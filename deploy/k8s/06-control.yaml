@@ -1,0 +1,82 @@
+# Control Plane Deployment and Service
+# Agent CRUD, lifecycle management, session routing
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aura-swarm-control
+  namespace: swarm-system
+  labels:
+    app: aura-swarm-control
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aura-swarm-control
+  template:
+    metadata:
+      labels:
+        app: aura-swarm-control
+    spec:
+      serviceAccountName: aura-swarm-control
+      containers:
+        - name: control
+          image: ECR_REGISTRY/RESOURCE_PREFIX-control:IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: RUST_LOG
+            - name: LISTEN_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: CONTROL_LISTEN_ADDR
+            - name: DATA_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aura-swarm-control
+  namespace: swarm-system
+spec:
+  selector:
+    app: aura-swarm-control
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

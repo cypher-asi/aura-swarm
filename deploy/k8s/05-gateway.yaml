@@ -1,0 +1,104 @@
+# Gateway Deployment and Service
+# Public API, WebSocket proxy, JWT validation
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aura-swarm-gateway
+  namespace: swarm-system
+  labels:
+    app: aura-swarm-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aura-swarm-gateway
+  template:
+    metadata:
+      labels:
+        app: aura-swarm-gateway
+    spec:
+      serviceAccountName: aura-swarm-gateway
+      containers:
+        - name: gateway
+          image: ECR_REGISTRY/RESOURCE_PREFIX-gateway:IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: RUST_LOG
+            - name: LISTEN_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: GATEWAY_LISTEN_ADDR
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: CONTROL_PLANE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aura-swarm-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+---
+# Internal ClusterIP service
+apiVersion: v1
+kind: Service
+metadata:
+  name: aura-swarm-gateway
+  namespace: swarm-system
+spec:
+  selector:
+    app: aura-swarm-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+# External LoadBalancer service
+apiVersion: v1
+kind: Service
+metadata:
+  name: aura-swarm-gateway-lb
+  namespace: swarm-system
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: aura-swarm-gateway
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http

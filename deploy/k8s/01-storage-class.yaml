@@ -1,0 +1,17 @@
+# EFS Storage Class for agent persistent state
+# Provides storage at /state/<user_id>/<agent_id>/
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: EFS_FILESYSTEM_ID
+  directoryPerms: "755"
+  uid: "1000"
+  gid: "1000"
+  basePath: "/state"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate

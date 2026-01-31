@@ -1,0 +1,23 @@
+[package]
+name = "aura-swarm-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RocksDB storage layer for aura-swarm"
+
+[dependencies]
+aura-swarm-core = { path = "../aura-swarm-core" }
+rocksdb = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

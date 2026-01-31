@@ -1,0 +1,15 @@
+# PersistentVolumeClaim for agent state storage
+# Shared across all agents, each gets a subpath: /state/<user_id>/<agent_id>/
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarm-agent-state
+  namespace: swarm-agents
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 100Gi

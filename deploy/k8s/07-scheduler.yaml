@@ -1,0 +1,87 @@
+# Scheduler Deployment and Service
+# Kubernetes reconciler, pod lifecycle, health monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aura-swarm-scheduler
+  namespace: swarm-system
+  labels:
+    app: aura-swarm-scheduler
+spec:
+  replicas: 1  # Single replica for leader election simplicity
+  selector:
+    matchLabels:
+      app: aura-swarm-scheduler
+  template:
+    metadata:
+      labels:
+        app: aura-swarm-scheduler
+    spec:
+      serviceAccountName: aura-swarm-scheduler
+      containers:
+        - name: scheduler
+          image: ECR_REGISTRY/RESOURCE_PREFIX-scheduler:IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: RUST_LOG
+            - name: AGENT_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: SCHEDULER_NAMESPACE
+            - name: RUNTIME_CLASS
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: SCHEDULER_RUNTIME_CLASS
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: CONTROL_PLANE_URL
+            - name: STATE_PVC_NAME
+              value: "swarm-agent-state"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aura-swarm-scheduler
+  namespace: swarm-system
+spec:
+  selector:
+    app: aura-swarm-scheduler
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

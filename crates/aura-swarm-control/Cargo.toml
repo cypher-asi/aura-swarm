@@ -1,0 +1,29 @@
+[package]
+name = "aura-swarm-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Control plane for aura-swarm agent lifecycle management"
+
+[features]
+default = []
+test-utils = ["aura-swarm-auth/test-utils"]
+
+[dependencies]
+aura-swarm-core = { path = "../aura-swarm-core" }
+aura-swarm-store = { path = "../aura-swarm-store" }
+aura-swarm-auth = { path = "../aura-swarm-auth" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

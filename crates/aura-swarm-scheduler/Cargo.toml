@@ -1,0 +1,45 @@
+[package]
+name = "aura-swarm-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Kubernetes pod scheduler for aura-swarm agent management"
+
+[features]
+default = []
+test-utils = []
+
+[dependencies]
+# Internal crates
+aura-swarm-core = { path = "../aura-swarm-core" }
+aura-swarm-store = { path = "../aura-swarm-store" }
+
+# Kubernetes
+kube.workspace = true
+k8s-openapi.workspace = true
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+# HTTP client for health checks
+reqwest.workspace = true
+
+# Utilities
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

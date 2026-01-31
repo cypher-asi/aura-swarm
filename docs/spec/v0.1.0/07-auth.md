@@ -2,14 +2,16 @@
 
 ## 1. Overview
 
-The `aura-swarm-auth` crate provides authentication integration with Zero-ID. For v0.1.0, we use simple email/password authentication with JWT tokens.
+The `aura-swarm-auth` crate provides authentication integration with Zero-ID (ZID). For v0.1.0, we use email/password authentication with JWT tokens.
 
 ### 1.1 Scope (v0.1.0)
 
 - Email/password login via Zero-ID server
-- JWT token validation
-- User ID extraction from tokens
-- No namespaces or policies (deferred to future versions)
+- JWT token validation with JWKS
+- Identity ID, Namespace ID, and Session ID extraction from tokens
+- MFA support (optional)
+- Token refresh support
+- No policies (deferred to future versions)
 
 ### 1.2 Position in Architecture
 
@@ -17,7 +19,7 @@ The `aura-swarm-auth` crate provides authentication integration with Zero-ID. Fo
 graph LR
     Gateway[aura-swarm-gateway] --> Auth[aura-swarm-auth]
     Auth --> ZeroID[Zero-ID Server]
-    Gateway -->|user_id| Control[aura-swarm-control]
+    Gateway -->|identity_id| Control[aura-swarm-control]
     
     style Auth fill:#e1f5fe
 ```
@@ -36,13 +38,13 @@ sequenceDiagram
     participant Gateway
     
     User->>App: Enter email/password
-    App->>ZeroID: POST /auth/login
+    App->>ZeroID: POST /v1/auth/login/email
     ZeroID-->>App: JWT access_token + refresh_token
     App->>App: Store tokens
     
     App->>Gateway: GET /v1/agents (Authorization: Bearer {token})
     Gateway->>Gateway: Validate JWT
-    Gateway->>Gateway: Extract user_id
+    Gateway->>Gateway: Extract identity_id
     Gateway-->>App: Agent list
 ```
 
@@ -54,7 +56,7 @@ sequenceDiagram
     participant ZeroID
     
     Note over App: access_token expired
-    App->>ZeroID: POST /auth/refresh (refresh_token)
+    App->>ZeroID: POST /v1/auth/refresh
     ZeroID-->>App: New access_token
     App->>App: Update stored token
 ```
@@ -63,47 +65,59 @@ sequenceDiagram
 
 ## 3. Zero-ID Integration
 
-### 3.1 Login Endpoint
+### 3.1 Base URLs
+
+| Environment | Base URL |
+|-------------|----------|
+| Production  | `https://auth.zero.tech` |
+| Local Dev   | `http://localhost:3000` |
+
+### 3.2 Login Endpoint
 
 The application (not the platform) calls Zero-ID directly:
 
 ```
-POST https://auth.example.com/auth/login
+POST {base_url}/v1/auth/login/email
 Content-Type: application/json
 
 {
   "email": "user@example.com",
-  "password": "secret123"
+  "password": "secret123",
+  "mfa_code": "123456"  // Optional, only if MFA enabled
 }
 ```
 
 Response:
 ```json
 {
-  "access_token": "eyJhbGciOiJFZDI1NTE5...",
+  "access_token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...",
   "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2g...",
-  "token_type": "Bearer",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "expires_in": 3600
 }
 ```
 
-### 3.2 Token Refresh Endpoint
+### 3.3 Token Refresh Endpoint
 
 ```
-POST https://auth.example.com/auth/refresh
+POST {base_url}/v1/auth/refresh
 Content-Type: application/json
 
 {
-  "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2g..."
+  "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2g...",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "machine_id": "device-fingerprint-abc"
 }
 ```
 
-### 3.3 JWKS Endpoint
+Response: Same structure as login response.
+
+### 3.4 JWKS Endpoint
 
 For JWT validation, Zero-ID exposes public keys:
 
 ```
-GET https://auth.example.com/.well-known/jwks.json
+GET {base_url}/.well-known/jwks.json
 ```
 
 Response:
@@ -113,10 +127,29 @@ Response:
     {
       "kty": "OKP",
       "crv": "Ed25519",
-      "x": "...",
-      "kid": "key-1"
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "kid": "key-1",
+      "alg": "EdDSA",
+      "use": "sig"
     }
   ]
+}
+```
+
+### 3.5 Error Codes
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| `UNAUTHORIZED` | 401 | Invalid credentials |
+| `MFA_REQUIRED` | 403 | MFA code required but not provided |
+| `IDENTITY_FROZEN` | 403 | Account is frozen |
+| `RATE_LIMITED` | 429 | Too many attempts |
+
+Error response format:
+```json
+{
+  "code": "MFA_REQUIRED",
+  "message": "Multi-factor authentication is required"
 }
 ```
 
@@ -128,36 +161,38 @@ Response:
 
 ```json
 {
-  "iss": "https://auth.example.com",
-  "sub": "u1234567890abcdef...",
+  "iss": "https://auth.zero.tech",
+  "sub": "550e8400-e29b-41d4-a716-446655440000",
+  "namespace_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+  "session_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "mfa_verified": true,
   "aud": "swarm-platform",
   "exp": 1706745600,
-  "iat": 1706742000,
-  "email": "user@example.com",
-  "email_verified": true
+  "iat": 1706742000
 }
 ```
 
-| Claim | Description |
-|-------|-------------|
-| `iss` | Issuer (Zero-ID server URL) |
-| `sub` | Subject (user_id as hex string) |
-| `aud` | Audience (must be "swarm-platform") |
-| `exp` | Expiration timestamp |
-| `iat` | Issued at timestamp |
-| `email` | User's email address |
-| `email_verified` | Email verification status |
+| Claim | Type | Description |
+|-------|------|-------------|
+| `iss` | String | Issuer (ZID server URL) |
+| `sub` | UUID | Subject (identity_id) |
+| `namespace_id` | UUID | Tenant context |
+| `session_id` | UUID | Current session |
+| `mfa_verified` | Boolean | MFA completion status |
+| `aud` | String | Audience (must be "swarm-platform") |
+| `exp` | Number | Expiration timestamp |
+| `iat` | Number | Issued at timestamp |
 
-### 4.2 User ID Derivation
+### 4.2 Identity ID Derivation
 
-The `sub` claim contains the user_id as a hex-encoded 32-byte identifier:
+The `sub` claim contains the identity_id as a UUID string:
 
 ```rust
-use swarm_core::UserId;
+use aura_swarm_core::IdentityId;
 
-fn extract_user_id(claims: &Claims) -> Result<UserId, AuthError> {
-    UserId::from_hex(&claims.sub)
-        .map_err(|_| AuthError::InvalidUserId)
+fn extract_identity_id(claims: &Claims) -> Result<IdentityId, AuthError> {
+    IdentityId::from_str(&claims.sub)
+        .map_err(|_| AuthError::InvalidIdentityId)
 }
 ```
 
@@ -169,7 +204,7 @@ fn extract_user_id(claims: &Claims) -> Result<UserId, AuthError> {
 
 ```rust
 use async_trait::async_trait;
-use swarm_core::UserId;
+use aura_swarm_core::{IdentityId, NamespaceId, SessionId};
 
 #[async_trait]
 pub trait JwtValidator: Send + Sync {
@@ -179,43 +214,99 @@ pub trait JwtValidator: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct ValidatedClaims {
-    pub user_id: UserId,
-    pub email: String,
-    pub email_verified: bool,
+    pub identity_id: IdentityId,
+    pub namespace_id: NamespaceId,
+    pub session_id: SessionId,
+    pub mfa_verified: bool,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 ```
 
-### 5.2 Error Types
+### 5.2 ZID Client
+
+```rust
+pub struct ZidClient { /* ... */ }
+
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+    pub mfa_code: Option<String>,
+}
+
+pub struct LoginResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub session_id: SessionId,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub struct RefreshRequest {
+    pub refresh_token: String,
+    pub session_id: SessionId,
+    pub machine_id: String,
+}
+
+impl ZidClient {
+    pub fn new(config: AuthConfig) -> Self;
+    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AuthError>;
+    pub async fn refresh(&self, req: RefreshRequest) -> Result<LoginResponse, AuthError>;
+}
+```
+
+### 5.3 Error Types
 
 ```rust
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AuthError {
-    #[error("Token expired")]
+    #[error("token expired")]
     TokenExpired,
     
-    #[error("Invalid signature")]
+    #[error("invalid signature")]
     InvalidSignature,
     
-    #[error("Invalid issuer")]
+    #[error("invalid issuer")]
     InvalidIssuer,
     
-    #[error("Invalid audience")]
+    #[error("invalid audience")]
     InvalidAudience,
     
-    #[error("Invalid user ID format")]
-    InvalidUserId,
+    #[error("invalid identity ID format")]
+    InvalidIdentityId,
     
-    #[error("Missing required claim: {0}")]
+    #[error("invalid namespace ID format")]
+    InvalidNamespaceId,
+    
+    #[error("invalid session ID format")]
+    InvalidSessionId,
+    
+    #[error("MFA required")]
+    MfaRequired,
+    
+    #[error("identity frozen")]
+    IdentityFrozen,
+    
+    #[error("rate limited")]
+    RateLimited,
+    
+    #[error("login failed: {0}")]
+    LoginFailed(String),
+    
+    #[error("missing required claim: {0}")]
     MissingClaim(String),
     
     #[error("JWKS fetch failed: {0}")]
     JwksFetchFailed(String),
     
-    #[error("Key not found: {0}")]
+    #[error("key not found: {0}")]
     KeyNotFound(String),
+    
+    #[error("invalid token format: {0}")]
+    InvalidToken(String),
+    
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 ```
 
@@ -226,153 +317,27 @@ pub enum AuthError {
 ### 6.1 JWKS-based Validator
 
 ```rust
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use reqwest::Client;
-use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
-
 pub struct JwksValidator {
-    jwks_url: String,
-    issuer: String,
-    audience: String,
-    client: Client,
-    keys: RwLock<CachedKeys>,
-}
-
-struct CachedKeys {
-    keys: HashMap<String, DecodingKey>,
-    fetched_at: Instant,
+    config: AuthConfig,
+    jwks: JwksProvider,
 }
 
 impl JwksValidator {
     pub fn new(config: AuthConfig) -> Self {
-        Self {
-            jwks_url: config.jwks_url,
-            issuer: config.issuer,
-            audience: config.audience,
-            client: Client::new(),
-            keys: RwLock::new(CachedKeys {
-                keys: HashMap::new(),
-                fetched_at: Instant::now() - Duration::from_secs(3600),
-            }),
-        }
-    }
-    
-    async fn refresh_keys(&self) -> Result<(), AuthError> {
-        let response: JwksResponse = self.client
-            .get(&self.jwks_url)
-            .send()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?;
-        
-        let mut new_keys = HashMap::new();
-        for key in response.keys {
-            if let (Some(kid), Some(x)) = (&key.kid, &key.x) {
-                // Ed25519 key
-                let public_key = base64_url_decode(x)?;
-                let decoding_key = DecodingKey::from_ed_der(&public_key);
-                new_keys.insert(kid.clone(), decoding_key);
-            }
-        }
-        
-        let mut cache = self.keys.write().unwrap();
-        cache.keys = new_keys;
-        cache.fetched_at = Instant::now();
-        
-        Ok(())
-    }
-    
-    async fn get_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
-        // Check if refresh needed (every 5 minutes)
-        {
-            let cache = self.keys.read().unwrap();
-            if cache.fetched_at.elapsed() < Duration::from_secs(300) {
-                if let Some(key) = cache.keys.get(kid) {
-                    return Ok(key.clone());
-                }
-            }
-        }
-        
-        // Refresh keys
-        self.refresh_keys().await?;
-        
-        // Try again
-        let cache = self.keys.read().unwrap();
-        cache.keys.get(kid)
-            .cloned()
-            .ok_or_else(|| AuthError::KeyNotFound(kid.to_string()))
+        let jwks = JwksProvider::new(config.clone());
+        Self { config, jwks }
     }
 }
 
 #[async_trait]
 impl JwtValidator for JwksValidator {
     async fn validate(&self, token: &str) -> Result<ValidatedClaims, AuthError> {
-        // Decode header to get kid
-        let header = decode_header(token)
-            .map_err(|_| AuthError::InvalidSignature)?;
-        
-        let kid = header.kid
-            .ok_or_else(|| AuthError::MissingClaim("kid".to_string()))?;
-        
-        // Get decoding key
-        let key = self.get_key(&kid).await?;
-        
-        // Validate token
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.audience]);
-        
-        let token_data = decode::<Claims>(token, &key, &validation)
-            .map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer => AuthError::InvalidIssuer,
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => AuthError::InvalidAudience,
-                _ => AuthError::InvalidSignature,
-            })?;
-        
-        let claims = token_data.claims;
-        
-        // Extract user_id
-        let user_id = UserId::from_hex(&claims.sub)
-            .map_err(|_| AuthError::InvalidUserId)?;
-        
-        Ok(ValidatedClaims {
-            user_id,
-            email: claims.email,
-            email_verified: claims.email_verified,
-            expires_at: chrono::DateTime::from_timestamp(claims.exp as i64, 0)
-                .unwrap_or_default(),
-        })
+        // 1. Decode header to get kid
+        // 2. Get decoding key from JWKS
+        // 3. Validate signature and claims
+        // 4. Extract identity_id, namespace_id, session_id
+        // 5. Return ValidatedClaims
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Claims {
-    iss: String,
-    sub: String,
-    aud: String,
-    exp: u64,
-    iat: u64,
-    email: String,
-    #[serde(default)]
-    email_verified: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JwksResponse {
-    keys: Vec<JwkKey>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JwkKey {
-    kty: String,
-    crv: Option<String>,
-    x: Option<String>,
-    kid: Option<String>,
 }
 ```
 
@@ -389,8 +354,10 @@ use axum::{
 };
 
 pub struct AuthUser {
-    pub user_id: UserId,
-    pub email: String,
+    pub identity_id: IdentityId,
+    pub namespace_id: NamespaceId,
+    pub session_id: SessionId,
+    pub mfa_verified: bool,
 }
 
 #[async_trait]
@@ -417,8 +384,10 @@ where
         let claims = validator.validate(token).await?;
         
         Ok(AuthUser {
-            user_id: claims.user_id,
-            email: claims.email,
+            identity_id: claims.identity_id,
+            namespace_id: claims.namespace_id,
+            session_id: claims.session_id,
+            mfa_verified: claims.mfa_verified,
         })
     }
 }
@@ -434,7 +403,7 @@ async fn list_agents(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Agent>>, ApiError> {
     let agents = state.control
-        .list_agents(user.user_id)
+        .list_agents(user.identity_id)
         .await?;
     
     Ok(Json(agents))
@@ -446,13 +415,10 @@ async fn list_agents(
 ## 8. Configuration
 
 ```rust
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AuthConfig {
-    /// Zero-ID JWKS endpoint URL
-    pub jwks_url: String,
-    
-    /// Expected issuer claim
-    pub issuer: String,
+    /// Base URL for ZID (e.g., "https://auth.zero.tech")
+    pub base_url: String,
     
     /// Expected audience claim
     pub audience: String,
@@ -461,11 +427,28 @@ pub struct AuthConfig {
     pub jwks_refresh_seconds: u64,
 }
 
+impl AuthConfig {
+    pub fn jwks_url(&self) -> String {
+        format!("{}/.well-known/jwks.json", self.base_url)
+    }
+    
+    pub fn login_url(&self) -> String {
+        format!("{}/v1/auth/login/email", self.base_url)
+    }
+    
+    pub fn refresh_url(&self) -> String {
+        format!("{}/v1/auth/refresh", self.base_url)
+    }
+    
+    pub fn issuer(&self) -> &str {
+        &self.base_url
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            jwks_url: "https://auth.example.com/.well-known/jwks.json".to_string(),
-            issuer: "https://auth.example.com".to_string(),
+            base_url: "https://auth.zero.tech".to_string(),
             audience: "swarm-platform".to_string(),
             jwks_refresh_seconds: 300,
         }
@@ -496,36 +479,30 @@ impl Default for AuthConfig {
 - Failed validations return generic 401
 - Detailed errors logged server-side only
 
+### 9.4 MFA Considerations
+
+- MFA status is included in JWT claims
+- Applications can enforce MFA for sensitive operations
+- MFA code is only required during initial login
+
 ---
 
 ## 10. Future Enhancements (post-v0.1.0)
 
-### 10.1 Namespace Support
-
-Zero-ID supports namespaces for multi-tenant isolation:
-
-```json
-{
-  "sub": "u1234...",
-  "namespace_id": "n5678...",
-  "namespace_role": "member"
-}
-```
-
-### 10.2 Policy Integration
+### 10.1 Policy Integration
 
 Zero-ID has a policy engine that could be integrated:
 
 ```rust
 pub struct PolicyContext {
-    pub user_id: UserId,
+    pub identity_id: IdentityId,
     pub namespace_id: NamespaceId,
     pub operation: Operation,
     pub resource: Resource,
 }
 ```
 
-### 10.3 Machine Keys
+### 10.2 Machine Keys
 
 For agent-to-agent communication (future):
 
@@ -537,6 +514,14 @@ pub struct MachineAuth {
 }
 ```
 
+### 10.3 Token Introspection
+
+For advanced token validation scenarios:
+
+```
+POST {base_url}/v1/auth/introspect
+```
+
 ---
 
 ## 11. Dependencies
@@ -545,16 +530,26 @@ pub struct MachineAuth {
 
 | Crate | Purpose |
 |-------|---------|
-| `aura-swarm-core` | `UserId` type |
+| `aura-swarm-core` | `IdentityId`, `NamespaceId`, `SessionId` types |
 
 ### 11.2 External
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | `jsonwebtoken` | 9.x | JWT validation |
-| `reqwest` | 0.11.x | HTTP client for JWKS |
-| `serde` | 1.x | JSON deserialization |
+| `reqwest` | 0.11.x | HTTP client for JWKS and login |
+| `serde` | 1.x | JSON serialization |
 | `chrono` | 0.4.x | Timestamp handling |
 | `thiserror` | 1.x | Error types |
 | `async-trait` | 0.1.x | Async trait support |
 | `base64` | 0.21.x | Base64 decoding |
+| `parking_lot` | 0.12.x | Synchronization primitives |
+
+---
+
+## 12. Notes
+
+- The existing `UserId` (32-byte hex) remains for internal use; `IdentityId` is the ZID-specific UUID
+- No registration endpoint per requirements ("email login to start")
+- MFA support is optional (pass `mfa_code` only if MFA enabled)
+- Introspection endpoint not implemented (local JWKS validation is recommended)

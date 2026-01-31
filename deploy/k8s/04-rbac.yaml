@@ -1,0 +1,90 @@
+# RBAC for Aura Swarm services
+---
+# Service account for gateway
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aura-swarm-gateway
+  namespace: swarm-system
+---
+# Service account for control plane
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aura-swarm-control
+  namespace: swarm-system
+---
+# Service account for scheduler (needs K8s API access)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aura-swarm-scheduler
+  namespace: swarm-system
+---
+# ClusterRole for scheduler to manage pods in swarm-agents namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aura-swarm-scheduler
+rules:
+  # Pod management
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+  # PVC access
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+  # Events for debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Nodes for scheduling info
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+# Bind scheduler to its role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aura-swarm-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: aura-swarm-scheduler
+    namespace: swarm-system
+roleRef:
+  kind: ClusterRole
+  name: aura-swarm-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+# Role for scheduler in swarm-agents namespace (more specific permissions)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aura-swarm-scheduler-agents
+  namespace: swarm-agents
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/status", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aura-swarm-scheduler-agents
+  namespace: swarm-agents
+subjects:
+  - kind: ServiceAccount
+    name: aura-swarm-scheduler
+    namespace: swarm-system
+roleRef:
+  kind: Role
+  name: aura-swarm-scheduler-agents
+  apiGroup: rbac.authorization.k8s.io

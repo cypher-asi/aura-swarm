@@ -1,0 +1,171 @@
+# Network Policies for Aura Swarm
+# Based on spec 08-networking.md section 5
+---
+# Default deny all in swarm-agents namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: swarm-agents
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow agent ingress from gateway and control plane
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-ingress
+  namespace: swarm-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: swarm-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from gateway (WebSocket proxy)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+          podSelector:
+            matchLabels:
+              app: aura-swarm-gateway
+      ports:
+        - port: 8080
+    # Allow from control plane (health, lifecycle)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+          podSelector:
+            matchLabels:
+              app: aura-swarm-control
+      ports:
+        - port: 8080
+    # Allow from scheduler (health checks)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+          podSelector:
+            matchLabels:
+              app: aura-swarm-scheduler
+      ports:
+        - port: 8080
+---
+# Allow agent egress to specific destinations
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-egress
+  namespace: swarm-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: swarm-agent
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow control plane (heartbeat)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+          podSelector:
+            matchLabels:
+              app: aura-swarm-control
+      ports:
+        - port: 8080
+    # Allow EFS (NFS) - storage subnet
+    - to:
+        - ipBlock:
+            cidr: 10.0.4.0/24
+      ports:
+        - port: 2049
+    # Allow external APIs (via NAT gateway) - HTTPS only
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+---
+# Deny agent-to-agent communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-agent-to-agent
+  namespace: swarm-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: swarm-agent
+  policyTypes:
+    - Ingress
+  ingress: []  # No ingress from other agents
+---
+# Allow swarm-system namespace internal communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-system-internal
+  namespace: swarm-system
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from same namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+    # Allow from load balancer (for gateway)
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 8080
+  egress:
+    # Allow to same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+    # Allow to agents namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-agents
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+    # Allow external (for control plane to reach K8s API, etc.)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0

@@ -1,0 +1,19 @@
+# Namespaces for Aura Swarm
+# - swarm-system: Platform services (gateway, control, scheduler)
+# - swarm-agents: Agent MicroVM pods
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: swarm-system
+  labels:
+    name: swarm-system
+    swarm.io/managed: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: swarm-agents
+  labels:
+    name: swarm-agents
+    swarm.io/managed: "true"

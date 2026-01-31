@@ -1,0 +1,43 @@
+[package]
+name = "aura-swarm-gateway"
+description = "HTTP and WebSocket gateway for aura-swarm agent platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Internal crates
+aura-swarm-core = { path = "../aura-swarm-core" }
+aura-swarm-auth = { path = "../aura-swarm-auth" }
+aura-swarm-control = { path = "../aura-swarm-control" }
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "limit", "timeout"] }
+
+# Async runtime
+tokio.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Utilities
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+aura-swarm-store = { path = "../aura-swarm-store" }
+tokio = { workspace = true, features = ["test-util"] }
+axum-test = "15"
+
+[lints]
+workspace = true

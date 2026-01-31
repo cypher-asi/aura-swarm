@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/*.tfplan
+deploy/terraform/terraform.tfstate
+deploy/terraform/terraform.tfstate.backup
+deploy/terraform/.terraform.tfstate.lock.info
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files with secrets (keep config.env as it's a template)
+.env
+.env.local
+*.pem
+*.key
