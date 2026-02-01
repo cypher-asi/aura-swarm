@@ -74,11 +74,13 @@
 
 pub mod error;
 pub mod lifecycle;
+pub mod scheduler_client;
 pub mod service;
 pub mod session;
 pub mod types;
 
 pub use error::{ControlError, Result};
+pub use scheduler_client::{HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient};
 pub use service::{ControlPlane, ControlPlaneService};
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 

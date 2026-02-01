@@ -60,14 +60,15 @@ module "storage" {
   source = "./modules/storage"
   count  = var.enable_storage && var.enable_network ? 1 : 0
 
-  resource_prefix    = local.resource_prefix
-  vpc_id             = module.network[0].vpc_id
-  subnet_ids         = module.network[0].storage_subnet_ids
-  agent_subnet_cidrs = module.network[0].agent_subnet_cidrs
-  encrypted          = var.efs_encrypted
-  throughput_mode    = var.efs_throughput_mode
-  performance_mode   = var.efs_performance_mode
-  tags               = local.common_tags
+  resource_prefix      = local.resource_prefix
+  vpc_id               = module.network[0].vpc_id
+  subnet_ids           = module.network[0].storage_subnet_ids
+  agent_subnet_cidrs   = module.network[0].agent_subnet_cidrs
+  private_subnet_cidrs = module.network[0].private_subnet_cidrs
+  encrypted            = var.efs_encrypted
+  throughput_mode      = var.efs_throughput_mode
+  performance_mode     = var.efs_performance_mode
+  tags                 = local.common_tags
 }
 
 #------------------------------------------------------------------------------

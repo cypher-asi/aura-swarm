@@ -1,6 +1,7 @@
 //! Types for the scheduler crate.
 
 use aura_swarm_core::AgentId;
+use aura_swarm_store::IsolationLevel;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -94,12 +95,15 @@ pub struct PodInfo {
 pub struct SchedulerConfig {
     /// Kubernetes namespace for agent pods.
     pub namespace: String,
-    /// `RuntimeClass` name (e.g., "kata-fc" for Firecracker).
-    pub runtime_class: String,
+    /// Default isolation level for agents that don't specify one.
+    /// Determines whether pods run as containers or microVMs.
+    pub default_isolation: IsolationLevel,
     /// Container image for the Aura runtime.
     pub image: String,
-    /// Internal URL of the control plane service.
+    /// Internal URL of the control plane service (deprecated, use gateway_url).
     pub control_plane_url: String,
+    /// Internal URL of the gateway service for status callbacks.
+    pub gateway_url: String,
     /// PVC name for agent state storage.
     pub state_pvc_name: String,
     /// Default CPU allocation in millicores.
@@ -116,9 +120,10 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             namespace: "swarm-agents".to_string(),
-            runtime_class: "kata-fc".to_string(),
+            default_isolation: IsolationLevel::MicroVM,
             image: "ghcr.io/cypher-asi/aura-runtime:latest".to_string(),
-            control_plane_url: "http://aura-swarm-control.swarm-system.svc:8080".to_string(),
+            control_plane_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
+            gateway_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
             state_pvc_name: "swarm-agent-state".to_string(),
             default_cpu_millicores: 500,
             default_memory_mb: 512,
@@ -136,6 +141,73 @@ impl SchedulerConfig {
             namespace: namespace.into(),
             ..Default::default()
         }
+    }
+
+    /// Load configuration from environment variables.
+    ///
+    /// Supported environment variables:
+    /// - `SCHEDULER_NAMESPACE`: Kubernetes namespace for agent pods
+    /// - `AURA_RUNTIME_IMAGE`: Container image for the Aura runtime
+    /// - `CONTROL_PLANE_URL`: Internal URL of the control plane service (deprecated)
+    /// - `GATEWAY_URL`: Internal URL of the gateway service for status callbacks
+    /// - `STATE_PVC_NAME`: PVC name for agent state storage
+    /// - `DEFAULT_ISOLATION`: Default isolation level ("container" or "microvm")
+    /// - `DEFAULT_CPU_MILLICORES`: Default CPU allocation
+    /// - `DEFAULT_MEMORY_MB`: Default memory allocation
+    /// - `MAX_CPU_MILLICORES`: Maximum CPU allowed
+    /// - `MAX_MEMORY_MB`: Maximum memory allowed
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        if let Ok(val) = std::env::var("SCHEDULER_NAMESPACE") {
+            config.namespace = val;
+        }
+        if let Ok(val) = std::env::var("AURA_RUNTIME_IMAGE") {
+            config.image = val;
+        }
+        if let Ok(val) = std::env::var("CONTROL_PLANE_URL") {
+            config.control_plane_url = val.clone();
+            // Also use as gateway_url if GATEWAY_URL not set
+            if std::env::var("GATEWAY_URL").is_err() {
+                config.gateway_url = val;
+            }
+        }
+        if let Ok(val) = std::env::var("GATEWAY_URL") {
+            config.gateway_url = val;
+        }
+        if let Ok(val) = std::env::var("STATE_PVC_NAME") {
+            config.state_pvc_name = val;
+        }
+        if let Ok(val) = std::env::var("DEFAULT_ISOLATION") {
+            config.default_isolation = match val.to_lowercase().as_str() {
+                "container" | "runc" => IsolationLevel::Container,
+                "microvm" | "kata" | "kata-fc" => IsolationLevel::MicroVM,
+                _ => config.default_isolation,
+            };
+        }
+        if let Ok(val) = std::env::var("DEFAULT_CPU_MILLICORES") {
+            if let Ok(n) = val.parse() {
+                config.default_cpu_millicores = n;
+            }
+        }
+        if let Ok(val) = std::env::var("DEFAULT_MEMORY_MB") {
+            if let Ok(n) = val.parse() {
+                config.default_memory_mb = n;
+            }
+        }
+        if let Ok(val) = std::env::var("MAX_CPU_MILLICORES") {
+            if let Ok(n) = val.parse() {
+                config.max_cpu_millicores = n;
+            }
+        }
+        if let Ok(val) = std::env::var("MAX_MEMORY_MB") {
+            if let Ok(n) = val.parse() {
+                config.max_memory_mb = n;
+            }
+        }
+
+        config
     }
 
     /// Validate resource requests against limits.
@@ -191,7 +263,8 @@ mod tests {
     fn scheduler_config_defaults() {
         let config = SchedulerConfig::default();
         assert_eq!(config.namespace, "swarm-agents");
-        assert_eq!(config.runtime_class, "kata-fc");
+        assert_eq!(config.default_isolation, IsolationLevel::MicroVM);
+        assert_eq!(config.default_isolation.runtime_class(), Some("kata-fc"));
         assert_eq!(config.default_cpu_millicores, 500);
         assert_eq!(config.default_memory_mb, 512);
     }

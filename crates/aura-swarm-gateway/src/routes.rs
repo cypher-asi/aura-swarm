@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
-use crate::handlers::{agents, health, sessions, ws};
+use crate::handlers::{agents, health, internal, sessions, ws};
 use crate::state::GatewayState;
 
 /// Create the gateway router with all routes and middleware.
@@ -30,11 +30,11 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents` - Create agent
 /// - `GET /v1/agents/:agent_id` - Get agent
 /// - `DELETE /v1/agents/:agent_id` - Delete agent
-/// - `POST /v1/agents/:agent_id:start` - Start agent
-/// - `POST /v1/agents/:agent_id:stop` - Stop agent
-/// - `POST /v1/agents/:agent_id:restart` - Restart agent
-/// - `POST /v1/agents/:agent_id:hibernate` - Hibernate agent
-/// - `POST /v1/agents/:agent_id:wake` - Wake agent
+/// - `POST /v1/agents/:agent_id/start` - Start agent
+/// - `POST /v1/agents/:agent_id/stop` - Stop agent
+/// - `POST /v1/agents/:agent_id/restart` - Restart agent
+/// - `POST /v1/agents/:agent_id/hibernate` - Hibernate agent
+/// - `POST /v1/agents/:agent_id/wake` - Wake agent
 /// - `GET /v1/agents/:agent_id/logs` - Get agent logs
 /// - `GET /v1/agents/:agent_id/status` - Get agent status
 ///
@@ -44,6 +44,10 @@ use crate::state::GatewayState;
 /// - `GET /v1/sessions/:session_id` - Get session
 /// - `DELETE /v1/sessions/:session_id` - Close session
 /// - `GET /v1/sessions/:session_id/ws` - WebSocket connection
+///
+/// ## Internal (no auth, cluster-only)
+/// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
+/// - `GET /internal/health` - Internal health check
 pub fn create_router<C, V>(state: GatewayState<C, V>) -> Router
 where
     C: ControlPlane + 'static,
@@ -69,50 +73,56 @@ where
             get(agents::list_agents::<C, V>).post(agents::create_agent::<C, V>),
         )
         .route(
-            "/v1/agents/{agent_id}",
+            "/v1/agents/:agent_id",
             get(agents::get_agent::<C, V>).delete(agents::delete_agent::<C, V>),
         )
-        // Agent lifecycle (using :action suffix pattern)
+        // Agent lifecycle
         .route(
-            "/v1/agents/{agent_id}:start",
+            "/v1/agents/:agent_id/start",
             post(agents::start_agent::<C, V>),
         )
         .route(
-            "/v1/agents/{agent_id}:stop",
+            "/v1/agents/:agent_id/stop",
             post(agents::stop_agent::<C, V>),
         )
         .route(
-            "/v1/agents/{agent_id}:restart",
+            "/v1/agents/:agent_id/restart",
             post(agents::restart_agent::<C, V>),
         )
         .route(
-            "/v1/agents/{agent_id}:hibernate",
+            "/v1/agents/:agent_id/hibernate",
             post(agents::hibernate_agent::<C, V>),
         )
         .route(
-            "/v1/agents/{agent_id}:wake",
+            "/v1/agents/:agent_id/wake",
             post(agents::wake_agent::<C, V>),
         )
         // Agent observability
-        .route("/v1/agents/{agent_id}/logs", get(agents::get_logs::<C, V>))
+        .route("/v1/agents/:agent_id/logs", get(agents::get_logs::<C, V>))
         .route(
-            "/v1/agents/{agent_id}/status",
+            "/v1/agents/:agent_id/status",
             get(agents::get_status::<C, V>),
         )
         // Sessions
         .route(
-            "/v1/agents/{agent_id}/sessions",
+            "/v1/agents/:agent_id/sessions",
             post(sessions::create_session::<C, V>).get(sessions::list_sessions::<C, V>),
         )
         .route(
-            "/v1/sessions/{session_id}",
+            "/v1/sessions/:session_id",
             get(sessions::get_session::<C, V>).delete(sessions::close_session::<C, V>),
         )
         // WebSocket
         .route(
-            "/v1/sessions/{session_id}/ws",
+            "/v1/sessions/:session_id/ws",
             get(ws::websocket_handler::<C, V>),
         )
+        // Internal endpoints (no auth required - protected by network policies)
+        .route(
+            "/internal/agents/:agent_id/status",
+            patch(internal::update_agent_status::<C, V>),
+        )
+        .route("/internal/health", get(internal::internal_health))
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

@@ -42,6 +42,9 @@ pub struct AgentResponse {
     /// Last heartbeat timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Error message if agent failed (e.g., provisioning error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 impl From<Agent> for AgentResponse {
@@ -54,6 +57,7 @@ impl From<Agent> for AgentResponse {
             created_at: agent.created_at,
             updated_at: agent.updated_at,
             last_heartbeat_at: agent.last_heartbeat_at,
+            error_message: agent.error_message,
         }
     }
 }

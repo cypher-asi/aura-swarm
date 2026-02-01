@@ -18,6 +18,11 @@ variable "agent_subnet_cidrs" {
   type        = list(string)
 }
 
+variable "private_subnet_cidrs" {
+  description = "CIDR blocks of private subnets (for platform services access)"
+  type        = list(string)
+}
+
 variable "encrypted" {
   description = "Enable encryption for EFS"
   type        = bool

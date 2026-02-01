@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Control plane for aura-swarm agent lifecycle management"
 
+[[bin]]
+name = "aura-swarm-control"
+path = "src/main.rs"
+
 [features]
 default = []
 test-utils = ["aura-swarm-auth/test-utils"]
@@ -20,6 +24,13 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+# HTTP client for scheduler communication
+reqwest = { workspace = true }
+
+# HTTP server (for binary)
+axum = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

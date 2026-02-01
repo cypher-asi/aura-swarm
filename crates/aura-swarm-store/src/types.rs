@@ -25,6 +25,9 @@ pub struct Agent {
     pub updated_at: DateTime<Utc>,
     /// Last heartbeat from the agent runtime.
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Error message when agent is in Error state (e.g., provisioning failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// Resource specification for an agent.
@@ -36,6 +39,10 @@ pub struct AgentSpec {
     pub memory_mb: u32,
     /// Aura runtime version.
     pub runtime_version: String,
+    /// Isolation level for the agent runtime.
+    /// If not specified, uses the scheduler's default.
+    #[serde(default)]
+    pub isolation: Option<IsolationLevel>,
 }
 
 impl Default for AgentSpec {
@@ -44,6 +51,39 @@ impl Default for AgentSpec {
             cpu_millicores: 500,
             memory_mb: 512,
             runtime_version: "latest".to_string(),
+            isolation: None, // Uses scheduler default
+        }
+    }
+}
+
+/// Isolation level for agent execution.
+///
+/// Determines whether the agent runs in a lightweight container
+/// or a more secure microVM with its own kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    /// Run in a standard container (shared kernel).
+    /// Faster startup, lower overhead, less isolation.
+    /// Use for trusted workloads or development.
+    Container,
+    /// Run in a Firecracker microVM (dedicated kernel).
+    /// Stronger isolation, slightly higher overhead.
+    /// Default for production agent workloads.
+    #[default]
+    MicroVM,
+}
+
+impl IsolationLevel {
+    /// Get the Kubernetes RuntimeClass name for this isolation level.
+    ///
+    /// Returns `None` for container isolation (uses default runtime),
+    /// or `Some("kata-fc")` for microVM isolation.
+    #[must_use]
+    pub const fn runtime_class(&self) -> Option<&'static str> {
+        match self {
+            Self::Container => None, // Use default container runtime
+            Self::MicroVM => Some("kata-fc"),
         }
     }
 }

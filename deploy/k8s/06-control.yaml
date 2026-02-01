@@ -21,7 +21,7 @@ spec:
       serviceAccountName: aura-swarm-control
       containers:
         - name: control
-          image: ECR_REGISTRY/RESOURCE_PREFIX-control:IMAGE_TAG
+          image: 909208902094.dkr.ecr.us-east-2.amazonaws.com/aura-swarm-dev-control:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

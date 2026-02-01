@@ -233,6 +233,23 @@ impl Store for RocksStore {
         let mut agent = self.get_agent(agent_id)?.ok_or(StoreError::NotFound)?;
         agent.status = status;
         agent.updated_at = chrono::Utc::now();
+        // Clear error message when not in error state
+        if status != AgentState::Error {
+            agent.error_message = None;
+        }
+        self.put_agent(&agent)
+    }
+
+    fn update_agent_error(
+        &self,
+        agent_id: &AgentId,
+        status: AgentState,
+        error_message: Option<String>,
+    ) -> Result<()> {
+        let mut agent = self.get_agent(agent_id)?.ok_or(StoreError::NotFound)?;
+        agent.status = status;
+        agent.error_message = error_message;
+        agent.updated_at = chrono::Utc::now();
         self.put_agent(&agent)
     }
 
@@ -391,6 +408,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_heartbeat_at: None,
+            error_message: None,
         }
     }
 

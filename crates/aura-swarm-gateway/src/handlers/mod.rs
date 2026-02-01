@@ -4,5 +4,6 @@
 
 pub mod agents;
 pub mod health;
+pub mod internal;
 pub mod sessions;
 pub mod ws;

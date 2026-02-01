@@ -6,11 +6,22 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "aura-swarm-gateway"
+path = "src/main.rs"
+
+[features]
+default = []
+dev-mode = ["aura-swarm-auth/test-utils"]
+
 [dependencies]
+# Tracing
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Internal crates
 aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-auth = { path = "../aura-swarm-auth" }
 aura-swarm-control = { path = "../aura-swarm-control" }
+aura-swarm-store = { path = "../aura-swarm-store" }
 
 # Web framework
 axum = { version = "0.7", features = ["ws", "macros"] }

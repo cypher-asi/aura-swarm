@@ -1,6 +1,28 @@
 # Gateway Deployment and Service
 # Public API, WebSocket proxy, JWT validation
+#
+# NOTE: Uses a single replica because RocksDB doesn't support concurrent writers.
+# For HA, use a distributed database or leader election.
+#
+# TODO: Install EBS CSI driver for persistent storage. Currently using emptyDir
+# which loses data on pod restart. To enable persistence:
+# 1. Install EBS CSI driver: eksctl create addon --name aws-ebs-csi-driver --cluster <cluster>
+# 2. Uncomment the PVC below and change volumes section to use PVC
 ---
+# Uncomment when EBS CSI driver is installed:
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: aura-swarm-gateway-data
+#   namespace: swarm-system
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   storageClassName: gp2
+#   resources:
+#     requests:
+#       storage: 10Gi
+# ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,7 +31,11 @@ metadata:
   labels:
     app: aura-swarm-gateway
 spec:
-  replicas: 2
+  # Single replica because RocksDB doesn't support concurrent writers
+  # For HA, consider using a distributed database or leader election
+  replicas: 1
+  strategy:
+    type: Recreate  # Ensures old pod is fully terminated before new one starts
   selector:
     matchLabels:
       app: aura-swarm-gateway
@@ -21,7 +47,7 @@ spec:
       serviceAccountName: aura-swarm-gateway
       containers:
         - name: gateway
-          image: ECR_REGISTRY/RESOURCE_PREFIX-gateway:IMAGE_TAG
+          image: 909208902094.dkr.ecr.us-east-2.amazonaws.com/aura-swarm-dev-gateway:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -37,16 +63,18 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: GATEWAY_LISTEN_ADDR
-            - name: CONTROL_PLANE_URL
+            - name: DATA_DIR
+              value: "/data/aura-swarm"
+            - name: AUTH_BASE_URL
+              value: "https://zid.zero.tech"
+            - name: AUTH_AUDIENCE
+              value: "zero-vault"
+            # Scheduler URL for agent lifecycle operations
+            - name: SCHEDULER_URL
               valueFrom:
                 configMapKeyRef:
                   name: aura-swarm-config
-                  key: CONTROL_PLANE_URL
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: aura-swarm-secrets
-                  key: JWT_SECRET
+                  key: SCHEDULER_URL
           resources:
             requests:
               cpu: 250m
@@ -66,10 +94,20 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data/aura-swarm
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             readOnlyRootFilesystem: true
+      volumes:
+        # TODO: Use PVC when EBS CSI driver is installed
+        # - name: data
+        #   persistentVolumeClaim:
+        #     claimName: aura-swarm-gateway-data
+        - name: data
+          emptyDir: {}
 ---
 # Internal ClusterIP service
 apiVersion: v1

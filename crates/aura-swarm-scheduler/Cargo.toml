@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "Kubernetes pod scheduler for aura-swarm agent management"
 
+[[bin]]
+name = "aura-swarm-scheduler"
+path = "src/main.rs"
+
 [features]
 default = []
 test-utils = []
@@ -14,6 +18,10 @@ test-utils = []
 # Internal crates
 aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-store = { path = "../aura-swarm-store" }
+
+# HTTP server (for binary)
+axum = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Kubernetes
 kube.workspace = true

@@ -40,7 +40,7 @@ pub mod types;
 
 pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
-pub use types::{Agent, AgentSpec, AgentState, Session, SessionStatus, User};
+pub use types::{Agent, AgentSpec, AgentState, IsolationLevel, Session, SessionStatus, User};
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
 
@@ -109,6 +109,20 @@ pub trait Store: Send + Sync {
     ///
     /// Returns `StoreError::NotFound` if the agent doesn't exist.
     fn update_agent_status(&self, agent_id: &AgentId, status: AgentState) -> Result<()>;
+
+    /// Update an agent's status with an error message.
+    ///
+    /// Use this when transitioning to an Error state to provide context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::NotFound` if the agent doesn't exist.
+    fn update_agent_error(
+        &self,
+        agent_id: &AgentId,
+        status: AgentState,
+        error_message: Option<String>,
+    ) -> Result<()>;
 
     /// List all agents in the database.
     ///

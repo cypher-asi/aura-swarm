@@ -7,6 +7,7 @@ members = [
     "crates/aura-swarm-control",
     "crates/aura-swarm-scheduler",
     "crates/aura-swarm-gateway",
+    "crates/aura-swarm-cli",
 ]
 
 [workspace.package]

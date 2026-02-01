@@ -70,15 +70,15 @@ pub const fn is_valid_transition(from: AgentState, to: AgentState) -> bool {
     matches!(
         (from, to),
         // Provisioning can only go to Running (on success) or Error
-        // Running, Idle, Hibernating can all go to Error
-        (Provisioning | Idle | Hibernating, Running)
+        // Running, Idle can go to Error
+        (Provisioning | Idle, Running)
             | (Provisioning | Running | Idle | Hibernating | Stopping, Error)
             // Running can go to Idle, Hibernating, or Stopping
             | (Running, Idle | Hibernating | Stopping)
             // Idle can go to Hibernating or Stopping
             | (Idle, Hibernating | Stopping)
-            // Hibernating can go to Stopping
-            | (Hibernating, Stopping)
+            // Hibernating can go to Running (instant wake) or Provisioning (for scheduler) or Stopping
+            | (Hibernating, Running | Provisioning | Stopping)
             // Stopping can go to Stopped; Error can also go to Stopped
             | (Stopping | Error, Stopped)
             // Stopped and Error can go to Provisioning (restart/retry)
@@ -95,7 +95,7 @@ pub fn valid_transitions_from(state: AgentState) -> Vec<AgentState> {
         Provisioning => vec![Running, Error],
         Running => vec![Idle, Hibernating, Stopping, Error],
         Idle => vec![Running, Hibernating, Stopping, Error],
-        Hibernating => vec![Running, Stopping, Error],
+        Hibernating => vec![Running, Provisioning, Stopping, Error],
         Stopping => vec![Stopped, Error],
         Stopped => vec![Provisioning],
         Error => vec![Stopped, Provisioning],

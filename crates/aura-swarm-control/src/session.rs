@@ -202,6 +202,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_heartbeat_at: None,
+            error_message: None,
         };
         store.put_agent(&agent).unwrap();
         (store, dir, user_id, agent)

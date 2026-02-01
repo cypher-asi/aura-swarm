@@ -12,6 +12,7 @@ use chrono::Utc;
 
 use crate::error::{ControlError, Result};
 use crate::lifecycle;
+use crate::scheduler_client::SchedulerClient;
 use crate::session;
 use crate::types::{ControlConfig, CreateAgentRequest};
 
@@ -100,25 +101,84 @@ pub trait ControlPlane: Send + Sync {
     ///
     /// Returns the endpoint URL if the agent is running.
     async fn resolve_agent_endpoint(&self, agent_id: &AgentId) -> Result<Option<String>>;
+
+    // =========================================================================
+    // Internal Operations (for scheduler callbacks)
+    // =========================================================================
+
+    /// Update an agent's status without ownership verification.
+    ///
+    /// This is used by the scheduler to report pod status changes. It does NOT
+    /// verify ownership because the scheduler operates at a system level.
+    ///
+    /// # Security
+    ///
+    /// This method should only be called from internal endpoints that are
+    /// protected by network policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::AgentNotFound` if the agent doesn't exist.
+    async fn update_agent_status_internal(
+        &self,
+        agent_id: &AgentId,
+        status: AgentState,
+    ) -> Result<()>;
 }
 
 /// The main control plane service implementation.
-pub struct ControlPlaneService<S: Store> {
+///
+/// The service can optionally integrate with a scheduler for managing agent pods.
+/// If no scheduler is configured, lifecycle operations only update the local store.
+pub struct ControlPlaneService<S: Store, SC: SchedulerClient = crate::scheduler_client::NoopSchedulerClient> {
     store: Arc<S>,
     config: ControlConfig,
+    scheduler: Option<Arc<SC>>,
 }
 
-impl<S: Store> ControlPlaneService<S> {
-    /// Create a new control plane service.
+impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClient> {
+    /// Create a new control plane service without scheduler integration.
     #[must_use]
     pub fn new(store: Arc<S>, config: ControlConfig) -> Self {
-        Self { store, config }
+        Self {
+            store,
+            config,
+            scheduler: None,
+        }
     }
 
-    /// Create with default configuration.
+    /// Create with default configuration and no scheduler.
     #[must_use]
     pub fn with_defaults(store: Arc<S>) -> Self {
         Self::new(store, ControlConfig::default())
+    }
+}
+
+impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
+    /// Create a new control plane service with scheduler integration.
+    #[must_use]
+    pub fn with_scheduler(store: Arc<S>, config: ControlConfig, scheduler: Arc<SC>) -> Self {
+        Self {
+            store,
+            config,
+            scheduler: Some(scheduler),
+        }
+    }
+
+    /// Create a new control plane service with optional scheduler integration.
+    ///
+    /// Use this when the scheduler may or may not be configured at runtime.
+    #[must_use]
+    pub fn with_optional_scheduler(
+        store: Arc<S>,
+        config: ControlConfig,
+        scheduler: Option<Arc<SC>>,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            scheduler,
+        }
     }
 
     /// Get a reference to the store.
@@ -131,6 +191,12 @@ impl<S: Store> ControlPlaneService<S> {
     #[must_use]
     pub const fn config(&self) -> &ControlConfig {
         &self.config
+    }
+
+    /// Check if a scheduler is configured.
+    #[must_use]
+    pub fn has_scheduler(&self) -> bool {
+        self.scheduler.is_some()
     }
 
     /// Verify that the user owns the given agent.
@@ -163,10 +229,46 @@ impl<S: Store> ControlPlaneService<S> {
         self.store.put_agent(agent)?;
         Ok(())
     }
+
+    /// Schedule an agent pod via the scheduler service.
+    async fn schedule_agent_pod(&self, agent: &Agent) -> Result<()> {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler
+                .schedule_agent(&agent.agent_id, &agent.user_id.to_hex(), &agent.spec)
+                .await?;
+            tracing::info!(
+                agent_id = %agent.agent_id,
+                "Scheduled agent pod via scheduler"
+            );
+        } else {
+            tracing::debug!(
+                agent_id = %agent.agent_id,
+                "No scheduler configured, skipping pod scheduling"
+            );
+        }
+        Ok(())
+    }
+
+    /// Terminate an agent pod via the scheduler service.
+    async fn terminate_agent_pod(&self, agent_id: &AgentId) -> Result<()> {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.terminate_agent(agent_id).await?;
+            tracing::info!(
+                agent_id = %agent_id,
+                "Terminated agent pod via scheduler"
+            );
+        } else {
+            tracing::debug!(
+                agent_id = %agent_id,
+                "No scheduler configured, skipping pod termination"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
+impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for ControlPlaneService<S, SC> {
     // =========================================================================
     // Agent CRUD Operations
     // =========================================================================
@@ -194,9 +296,28 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
             created_at: now,
             updated_at: now,
             last_heartbeat_at: None,
+            error_message: None,
         };
 
         self.store.put_agent(&agent)?;
+
+        // Schedule the agent pod
+        if let Err(e) = self.schedule_agent_pod(&agent).await {
+            tracing::error!(
+                agent_id = %agent.agent_id,
+                error = %e,
+                "Failed to schedule agent pod, marking as error"
+            );
+            // Update status to Error with the error message
+            self.store
+                .update_agent_error(
+                    &agent.agent_id,
+                    AgentState::Error,
+                    Some(e.to_string()),
+                )
+                .ok();
+            return Err(e);
+        }
 
         tracing::info!(
             agent_id = %agent.agent_id,
@@ -255,6 +376,19 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
         // Can only start from Stopped state
         self.transition_state(&mut agent, AgentState::Provisioning)?;
 
+        // Schedule the agent pod
+        if let Err(e) = self.schedule_agent_pod(&agent).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to schedule agent pod on start"
+            );
+            self.store
+                .update_agent_status(agent_id, AgentState::Error)
+                .ok();
+            return Err(e);
+        }
+
         tracing::info!(agent_id = %agent_id, "Starting agent");
 
         Ok(agent)
@@ -277,20 +411,43 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
         // Transition to Stopping
         self.transition_state(&mut agent, AgentState::Stopping)?;
 
+        // Terminate the agent pod
+        if let Err(e) = self.terminate_agent_pod(agent_id).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to terminate agent pod on stop"
+            );
+            // Don't fail the stop operation, just log - the scheduler will clean up
+        }
+
         tracing::info!(agent_id = %agent_id, "Stopping agent");
 
         Ok(agent)
     }
 
     async fn restart_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        // Stop the agent
+        // Stop the agent (this will terminate the pod)
         let mut agent = self.stop_agent(user_id, agent_id).await?;
 
-        // Simulate immediate stop completion (in real impl, scheduler would do this)
+        // Transition to Stopped state
         self.transition_state(&mut agent, AgentState::Stopped)?;
 
-        // Start again
+        // Start again (this will schedule a new pod)
         self.transition_state(&mut agent, AgentState::Provisioning)?;
+
+        // Schedule the new pod
+        if let Err(e) = self.schedule_agent_pod(&agent).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to schedule agent pod on restart"
+            );
+            self.store
+                .update_agent_status(agent_id, AgentState::Error)
+                .ok();
+            return Err(e);
+        }
 
         tracing::info!(agent_id = %agent_id, "Restarting agent");
 
@@ -313,6 +470,16 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
 
         self.transition_state(&mut agent, AgentState::Hibernating)?;
 
+        // Terminate the agent pod (but keep state saved)
+        if let Err(e) = self.terminate_agent_pod(agent_id).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to terminate agent pod on hibernate"
+            );
+            // Don't fail the hibernate operation
+        }
+
         tracing::info!(agent_id = %agent_id, "Hibernating agent");
 
         Ok(agent)
@@ -329,15 +496,22 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
             });
         }
 
-        // For hibernating, wake to Running directly
-        // For stopped, go through Provisioning
-        let target = if agent.status == AgentState::Hibernating {
-            AgentState::Running
-        } else {
-            AgentState::Provisioning
-        };
+        // For hibernating, go through Provisioning to trigger pod scheduling
+        // For stopped, also go through Provisioning
+        self.transition_state(&mut agent, AgentState::Provisioning)?;
 
-        self.transition_state(&mut agent, target)?;
+        // Schedule the agent pod
+        if let Err(e) = self.schedule_agent_pod(&agent).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to schedule agent pod on wake"
+            );
+            self.store
+                .update_agent_status(agent_id, AgentState::Error)
+                .ok();
+            return Err(e);
+        }
 
         tracing::info!(agent_id = %agent_id, "Waking agent");
 
@@ -406,24 +580,52 @@ impl<S: Store + 'static> ControlPlane for ControlPlaneService<S> {
 
         // Only return endpoint for active agents
         if lifecycle::is_active(agent.status) {
-            // In a real implementation, this would query the scheduler/cache
-            // For now, return a placeholder based on agent ID
-            Ok(Some(format!(
-                "http://agent-{agent_id}.swarm-agents.svc:8080"
-            )))
+            // Query the scheduler for the pod's actual endpoint (IP:port)
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.get_pod_endpoint(agent_id).await
+            } else {
+                // No scheduler configured, return mock endpoint for local dev
+                Ok(Some("localhost:8080".to_string()))
+            }
         } else {
             Ok(None)
         }
+    }
+
+    async fn update_agent_status_internal(
+        &self,
+        agent_id: &AgentId,
+        status: AgentState,
+    ) -> Result<()> {
+        // Verify agent exists
+        if self.store.get_agent(agent_id)?.is_none() {
+            return Err(ControlError::AgentNotFound(*agent_id));
+        }
+
+        self.store.update_agent_status(agent_id, status)?;
+
+        tracing::info!(
+            agent_id = %agent_id,
+            status = ?status,
+            "Updated agent status (internal)"
+        );
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler_client::NoopSchedulerClient;
     use aura_swarm_store::RocksStore;
     use tempfile::TempDir;
 
-    fn setup() -> (ControlPlaneService<RocksStore>, TempDir, UserId) {
+    fn setup() -> (
+        ControlPlaneService<RocksStore, NoopSchedulerClient>,
+        TempDir,
+        UserId,
+    ) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(RocksStore::open(dir.path()).unwrap());
         let config = ControlConfig {
@@ -501,9 +703,15 @@ mod tests {
             .unwrap();
         assert_eq!(agent.status, AgentState::Hibernating);
 
-        // Wake
+        // Wake (goes through Provisioning for scheduler)
         let agent = service.wake_agent(&user_id, &agent.agent_id).await.unwrap();
-        assert_eq!(agent.status, AgentState::Running);
+        assert_eq!(agent.status, AgentState::Provisioning);
+
+        // Simulate provisioning complete
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
 
         // Stop
         let agent = service.stop_agent(&user_id, &agent.agent_id).await.unwrap();

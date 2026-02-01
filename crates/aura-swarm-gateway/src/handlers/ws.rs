@@ -81,6 +81,8 @@ where
 }
 
 /// Handle the WebSocket connection after upgrade.
+///
+/// Connects to the agent's `/stream` endpoint for real-time streaming.
 async fn handle_websocket(
     client_socket: WebSocket,
     agent_endpoint: String,
@@ -88,8 +90,8 @@ async fn handle_websocket(
     agent_id: String,
     timeout: std::time::Duration,
 ) {
-    // Connect to agent
-    let agent_url = format!("ws://{agent_endpoint}/chat");
+    // Connect to agent's streaming endpoint
+    let agent_url = format!("ws://{agent_endpoint}/stream");
 
     let agent_socket =
         match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(&agent_url)).await {

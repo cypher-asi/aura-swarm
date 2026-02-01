@@ -150,6 +150,7 @@ mod tests {
             cpu_millicores: 1000,
             memory_mb: 1024,
             runtime_version: "v1.0.0".to_string(),
+            isolation: None,
         };
         let req = CreateAgentRequest::with_spec("my-agent", spec.clone());
         assert_eq!(req.name, "my-agent");

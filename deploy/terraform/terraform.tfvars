@@ -22,6 +22,6 @@ node_max_count      = 5
 
 # Feature flags - only deploy network for now
 enable_network = true
-enable_storage = false
-enable_eks     = false
-enable_ecr     = false
+enable_storage = true
+enable_eks     = true
+enable_ecr     = true

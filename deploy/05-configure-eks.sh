@@ -66,19 +66,21 @@ fi
 
 # Create IAM role for EFS CSI driver
 EFS_ROLE_NAME="${RESOURCE_PREFIX}-efs-csi-role"
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # Check if role exists
 if ! aws iam get-role --role-name "${EFS_ROLE_NAME}" &> /dev/null; then
     echo "Creating IAM role for EFS CSI driver..."
     
-    cat > /tmp/efs-csi-trust-policy.json <<EOF
+    # Build the trust policy as a JSON string (avoids file:// issues on Windows)
+    TRUST_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
       "Principal": {
-        "Federated": "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):oidc-provider/${OIDC_PROVIDER}"
+        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}"
       },
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
@@ -91,10 +93,11 @@ if ! aws iam get-role --role-name "${EFS_ROLE_NAME}" &> /dev/null; then
   ]
 }
 EOF
+)
     
     aws iam create-role \
         --role-name "${EFS_ROLE_NAME}" \
-        --assume-role-policy-document file:///tmp/efs-csi-trust-policy.json
+        --assume-role-policy-document "$TRUST_POLICY"
     
     aws iam attach-role-policy \
         --role-name "${EFS_ROLE_NAME}" \
@@ -103,7 +106,7 @@ EOF
     echo -e "${GREEN}✓${NC} IAM role created: ${EFS_ROLE_NAME}"
 fi
 
-EFS_ROLE_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/${EFS_ROLE_NAME}"
+EFS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EFS_ROLE_NAME}"
 
 # Install EFS CSI driver using EKS add-on
 echo "Installing EFS CSI driver add-on..."

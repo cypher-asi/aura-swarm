@@ -48,6 +48,50 @@ echo "  ECR Registry: ${ECR_REGISTRY}"
 echo ""
 
 #------------------------------------------------------------------------------
+# Load secrets from .secrets/ folder
+#------------------------------------------------------------------------------
+
+SECRETS_DIR="${SCRIPT_DIR}/../.secrets"
+
+echo "Loading secrets from .secrets/ folder..."
+
+load_secret() {
+    local name="$1"
+    local file="${SECRETS_DIR}/${name}"
+    
+    if [[ -f "$file" ]]; then
+        cat "$file" | tr -d '\n'
+    else
+        echo ""
+    fi
+}
+
+ANTHROPIC_API_KEY=$(load_secret "ANTHROPIC_API_KEY")
+OPENAI_API_KEY=$(load_secret "OPENAI_API_KEY")
+ZERO_ID_SECRET=$(load_secret "ZERO_ID_SECRET")
+
+# Validate required secrets
+MISSING_SECRETS=()
+if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+    MISSING_SECRETS+=("ANTHROPIC_API_KEY")
+fi
+
+if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+    echo -e "${RED}✗${NC} Missing required secrets: ${MISSING_SECRETS[*]}"
+    echo ""
+    echo "Create the following files in .secrets/ folder:"
+    for secret in "${MISSING_SECRETS[@]}"; do
+        echo "  - .secrets/${secret}"
+    done
+    echo ""
+    echo "See .secrets/README.md for instructions."
+    exit 1
+fi
+
+echo -e "${GREEN}✓${NC} Secrets loaded"
+echo ""
+
+#------------------------------------------------------------------------------
 # Update K8s manifests with environment values
 #------------------------------------------------------------------------------
 
@@ -57,6 +101,19 @@ echo "Updating Kubernetes manifests..."
 
 # Update storage class with EFS ID
 sed -i "s/EFS_FILESYSTEM_ID/${EFS_ID}/g" "${K8S_DIR}/01-storage-class.yaml" 2>/dev/null || true
+
+# Update ConfigMap with aura-runtime image URL
+RUNTIME_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
+sed -i "s|REPLACE_WITH_ECR_REGISTRY/${RESOURCE_PREFIX}-runtime:v0.1.0|${RUNTIME_IMAGE}|g" "${K8S_DIR}/03-secrets.yaml" 2>/dev/null || true
+
+# Inject secrets into the secrets manifest (use a temp file to avoid partial writes)
+SECRETS_YAML="${K8S_DIR}/03-secrets.yaml"
+SECRETS_YAML_TMP="${K8S_DIR}/03-secrets.yaml.tmp"
+
+cp "$SECRETS_YAML" "$SECRETS_YAML_TMP"
+sed -i "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY}|g" "$SECRETS_YAML_TMP"
+sed -i "s|__OPENAI_API_KEY__|${OPENAI_API_KEY:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
+sed -i "s|__ZERO_ID_SECRET__|${ZERO_ID_SECRET:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
 
 # Update deployments with ECR image URLs
 for manifest in "${K8S_DIR}"/05-*.yaml "${K8S_DIR}"/06-*.yaml "${K8S_DIR}"/07-*.yaml; do
@@ -94,6 +151,11 @@ MANIFESTS=(
 for manifest in "${MANIFESTS[@]}"; do
     manifest_path="${K8S_DIR}/${manifest}"
     
+    # Use temp file for secrets (contains injected values)
+    if [[ "$manifest" == "03-secrets.yaml" ]]; then
+        manifest_path="${SECRETS_YAML_TMP}"
+    fi
+    
     if [[ -f "$manifest_path" ]]; then
         echo "Applying ${manifest}..."
         kubectl apply -f "$manifest_path"
@@ -102,6 +164,11 @@ for manifest in "${MANIFESTS[@]}"; do
         echo -e "${YELLOW}⚠${NC} Skipping ${manifest} (not found)"
     fi
 done
+
+# Clean up temp secrets file (don't leave secrets on disk)
+if [[ -f "$SECRETS_YAML_TMP" ]]; then
+    rm -f "$SECRETS_YAML_TMP"
+fi
 
 echo ""
 

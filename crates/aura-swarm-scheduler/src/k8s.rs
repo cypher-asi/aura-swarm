@@ -3,7 +3,6 @@
 //! This module provides the `K8sScheduler` which manages agent pods in a
 //! Kubernetes cluster using the Kata Containers runtime for microVM isolation.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,10 +11,11 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::runtime::watcher::{self, watcher, Config as WatcherConfig};
 use kube::Client;
+use serde::Serialize;
 use tracing::{error, info, warn};
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, AgentState, Store};
+use aura_swarm_store::{AgentSpec, AgentState};
 
 use crate::cache::EndpointCache;
 use crate::pod::{build_pod, pod_name_for_agent};
@@ -142,11 +142,13 @@ impl K8sScheduler {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
-    /// Run the reconciliation loop, watching for pod changes and updating the store.
+    /// Run the reconciliation loop, watching for pod changes and notifying the gateway.
     ///
     /// This method runs indefinitely, processing pod events as they occur.
     /// It should be spawned as a background task.
-    pub async fn run_reconciler<S: Store + 'static>(&self, store: Arc<S>) {
+    ///
+    /// Status updates are sent to the gateway's internal endpoint via HTTP.
+    pub async fn run_reconciler(&self) {
         let pods = self.pods_api();
         let config = WatcherConfig::default().labels("app=swarm-agent");
 
@@ -156,16 +158,17 @@ impl K8sScheduler {
 
         info!(
             namespace = %self.config.namespace,
+            gateway_url = %self.config.gateway_url,
             "Starting pod reconciliation loop"
         );
 
         while let Some(event) = watch.next().await {
             match event {
                 Ok(watcher::Event::Apply(pod) | watcher::Event::InitApply(pod)) => {
-                    Self::handle_pod_update(&self.endpoint_cache, &pod, store.as_ref());
+                    self.handle_pod_update(&pod).await;
                 }
                 Ok(watcher::Event::Delete(pod)) => {
-                    self.handle_pod_deleted(&pod, store.as_ref());
+                    self.handle_pod_deleted(&pod).await;
                 }
                 Ok(watcher::Event::Init) => {
                     info!("Watcher initialized, starting reconciliation");
@@ -183,7 +186,7 @@ impl K8sScheduler {
         warn!("Reconciliation loop exited unexpectedly");
     }
 
-    fn handle_pod_update<S: Store>(endpoint_cache: &EndpointCache, pod: &Pod, store: &S) {
+    async fn handle_pod_update(&self, pod: &Pod) {
         let Some(agent_id) = Self::extract_agent_id(pod) else {
             return;
         };
@@ -198,7 +201,7 @@ impl K8sScheduler {
 
         // Update endpoint cache if we have an IP
         if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_ref()) {
-            endpoint_cache.insert(agent_id, format!("{ip}:8080"));
+            self.endpoint_cache.insert(agent_id, format!("{ip}:8080"));
         }
 
         // Map pod phase to agent state
@@ -210,11 +213,12 @@ impl K8sScheduler {
             _ => return, // Don't update for unknown states
         };
 
-        if let Err(e) = store.update_agent_status(&agent_id, new_state) {
+        // Notify the gateway of the status change
+        if let Err(e) = self.notify_status_change(&agent_id, new_state, None).await {
             error!(
                 agent_id = %agent_id,
                 error = %e,
-                "Failed to update agent status"
+                "Failed to notify gateway of status change"
             );
         } else {
             info!(
@@ -222,12 +226,12 @@ impl K8sScheduler {
                 phase,
                 ready,
                 new_state = ?new_state,
-                "Updated agent status from pod"
+                "Notified gateway of agent status change"
             );
         }
     }
 
-    fn handle_pod_deleted<S: Store>(&self, pod: &Pod, store: &S) {
+    async fn handle_pod_deleted(&self, pod: &Pod) {
         let Some(agent_id) = Self::extract_agent_id(pod) else {
             return;
         };
@@ -235,24 +239,77 @@ impl K8sScheduler {
         // Remove from endpoint cache
         self.endpoint_cache.remove(&agent_id);
 
-        // Update state to Stopped (unless it's Hibernating)
-        if let Ok(Some(agent)) = store.get_agent(&agent_id) {
-            if agent.status != AgentState::Hibernating {
-                if let Err(e) = store.update_agent_status(&agent_id, AgentState::Stopped) {
-                    error!(
-                        agent_id = %agent_id,
-                        error = %e,
-                        "Failed to update agent status on pod deletion"
-                    );
-                } else {
-                    info!(agent_id = %agent_id, "Marked agent as stopped (pod deleted)");
-                }
-            }
+        // Notify gateway that pod is deleted (transition to Stopped)
+        // Note: The gateway will check if agent is hibernating and skip if so
+        if let Err(e) = self
+            .notify_status_change(&agent_id, AgentState::Stopped, Some("Pod deleted".to_string()))
+            .await
+        {
+            error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to notify gateway of pod deletion"
+            );
+        } else {
+            info!(agent_id = %agent_id, "Notified gateway of pod deletion");
+        }
+    }
+
+    /// Notify the gateway of an agent status change via HTTP.
+    async fn notify_status_change(
+        &self,
+        agent_id: &AgentId,
+        status: AgentState,
+        message: Option<String>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct StatusUpdate {
+            status: AgentState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message: Option<String>,
+        }
+
+        let url = format!(
+            "{}/internal/agents/{}/status",
+            self.config.gateway_url,
+            agent_id.to_hex()
+        );
+
+        let body = StatusUpdate { status, message };
+
+        let response = self
+            .http_client
+            .patch(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SchedulerError::Config(format!("Failed to call gateway: {e}")))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status_code = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            Err(SchedulerError::Config(format!(
+                "Gateway returned {status_code}: {error_text}"
+            )))
         }
     }
 
     fn extract_agent_id(pod: &Pod) -> Option<AgentId> {
-        let agent_id_hex = pod.metadata.labels.as_ref()?.get("swarm.io/agent-id")?;
+        // Try to get full agent ID from annotation first (preferred, no truncation)
+        // Fall back to label for backwards compatibility
+        let agent_id_hex = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("swarm.io/agent-id-full"))
+            .or_else(|| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("swarm.io/agent-id"))
+            })?;
 
         match AgentId::from_hex(agent_id_hex) {
             Ok(id) => Some(id),
@@ -260,7 +317,7 @@ impl K8sScheduler {
                 warn!(
                     agent_id_hex,
                     error = %e,
-                    "Invalid agent ID in pod label"
+                    "Invalid agent ID in pod label/annotation"
                 );
                 None
             }

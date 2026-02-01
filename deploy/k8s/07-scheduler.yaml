@@ -21,7 +21,7 @@ spec:
       serviceAccountName: aura-swarm-scheduler
       containers:
         - name: scheduler
-          image: ECR_REGISTRY/RESOURCE_PREFIX-scheduler:IMAGE_TAG
+          image: 909208902094.dkr.ecr.us-east-2.amazonaws.com/aura-swarm-dev-scheduler:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -32,23 +32,40 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: RUST_LOG
-            - name: AGENT_NAMESPACE
+            - name: SCHEDULER_NAMESPACE
               valueFrom:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: SCHEDULER_NAMESPACE
-            - name: RUNTIME_CLASS
+            - name: AURA_RUNTIME_IMAGE
               valueFrom:
                 configMapKeyRef:
                   name: aura-swarm-config
-                  key: SCHEDULER_RUNTIME_CLASS
+                  key: AURA_RUNTIME_IMAGE
+            - name: DEFAULT_ISOLATION
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: DEFAULT_ISOLATION
+                  optional: true
+            # Gateway URL for status callbacks
+            - name: GATEWAY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: GATEWAY_URL
+            # Deprecated - use GATEWAY_URL
             - name: CONTROL_PLANE_URL
               valueFrom:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: CONTROL_PLANE_URL
             - name: STATE_PVC_NAME
-              value: "swarm-agent-state"
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: STATE_PVC_NAME
+                  optional: true
           resources:
             requests:
               cpu: 250m

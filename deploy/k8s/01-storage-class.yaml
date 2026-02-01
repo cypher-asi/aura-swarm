@@ -8,10 +8,25 @@ metadata:
 provisioner: efs.csi.aws.com
 parameters:
   provisioningMode: efs-ap
-  fileSystemId: EFS_FILESYSTEM_ID
+  fileSystemId: fs-0b2a453aa898213d9
   directoryPerms: "755"
   uid: "1000"
   gid: "1000"
   basePath: "/state"
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
+---
+# GP3 Storage Class for service persistent state (RocksDB, etc.)
+# Uses EBS volumes for single-node access
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  fsType: ext4
+  encrypted: "true"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
