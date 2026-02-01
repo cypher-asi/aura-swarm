@@ -8,11 +8,245 @@
 
 use std::time::Duration;
 
+use base64::Engine;
 use tokio::sync::mpsc;
 
 use crate::client::{ClientError, GatewayClient};
 use crate::types::{Agent, AgentState, ChatMessage};
 use crate::ws::{self, WsEvent, WsSender};
+
+// =============================================================================
+// Tool Result Formatting
+// =============================================================================
+
+/// Parsed tool result from the agent runtime.
+#[derive(Debug)]
+struct ToolResult {
+    tool: String,
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl ToolResult {
+    /// Parse a tool result JSON string.
+    fn parse(json: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let obj = v.as_object()?;
+        
+        let tool = obj.get("tool")?.as_str()?.to_string();
+        let ok = obj.get("ok")?.as_bool()?;
+        let stdout_b64 = obj.get("stdout")?.as_str().unwrap_or("");
+        let stderr_b64 = obj.get("stderr")?.as_str().unwrap_or("");
+        
+        // Decode base64
+        let stdout = decode_base64(stdout_b64);
+        let stderr = decode_base64(stderr_b64);
+        
+        Some(Self { tool, ok, stdout, stderr })
+    }
+    
+    /// Format the result for display.
+    fn format(&self) -> String {
+        if !self.ok {
+            // Error case - show stderr
+            let error_msg = if self.stderr.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                self.stderr.trim().to_string()
+            };
+            return format!("Error: {error_msg}");
+        }
+        
+        // Format based on tool type
+        match self.tool.as_str() {
+            "fs.ls" | "fs_ls" => self.format_ls(),
+            "fs.read" | "fs_read" => self.format_read(),
+            "fs.write" | "fs_write" => self.format_write(),
+            "cmd.run" | "cmd_run" => self.format_cmd(),
+            _ => self.format_generic(),
+        }
+    }
+    
+    fn format_ls(&self) -> String {
+        if self.stdout.trim().is_empty() {
+            "(empty directory)".to_string()
+        } else {
+            // Parse as file listing - each line is a file/dir
+            let entries: Vec<&str> = self.stdout.lines().collect();
+            if entries.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                let count = entries.len();
+                let preview: String = entries.iter().take(10).map(|e| format!("  {e}")).collect::<Vec<_>>().join("\n");
+                if count > 10 {
+                    format!("{preview}\n  ... and {} more", count - 10)
+                } else {
+                    preview
+                }
+            }
+        }
+    }
+    
+    fn format_read(&self) -> String {
+        if self.stdout.is_empty() {
+            "(empty file)".to_string()
+        } else {
+            // Show file contents, truncated if long
+            let content = self.stdout.trim();
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() > 20 {
+                let preview: String = lines.iter().take(20).cloned().collect::<Vec<_>>().join("\n");
+                format!("{preview}\n... ({} more lines)", lines.len() - 20)
+            } else {
+                content.to_string()
+            }
+        }
+    }
+    
+    fn format_write(&self) -> String {
+        // stdout usually contains "Wrote N bytes to filename"
+        if self.stdout.is_empty() {
+            "File written".to_string()
+        } else {
+            self.stdout.trim().to_string()
+        }
+    }
+    
+    fn format_cmd(&self) -> String {
+        let mut output = String::new();
+        
+        if !self.stdout.is_empty() {
+            output.push_str(self.stdout.trim());
+        }
+        
+        if !self.stderr.is_empty() {
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str("stderr:\n");
+            output.push_str(self.stderr.trim());
+        }
+        
+        if output.is_empty() {
+            "(no output)".to_string()
+        } else {
+            // Truncate very long output
+            if output.len() > 2000 {
+                format!("{}...\n(truncated)", &output[..2000])
+            } else {
+                output
+            }
+        }
+    }
+    
+    fn format_generic(&self) -> String {
+        if !self.stdout.is_empty() {
+            let content = self.stdout.trim();
+            if content.len() > 500 {
+                format!("{}...", &content[..500])
+            } else {
+                content.to_string()
+            }
+        } else {
+            "OK".to_string()
+        }
+    }
+}
+
+/// Decode a base64 string to UTF-8 text.
+fn decode_base64(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| input.to_string()) // Fall back to raw if not valid base64
+}
+
+/// Format a tool result for display.
+fn format_tool_result(result: &str) -> String {
+    ToolResult::parse(result)
+        .map(|r| r.format())
+        .unwrap_or_else(|| {
+            // Fallback: just show the raw result, truncated
+            if result.len() > 500 {
+                format!("{}...", &result[..500])
+            } else {
+                result.to_string()
+            }
+        })
+}
+
+/// Format tool arguments like a shell command for display.
+/// Returns empty string if there's nothing meaningful to show.
+fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+    // Skip if args is null or empty
+    if args.is_null() {
+        return String::new();
+    }
+    
+    let obj = args.as_object();
+    if obj.map_or(false, |o| o.is_empty()) {
+        return String::new();
+    }
+    
+    // Extract common argument patterns for cleaner display
+    match tool_name {
+        "fs.ls" | "fs_ls" => {
+            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str()).unwrap_or(".");
+            format!("ls {path}")
+        }
+        "fs.read" | "fs_read" => {
+            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str());
+            path.map(|p| format!("cat {p}")).unwrap_or_default()
+        }
+        "fs.write" | "fs_write" => {
+            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str());
+            let content = obj.and_then(|o| o.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+            match path {
+                Some(p) => {
+                    let preview = if content.len() > 30 {
+                        format!("{}...", &content[..30])
+                    } else {
+                        content.to_string()
+                    };
+                    format!("write {p} \"{preview}\"")
+                }
+                None => String::new(),
+            }
+        }
+        "fs.mkdir" | "fs_mkdir" => {
+            obj.and_then(|o| o.get("path")).and_then(|v| v.as_str())
+                .map(|p| format!("mkdir {p}"))
+                .unwrap_or_default()
+        }
+        "fs.rm" | "fs_rm" => {
+            obj.and_then(|o| o.get("path")).and_then(|v| v.as_str())
+                .map(|p| format!("rm {p}"))
+                .unwrap_or_default()
+        }
+        "cmd.run" | "cmd_run" => {
+            let cmd = obj.and_then(|o| o.get("command")).and_then(|v| v.as_str())
+                .or_else(|| obj.and_then(|o| o.get("cmd")).and_then(|v| v.as_str()));
+            cmd.map(|c| format!("$ {c}")).unwrap_or_default()
+        }
+        _ => {
+            // Generic: show tool name with compact args
+            let compact = serde_json::to_string(args).unwrap_or_default();
+            if compact == "{}" || compact.is_empty() {
+                String::new()
+            } else if compact.len() > 60 {
+                format!("{tool_name} {}...", &compact[..60])
+            } else {
+                format!("{tool_name} {compact}")
+            }
+        }
+    }
+}
 
 /// Which UI column has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -538,24 +772,26 @@ impl App {
             WsEvent::ToolStart { tool_name, args } => {
                 // Show that the server is executing a tool
                 self.set_status(format!("Executing: {tool_name}..."));
-                // Add a visual indicator to the streaming buffer
-                let args_str = serde_json::to_string_pretty(&args).unwrap_or_default();
-                self.streaming_text_buffer.push_str(&format!("\n\n🔧 **{tool_name}**\n```json\n{args_str}\n```\n"));
+                
+                // Format tool call like a command
+                let args_display = format_tool_args(&tool_name, &args);
+                let display = if args_display.is_empty() {
+                    tool_name.clone() // Just show tool name when no args
+                } else {
+                    args_display
+                };
+                self.streaming_text_buffer.push_str(&format!("\n\n🔧 `{display}`\n"));
                 self.update_streaming_message_live();
                 true
             }
             WsEvent::ToolComplete { tool_name, result, is_error } => {
-                // Show tool execution result
+                // Show tool execution result with proper formatting
                 let icon = if is_error { "❌" } else { "✅" };
                 let status = if is_error { "Error" } else { "Success" };
                 self.set_status(format!("{tool_name}: {status}"));
                 
-                // Add result to streaming buffer (truncate if very long)
-                let display_result = if result.len() > 500 {
-                    format!("{}...(truncated)", &result[..500])
-                } else {
-                    result
-                };
+                // Parse and format the result for clean display
+                let display_result = format_tool_result(&result);
                 self.streaming_text_buffer.push_str(&format!("\n{icon} **Result:**\n```\n{display_result}\n```\n\n"));
                 self.update_streaming_message_live();
                 true

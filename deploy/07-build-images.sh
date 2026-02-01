@@ -13,6 +13,7 @@
 #   ./07-build-images.sh              # Build platform services only
 #   ./07-build-images.sh --all        # Build platform + aura-runtime
 #   ./07-build-images.sh --runtime    # Build aura-runtime only
+#   ./07-build-images.sh --runtime --refresh  # Build runtime AND restart agent pods
 
 set -euo pipefail
 
@@ -253,6 +254,7 @@ if [[ "$BUILD_RUNTIME" == "true" ]]; then
     
     echo "Building aura-runtime image..."
     docker build \
+        --no-cache \
         -t "${RUNTIME_REPO_NAME}:${IMAGE_TAG}" \
         -t "${RUNTIME_IMAGE}" \
         "${AURA_RUNTIME_PATH}"
@@ -284,9 +286,6 @@ fi
 
 if [[ "$BUILD_RUNTIME" == "true" ]]; then
     echo "  ${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
-    echo ""
-    echo -e "${YELLOW}Note: Update scheduler config to use:${NC}"
-    echo "  AURA_RUNTIME_IMAGE=${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
 fi
 
 echo ""
@@ -337,6 +336,32 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
     else
         echo "No platform services were built, skipping refresh."
     fi
+    
+    # Restart agent pods if runtime was rebuilt
+    if [[ "$BUILD_RUNTIME" == "true" ]]; then
+        echo ""
+        echo "=============================================="
+        echo "  Restarting Agent Pods"
+        echo "=============================================="
+        echo ""
+        
+        AGENT_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        if [[ "$AGENT_COUNT" -gt 0 ]]; then
+            echo "Found ${AGENT_COUNT} running agent pod(s)."
+            echo "Deleting all agent pods to pull new runtime image..."
+            echo ""
+            
+            kubectl delete pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --wait=false
+            
+            echo ""
+            echo -e "${GREEN}✓${NC} Agent pods deleted. They will be recreated with the new image when sessions are opened."
+            echo ""
+            echo -e "${YELLOW}Note:${NC} Agents will be in 'Stopped' state. Use the CLI to start them again."
+        else
+            echo "No running agent pods found."
+        fi
+    fi
 else
     echo "Next step: Run ./08-deploy-k8s.sh"
     echo ""
@@ -346,4 +371,17 @@ else
     echo "Or use --refresh flag next time:"
     echo "  ./07-build-images.sh --dev-mode --refresh          # All services"
     echo "  ./07-build-images.sh --dev-mode --refresh-gateway  # Gateway only"
+    
+    # Warn about agent pods if runtime was rebuilt
+    if [[ "$BUILD_RUNTIME" == "true" ]]; then
+        AGENT_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        if [[ "$AGENT_COUNT" -gt 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}⚠ Warning:${NC} ${AGENT_COUNT} agent pod(s) are still running with the OLD runtime image."
+            echo "  To update them, either:"
+            echo "    1. Use --refresh flag: ./07-build-images.sh --runtime --refresh"
+            echo "    2. Manually delete: kubectl delete pods -n ${K8S_NAMESPACE_AGENTS} -l app=swarm-agent"
+        fi
+    fi
 fi

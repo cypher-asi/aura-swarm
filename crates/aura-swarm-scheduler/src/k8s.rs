@@ -268,26 +268,37 @@ impl K8sScheduler {
                 "Pod creation error detected from event"
             );
 
-            // Try to extract agent ID from pod name (agent-{hex})
-            if let Some(hex) = pod_name.strip_prefix("agent-") {
-                if let Ok(agent_id) = AgentId::from_hex(hex) {
-                    let error_msg = format!("{reason}: {message}");
-                    if let Err(e) = self
-                        .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
-                        .await
-                    {
-                        error!(
-                            agent_id = %agent_id,
-                            error = %e,
-                            "Failed to notify gateway of pod error from event"
-                        );
-                    } else {
-                        info!(
-                            agent_id = %agent_id,
-                            reason,
-                            "Notified gateway of pod error from Kubernetes event"
-                        );
-                    }
+            // Pod name is truncated (agent-{first 16 hex chars}), so we need to
+            // fetch the pod to get the full agent ID from the annotation
+            let agent_id = match self.pods_api().get_opt(pod_name).await {
+                Ok(Some(pod)) => Self::extract_agent_id(&pod),
+                Ok(None) => {
+                    debug!(pod_name, "Pod not found when handling error event");
+                    None
+                }
+                Err(e) => {
+                    debug!(pod_name, error = %e, "Failed to fetch pod for error event");
+                    None
+                }
+            };
+
+            if let Some(agent_id) = agent_id {
+                let error_msg = format!("{reason}: {message}");
+                if let Err(e) = self
+                    .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
+                    .await
+                {
+                    error!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Failed to notify gateway of pod error from event"
+                    );
+                } else {
+                    info!(
+                        agent_id = %agent_id,
+                        reason,
+                        "Notified gateway of pod error from Kubernetes event"
+                    );
                 }
             }
         }

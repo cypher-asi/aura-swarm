@@ -114,6 +114,7 @@ cp "$SECRETS_YAML" "$SECRETS_YAML_TMP"
 sed -i "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__OPENAI_API_KEY__|${OPENAI_API_KEY:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__ZERO_ID_SECRET__|${ZERO_ID_SECRET:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
+sed -i "s|__DEFAULT_ISOLATION__|${DEFAULT_ISOLATION}|g" "$SECRETS_YAML_TMP"
 
 # Update deployments with ECR image URLs
 for manifest in "${K8S_DIR}"/05-*.yaml "${K8S_DIR}"/06-*.yaml "${K8S_DIR}"/07-*.yaml; do

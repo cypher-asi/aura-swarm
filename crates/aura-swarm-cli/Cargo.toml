@@ -49,5 +49,8 @@ chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Base64 decoding for tool results
+base64 = "0.22"
+
 [lints]
 workspace = true
