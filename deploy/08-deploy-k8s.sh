@@ -7,8 +7,39 @@
 # - Secrets (placeholders), RBAC
 # - Deployments (gateway, control, scheduler)
 # - Network policies
+#
+# Usage:
+#   ./08-deploy-k8s.sh              # Normal deploy (preserves data)
+#   ./08-deploy-k8s.sh --reset-data # Fresh deploy (wipes databases)
 
 set -euo pipefail
+
+#------------------------------------------------------------------------------
+# Parse arguments
+#------------------------------------------------------------------------------
+
+RESET_DATA=false
+
+for arg in "$@"; do
+    case $arg in
+        --reset-data)
+            RESET_DATA=true
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--reset-data]"
+            echo ""
+            echo "Options:"
+            echo "  --reset-data  Delete gateway and control plane databases before deploy"
+            echo "                (wipes all agent records, sessions, and user data)"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.env"
@@ -127,6 +158,52 @@ done
 
 echo -e "${GREEN}✓${NC} Manifests updated"
 echo ""
+
+#------------------------------------------------------------------------------
+# Reset data (if requested)
+#------------------------------------------------------------------------------
+
+if [[ "$RESET_DATA" == "true" ]]; then
+    echo -e "${RED}WARNING: --reset-data flag detected${NC}"
+    echo ""
+    echo "This will delete ALL stored data including:"
+    echo "  - Agent records"
+    echo "  - Session history"
+    echo "  - User data"
+    echo ""
+    read -p "Are you sure you want to continue? [y/N] " -n 1 -r
+    echo ""
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+    
+    echo ""
+    echo "Deleting data PVCs..."
+    
+    # Delete gateway data PVC
+    if kubectl get pvc aura-swarm-gateway-data -n "${K8S_NAMESPACE_SYSTEM}" &>/dev/null; then
+        echo "  Deleting aura-swarm-gateway-data..."
+        kubectl delete pvc aura-swarm-gateway-data -n "${K8S_NAMESPACE_SYSTEM}" --wait=true
+        echo -e "  ${GREEN}✓${NC} Deleted gateway data"
+    else
+        echo -e "  ${YELLOW}⚠${NC} aura-swarm-gateway-data not found (skipping)"
+    fi
+    
+    # Delete control plane data PVC
+    if kubectl get pvc aura-swarm-control-data -n "${K8S_NAMESPACE_SYSTEM}" &>/dev/null; then
+        echo "  Deleting aura-swarm-control-data..."
+        kubectl delete pvc aura-swarm-control-data -n "${K8S_NAMESPACE_SYSTEM}" --wait=true
+        echo -e "  ${GREEN}✓${NC} Deleted control plane data"
+    else
+        echo -e "  ${YELLOW}⚠${NC} aura-swarm-control-data not found (skipping)"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}✓${NC} Data reset complete. PVCs will be recreated during deploy."
+    echo ""
+fi
 
 #------------------------------------------------------------------------------
 # Apply manifests in order

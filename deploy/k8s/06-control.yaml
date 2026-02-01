@@ -1,5 +1,22 @@
 # Control Plane Deployment and Service
 # Agent CRUD, lifecycle management, session routing
+#
+# NOTE: Uses a single replica because RocksDB doesn't support concurrent writers.
+# For HA, use a distributed database or leader election.
+---
+# PVC for control plane RocksDB data (uses existing EFS storage class)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aura-swarm-control-data
+  namespace: swarm-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 10Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -9,7 +26,11 @@ metadata:
   labels:
     app: aura-swarm-control
 spec:
-  replicas: 2
+  # Single replica because RocksDB doesn't support concurrent writers
+  # For HA, consider using a distributed database or leader election
+  replicas: 1
+  strategy:
+    type: Recreate  # Ensures old pod is fully terminated before new one starts
   selector:
     matchLabels:
       app: aura-swarm-control
@@ -66,7 +87,8 @@ spec:
             runAsUser: 1000
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: aura-swarm-control-data
 ---
 apiVersion: v1
 kind: Service

@@ -25,8 +25,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use app::{App, Focus, InputMode, REFRESH_INTERVAL};
+use app::{App, InputMode, REFRESH_INTERVAL};
 use client::GatewayClient;
+use types::AgentState;
 use ws::WsEvent;
 
 /// Aura Swarm CLI - Terminal UI for managing agents.
@@ -209,110 +210,86 @@ async fn handle_input(
 }
 
 /// Handle input in normal mode.
+///
+/// Unified input model:
+/// - Up/Down always navigate agents
+/// - Typing goes directly to input (when not in command mode)
+/// - ESC enters command mode where q/n/d/s/t/r work
 async fn handle_normal_mode(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
     ws_tx: &mpsc::Sender<WsEvent>,
 ) -> anyhow::Result<()> {
-    // Check if we can use command keys (q to quit)
-    // Only allowed when: in Agents panel, OR in Chat panel but NOT in insert mode
-    let can_use_commands = app.focus == Focus::Agents || !app.chat_insert_mode;
-
-    // Global keybindings
-    match code {
-        KeyCode::Char('q') if can_use_commands => {
-            app.should_quit = true;
-            return Ok(());
-        }
-        KeyCode::Tab => {
-            app.focus = app.focus.next();
-            // Enter insert mode when switching to Chat
-            if app.focus == Focus::Chat {
-                app.chat_insert_mode = true;
-            }
-            return Ok(());
-        }
-        KeyCode::BackTab => {
-            app.focus = app.focus.prev();
-            // Enter insert mode when switching to Chat
-            if app.focus == Focus::Chat {
-                app.chat_insert_mode = true;
-            }
-            return Ok(());
-        }
-        KeyCode::Esc => {
-            // In Chat panel: first exit insert mode, then handle other Esc actions
-            if app.focus == Focus::Chat && app.chat_insert_mode {
-                app.chat_insert_mode = false;
-                return Ok(());
-            }
-            // Cancel streaming, clear error, input, or disconnect (in priority order)
+    // ESC toggles command mode
+    if code == KeyCode::Esc {
+        if app.command_mode {
+            // Exit command mode back to input mode
+            app.command_mode = false;
+        } else {
+            // Enter command mode, or handle streaming/errors first
             if app.is_streaming {
                 app.cancel_streaming().await;
             } else if app.error_message.is_some() {
                 app.clear_error();
-            } else if !app.input.is_empty() {
-                app.clear_input();
-            } else if app.is_connected() {
-                app.disconnect().await;
+            } else {
+                // Enter command mode
+                app.command_mode = true;
             }
+        }
+        return Ok(());
+    }
+
+    // Page up/down always work for scrolling
+    match code {
+        KeyCode::PageUp => {
+            app.scroll_chat_up(10);
+            return Ok(());
+        }
+        KeyCode::PageDown => {
+            app.scroll_chat_down(10);
             return Ok(());
         }
         _ => {}
     }
 
-    // Panel-specific keybindings
-    match app.focus {
-        Focus::Agents => {
-            handle_agents_panel_input(app, code, ws_tx).await?;
+    // Up/Down always navigate agents
+    match code {
+        KeyCode::Up => {
+            app.select_prev_agent();
+            return Ok(());
         }
-        Focus::Chat => {
-            // Right column: handle both chat scrolling and input
-            handle_chat_column_input(app, code, modifiers, ws_tx).await?;
+        KeyCode::Down => {
+            app.select_next_agent();
+            return Ok(());
         }
+        _ => {}
+    }
+
+    if app.command_mode {
+        // Command mode: single-key commands for agent actions
+        handle_command_mode(app, code, ws_tx).await?;
+    } else {
+        // Input mode: typing goes to input
+        handle_input_mode(app, code, modifiers, ws_tx).await?;
     }
 
     Ok(())
 }
 
-/// Handle input for the agents panel.
-async fn handle_agents_panel_input(
+/// Handle input in command mode (ESC was pressed).
+/// Single-key commands for agent management.
+async fn handle_command_mode(
     app: &mut App,
     code: KeyCode,
     ws_tx: &mpsc::Sender<WsEvent>,
 ) -> anyhow::Result<()> {
     match code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.select_prev_agent();
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.select_next_agent();
-        }
-        KeyCode::Enter => {
-            // Connect to agent
-            if app.selected_agent().is_some() {
-                match app.connect_to_agent().await {
-                    Ok(mut rx) => {
-                        // Spawn task to forward WebSocket events to the main channel
-                        let ws_tx = ws_tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(event) = rx.recv().await {
-                                if ws_tx.send(event).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-                        app.focus = Focus::Chat;
-                    }
-                    Err(e) => {
-                        app.set_error(e);
-                    }
-                }
-            }
+        KeyCode::Char('q') => {
+            app.should_quit = true;
         }
         KeyCode::Char('n') => {
-            // Create new agent - enter dialog mode (saves chat input)
+            // Create new agent - enter dialog mode
             app.enter_dialog_mode(InputMode::CreatingAgent);
         }
         KeyCode::Char('d') => {
@@ -351,44 +328,74 @@ async fn handle_agents_panel_input(
                 app.set_error(e.to_string());
             }
         }
+        KeyCode::Char('c') => {
+            // Connect to agent (auto-wake/start if needed)
+            if app.selected_agent().is_some() && !app.is_connected() {
+                // Show immediate feedback about agent state
+                show_agent_wake_status(app);
+                
+                match app.ensure_ready_and_connect().await {
+                    Ok(mut rx) => {
+                        let ws_tx = ws_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = rx.recv().await {
+                                if ws_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        app.set_error(e);
+                    }
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            // Disconnect from agent
+            if app.is_connected() {
+                app.disconnect().await;
+            }
+        }
+        KeyCode::Char('j') => {
+            // Scroll chat down (vim-style)
+            app.scroll_chat_down(1);
+        }
+        KeyCode::Char('k') => {
+            // Scroll chat up (vim-style)
+            app.scroll_chat_up(1);
+        }
+        KeyCode::Enter => {
+            // Exit command mode (convenient way to get back to typing)
+            app.command_mode = false;
+        }
         _ => {}
     }
 
     Ok(())
 }
 
-/// Handle input for the chat column (right side: chat + input).
-/// Vim-like: must be in insert mode to type. Press 'i' to enter insert mode, Esc to exit.
-async fn handle_chat_column_input(
+/// Handle input in normal input mode (typing goes to input).
+async fn handle_input_mode(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
     ws_tx: &mpsc::Sender<WsEvent>,
 ) -> anyhow::Result<()> {
-    // Page up/down always work for scrolling
     match code {
-        KeyCode::PageUp => {
-            app.scroll_chat_up(10);
-            return Ok(());
-        }
-        KeyCode::PageDown => {
-            app.scroll_chat_down(10);
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    // If not in insert mode, only 'i' or Enter enters insert mode
-    if !app.chat_insert_mode {
-        match code {
-            KeyCode::Char('i') => {
-                app.chat_insert_mode = true;
-            }
-            KeyCode::Enter => {
-                // Enter also enters insert mode and connects if needed
-                app.chat_insert_mode = true;
-                if !app.is_connected() && app.selected_agent().is_some() {
-                    match app.connect_to_agent().await {
+        KeyCode::Enter => {
+            if !app.input.is_empty() {
+                if app.is_connected() {
+                    let input = app.take_input();
+                    if let Err(e) = app.send_message(input).await {
+                        app.set_error(e);
+                    }
+                } else if app.selected_agent().is_some() {
+                    // Show immediate feedback about agent state
+                    show_agent_wake_status(app);
+                    
+                    // Auto-connect (wake/start if needed) and send
+                    match app.ensure_ready_and_connect().await {
                         Ok(mut rx) => {
                             let ws_tx = ws_tx.clone();
                             tokio::spawn(async move {
@@ -398,39 +405,25 @@ async fn handle_chat_column_input(
                                     }
                                 }
                             });
+                            // Now send the message
+                            let input = app.take_input();
+                            if let Err(e) = app.send_message(input).await {
+                                app.set_error(e);
+                            }
                         }
                         Err(e) => {
                             app.set_error(e);
                         }
                     }
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.scroll_chat_up(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.scroll_chat_down(1);
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    // In insert mode: handle text input
-    match code {
-        KeyCode::Enter => {
-            if !app.input.is_empty() {
-                if app.is_connected() {
-                    let input = app.take_input();
-                    if let Err(e) = app.send_message(input).await {
-                        app.set_error(e);
-                    }
                 } else {
-                    app.set_error("Not connected to agent. Press Enter to connect first.");
+                    app.set_error("No agent selected");
                 }
             } else if !app.is_connected() && app.selected_agent().is_some() {
-                // Connect on Enter if not connected
-                match app.connect_to_agent().await {
+                // Show immediate feedback about agent state
+                show_agent_wake_status(app);
+                
+                // Connect on Enter if not connected and input is empty (auto-wake/start)
+                match app.ensure_ready_and_connect().await {
                     Ok(mut rx) => {
                         let ws_tx = ws_tx.clone();
                         tokio::spawn(async move {
@@ -549,4 +542,30 @@ async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// Show immediate status feedback when connecting to an agent that may need waking/starting.
+fn show_agent_wake_status(app: &mut App) {
+    if let Some(agent) = app.selected_agent() {
+        match agent.status {
+            AgentState::Running | AgentState::Idle => {
+                app.set_status("Connecting...");
+            }
+            AgentState::Hibernating => {
+                app.set_status(format!("Waking agent '{}'...", agent.name));
+            }
+            AgentState::Stopped => {
+                app.set_status(format!("Starting agent '{}'...", agent.name));
+            }
+            AgentState::Provisioning => {
+                app.set_status(format!("Agent '{}' is provisioning, please wait...", agent.name));
+            }
+            AgentState::Stopping => {
+                app.set_status(format!("Agent '{}' is stopping, please wait...", agent.name));
+            }
+            AgentState::Error => {
+                app.set_status(format!("Restarting failed agent '{}'...", agent.name));
+            }
+        }
+    }
 }

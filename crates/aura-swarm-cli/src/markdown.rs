@@ -161,12 +161,17 @@ impl MarkdownRenderer {
 
         let style = self.current_style();
         
-        // Handle newlines within text
+        // Handle newlines within text - preserve blank lines
         let parts: Vec<&str> = text.split('\n').collect();
         for (i, part) in parts.iter().enumerate() {
             if i > 0 {
-                // Start a new line for each newline in the source
+                // Flush current line first
                 self.flush_line();
+                // If this part is empty, it means there was a blank line (consecutive newlines)
+                // Add an explicit blank line to preserve spacing
+                if part.is_empty() && i < parts.len() - 1 {
+                    self.lines.push(Line::from(""));
+                }
             }
             
             if !part.is_empty() {

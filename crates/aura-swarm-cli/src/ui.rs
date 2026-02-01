@@ -11,7 +11,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, Focus, InputMode};
+use crate::app::{App, InputMode};
 use crate::markdown::render_markdown;
 use crate::types::AgentState;
 
@@ -102,16 +102,10 @@ fn render_header_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the agents panel.
 fn render_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.focus == Focus::Agents;
-
     let block = Block::default()
         .title(" Agents ")
         .borders(Borders::ALL)
-        .border_style(if is_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Gray)
-        });
+        .border_style(Style::default().fg(Color::Cyan));
 
     let items: Vec<ListItem> = app
         .agents
@@ -145,8 +139,8 @@ fn render_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_stateful_widget(list, area, &mut state);
 
-    // Render keybindings help at the bottom
-    if is_focused && app.input_mode == InputMode::Normal {
+    // Render keybindings help at the bottom when in command mode
+    if app.command_mode && app.input_mode == InputMode::Normal {
         let help_area = Rect::new(
             area.x + 1,
             area.y + area.height.saturating_sub(2),
@@ -179,8 +173,6 @@ const CHAT_PADDING: u16 = 2;
 
 /// Render the right column containing chat and input as one unit.
 fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.focus == Focus::Chat;
-
     // Build title (no streaming indicator here - it goes in the chat area)
     let title = if let Some(agent) = app.selected_agent() {
         if app.is_connected() {
@@ -196,11 +188,7 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(if is_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Gray)
-        });
+        .border_style(Style::default().fg(Color::Cyan));
 
     let inner_area = block.inner(area);
     frame.render_widget(block, area);
@@ -232,7 +220,7 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
         if agent.status == AgentState::Error {
             if let Some(ref error) = agent.error_message {
                 render_error_details(frame, error, chat_area);
-                render_input_line(frame, app, separator_area, input_area, is_focused);
+                render_input_line(frame, app, separator_area, input_area);
                 return;
             }
         }
@@ -275,6 +263,8 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::styled("[Agent]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 ]));
+                // Add blank lines after [Agent] label for visual separation
+                lines.push(Line::from(" "));
                 
                 // Render markdown content with syntax highlighting
                 let md_lines = render_markdown(&msg.content, content_width);
@@ -347,11 +337,11 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Render input line
-    render_input_line(frame, app, separator_area, input_area, is_focused);
+    render_input_line(frame, app, separator_area, input_area);
 }
 
 /// Render the input line at the bottom of the chat column.
-fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_area: Rect, is_focused: bool) {
+fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_area: Rect) {
     // Draw separator line
     let separator = Paragraph::new("─".repeat(separator_area.width as usize))
         .style(Style::default().fg(Color::DarkGray));
@@ -361,28 +351,26 @@ fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_a
     let in_modal = app.input_mode != InputMode::Normal;
 
     // Draw input prompt and text
-    // Show different prompt based on insert mode
-    let prompt = if !is_focused {
-        "│ "
-    } else if app.chat_insert_mode {
-        "> "
-    } else {
+    // Show different prompt based on mode
+    let prompt = if app.command_mode {
         ": "  // Command mode indicator
+    } else {
+        "> "  // Normal input mode
     };
 
     // Show input text only when not in a modal dialog
     let input_text = if in_modal { "" } else { app.input.as_str() };
     
     let input_line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(if app.chat_insert_mode && is_focused { Color::Cyan } else { Color::DarkGray })),
+        Span::styled(prompt, Style::default().fg(if app.command_mode { Color::Yellow } else { Color::Cyan })),
         Span::styled(input_text, Style::default().fg(Color::White)),
     ]);
     let input_widget = Paragraph::new(input_line);
     frame.render_widget(input_widget, input_area);
 
-    // Show cursor only if focused AND in insert mode AND not streaming AND not in modal
+    // Show cursor when not in command mode AND not streaming AND not in modal
     // Hide cursor during streaming to prevent flickering
-    if is_focused && app.input_mode == InputMode::Normal && app.chat_insert_mode && !app.is_streaming {
+    if !app.command_mode && app.input_mode == InputMode::Normal && !app.is_streaming {
         frame.set_cursor_position((
             input_area.x + prompt.len() as u16 + app.cursor_position as u16,
             input_area.y,
@@ -392,15 +380,11 @@ fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_a
 
 /// Render the status bar.
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    // Mode indicator (vim-like)
-    let mode_indicator = if app.focus == Focus::Chat {
-        if app.chat_insert_mode {
-            Span::styled(" INSERT ", Style::default().fg(Color::Black).bg(Color::Green))
-        } else {
-            Span::styled(" NORMAL ", Style::default().fg(Color::Black).bg(Color::Blue))
-        }
+    // Mode indicator
+    let mode_indicator = if app.command_mode {
+        Span::styled(" COMMAND ", Style::default().fg(Color::Black).bg(Color::Yellow))
     } else {
-        Span::styled(" AGENTS ", Style::default().fg(Color::Black).bg(Color::Magenta))
+        Span::styled(" INPUT ", Style::default().fg(Color::Black).bg(Color::Green))
     };
 
     let status = if let Some(ref error) = app.error_message {
@@ -421,47 +405,35 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             mode_indicator,
             Span::styled(format!(" {status}"), Style::default().fg(Color::Green)),
         ])
-    } else if app.focus == Focus::Chat && app.chat_insert_mode {
-        // Insert mode help
+    } else if app.command_mode {
+        // Command mode help
         Line::from(vec![
             mode_indicator,
             Span::raw(" "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(":send "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw(":normal mode "),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(":switch"),
-        ])
-    } else if app.focus == Focus::Chat {
-        // Normal mode in chat
-        Line::from(vec![
-            mode_indicator,
-            Span::raw(" "),
-            Span::styled("i", Style::default().fg(Color::Yellow)),
-            Span::raw(":insert "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(":quit "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::raw(":scroll "),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(":switch"),
-        ])
-    } else {
-        // Agents panel help
-        Line::from(vec![
-            mode_indicator,
-            Span::raw(" "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(":connect "),
             Span::styled("n", Style::default().fg(Color::Yellow)),
             Span::raw(":new "),
             Span::styled("d", Style::default().fg(Color::Yellow)),
             Span::raw(":delete "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(":quit "),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(":switch"),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(":start "),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::raw(":stop "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(":back"),
+        ])
+    } else {
+        // Normal input mode help
+        Line::from(vec![
+            mode_indicator,
+            Span::raw(" "),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::raw(":agents "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(":send "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(":commands"),
         ])
     };
 
@@ -600,6 +572,8 @@ fn render_error_details(frame: &mut Frame, error: &str, area: Rect) {
 /// Calculate the number of visual lines after text wrapping.
 ///
 /// This accounts for long lines that wrap to multiple visual lines.
+/// Note: This is an estimate because ratatui's word-boundary wrapping
+/// may produce slightly more lines than character-based calculation.
 fn calculate_wrapped_line_count(text: &Text, available_width: usize) -> usize {
     if available_width == 0 {
         return text.lines.len();
@@ -616,10 +590,14 @@ fn calculate_wrapped_line_count(text: &Text, available_width: usize) -> usize {
         } else {
             // Calculate how many visual lines this text line will take
             // Round up: (line_width + available_width - 1) / available_width
-            total += (line_width + available_width - 1) / available_width;
+            // Add 1 extra line per wrap to account for word-boundary breaks
+            let wrapped = (line_width + available_width - 1) / available_width;
+            // Word wrapping can cause extra lines, add margin for long lines
+            total += wrapped + if wrapped > 1 { 1 } else { 0 };
         }
     }
-    total
+    // Add a small safety margin to ensure we can always scroll to true bottom
+    total + 2
 }
 
 /// Create a centered rectangle.

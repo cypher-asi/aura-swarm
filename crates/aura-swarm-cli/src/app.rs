@@ -6,6 +6,7 @@
 //! Supports real-time streaming display where text appears token-by-token
 //! as it arrives from the agent.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine;
@@ -182,98 +183,97 @@ fn format_tool_result(result: &str) -> String {
 }
 
 /// Format tool arguments like a shell command for display.
-/// Returns empty string if there's nothing meaningful to show.
+/// Always returns something meaningful - at minimum the tool name.
 fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
-    // Skip if args is null or empty
-    if args.is_null() {
-        return String::new();
-    }
-    
     let obj = args.as_object();
-    if obj.map_or(false, |o| o.is_empty()) {
-        return String::new();
-    }
+    
+    // Helper to get a string field from args
+    let get_str = |field: &str| -> Option<&str> {
+        obj.and_then(|o| o.get(field)).and_then(|v| v.as_str())
+    };
     
     // Extract common argument patterns for cleaner display
-    match tool_name {
+    let formatted = match tool_name {
         "fs.ls" | "fs_ls" => {
-            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str()).unwrap_or(".");
+            let path = get_str("path").unwrap_or(".");
             format!("ls {path}")
         }
+        "fs.stat" | "fs_stat" => {
+            let path = get_str("path").unwrap_or(".");
+            format!("stat {path}")
+        }
         "fs.read" | "fs_read" => {
-            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str());
-            path.map(|p| format!("cat {p}")).unwrap_or_default()
+            get_str("path").map(|p| format!("read {p}")).unwrap_or_default()
         }
         "fs.write" | "fs_write" => {
-            let path = obj.and_then(|o| o.get("path")).and_then(|v| v.as_str());
-            let content = obj.and_then(|o| o.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+            let path = get_str("path");
+            let content = get_str("content").unwrap_or("");
             match path {
                 Some(p) => {
-                    let preview = if content.len() > 30 {
-                        format!("{}...", &content[..30])
-                    } else {
-                        content.to_string()
-                    };
-                    format!("write {p} \"{preview}\"")
+                    let lines = content.lines().count();
+                    let chars = content.len();
+                    format!("write {p} ({lines} lines, {chars} chars)")
                 }
                 None => String::new(),
             }
         }
         "fs.mkdir" | "fs_mkdir" => {
-            obj.and_then(|o| o.get("path")).and_then(|v| v.as_str())
-                .map(|p| format!("mkdir {p}"))
-                .unwrap_or_default()
+            get_str("path").map(|p| format!("mkdir {p}")).unwrap_or_default()
         }
         "fs.rm" | "fs_rm" => {
-            obj.and_then(|o| o.get("path")).and_then(|v| v.as_str())
-                .map(|p| format!("rm {p}"))
-                .unwrap_or_default()
+            get_str("path").map(|p| format!("rm {p}")).unwrap_or_default()
         }
-        "cmd.run" | "cmd_run" => {
-            let cmd = obj.and_then(|o| o.get("command")).and_then(|v| v.as_str())
-                .or_else(|| obj.and_then(|o| o.get("cmd")).and_then(|v| v.as_str()));
-            cmd.map(|c| format!("$ {c}")).unwrap_or_default()
+        "search_code" | "code_search" | "grep" => {
+            let query = get_str("query")
+                .or_else(|| get_str("pattern"))
+                .or_else(|| get_str("search"))
+                .unwrap_or("?");
+            let path = get_str("path").or_else(|| get_str("directory")).unwrap_or(".");
+            format!("search \"{query}\" in {path}")
         }
-        _ => {
-            // Generic: show tool name with compact args
-            let compact = serde_json::to_string(args).unwrap_or_default();
-            if compact == "{}" || compact.is_empty() {
-                String::new()
-            } else if compact.len() > 60 {
-                format!("{tool_name} {}...", &compact[..60])
-            } else {
-                format!("{tool_name} {compact}")
+        "find_files" | "glob" | "find" => {
+            let pattern = get_str("pattern").or_else(|| get_str("glob")).unwrap_or("*");
+            let path = get_str("path").or_else(|| get_str("directory")).unwrap_or(".");
+            format!("find {pattern} in {path}")
+        }
+        name if name.eq_ignore_ascii_case("cmd.run") || name.eq_ignore_ascii_case("cmd_run") 
+            || name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("shell") 
+            || name.eq_ignore_ascii_case("exec") => {
+            // Try common field names for the command
+            let cmd = get_str("command")
+                .or_else(|| get_str("cmd"))
+                .or_else(|| get_str("input"))
+                .or_else(|| get_str("script"));
+            
+            match cmd {
+                Some(c) if c.len() > 80 => format!("$ {}...", &c[..80]),
+                Some(c) => format!("$ {c}"),
+                None => String::new(),
             }
         }
+        _ => String::new(),
+    };
+    
+    // If we got a good formatted string, use it
+    if !formatted.is_empty() {
+        return formatted;
+    }
+    
+    // Fallback: show tool name with compact args
+    if args.is_null() {
+        return tool_name.to_string();
+    }
+    
+    let compact = serde_json::to_string(args).unwrap_or_default();
+    if compact == "{}" || compact.is_empty() || compact == "null" {
+        tool_name.to_string()
+    } else if compact.len() > 60 {
+        format!("{tool_name} {}...", &compact[..60])
+    } else {
+        format!("{tool_name} {compact}")
     }
 }
 
-/// Which UI column has focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Focus {
-    /// Left column: Agent list panel.
-    #[default]
-    Agents,
-    /// Right column: Chat area with input.
-    Chat,
-}
-
-impl Focus {
-    /// Toggle to the other column.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Agents => Self::Chat,
-            Self::Chat => Self::Agents,
-        }
-    }
-
-    /// Toggle to the other column (same as next for two columns).
-    #[must_use]
-    pub const fn prev(self) -> Self {
-        self.next()
-    }
-}
 
 /// Input mode for special operations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -297,18 +297,20 @@ pub struct App {
     pub selected_agent: Option<usize>,
     /// Chat messages for the current session.
     pub messages: Vec<ChatMessage>,
+    /// Cached messages per agent (by agent_id).
+    message_cache: HashMap<String, Vec<ChatMessage>>,
     /// Current input buffer.
     pub input: String,
     /// Cursor position in input.
     pub cursor_position: usize,
-    /// Which panel has focus.
-    pub focus: Focus,
     /// Current input mode.
     pub input_mode: InputMode,
     /// WebSocket sender (if connected).
     ws_sender: Option<WsSender>,
     /// Current session ID (if connected).
     current_session_id: Option<String>,
+    /// Agent ID of the currently connected session.
+    connected_agent_id: Option<String>,
     /// Chat scroll position.
     pub chat_scroll: usize,
     /// Status message to display.
@@ -334,9 +336,10 @@ pub struct App {
     streaming_message_idx: Option<usize>,
     /// Whether currently receiving a streaming response.
     pub is_streaming: bool,
-    /// Whether in insert mode for chat input (vim-like).
-    /// When true, keys go to input. When false, can use commands like 'q' to quit.
-    pub chat_insert_mode: bool,
+    /// Whether in command mode (Esc pressed).
+    /// When true, can use q to quit, n/d/s/t/r for agent actions.
+    /// When false, typing goes to input, Up/Down navigate agents.
+    pub command_mode: bool,
     /// Animation frame counter for loading indicators.
     pub animation_frame: usize,
     /// Saved chat input when entering a dialog mode.
@@ -352,12 +355,13 @@ impl App {
             agents: Vec::new(),
             selected_agent: None,
             messages: Vec::new(),
+            message_cache: HashMap::new(),
             input: String::new(),
             cursor_position: 0,
-            focus: Focus::Agents,
             input_mode: InputMode::Normal,
             ws_sender: None,
             current_session_id: None,
+            connected_agent_id: None,
             chat_scroll: 0,
             status_message: None,
             should_quit: false,
@@ -369,8 +373,8 @@ impl App {
             streaming_text_buffer: String::new(),
             streaming_message_idx: None,
             is_streaming: false,
-            // Start in insert mode for chat
-            chat_insert_mode: true,
+            // Start in normal input mode (not command mode)
+            command_mode: false,
             // Animation
             animation_frame: 0,
             // No saved input initially
@@ -446,17 +450,49 @@ impl App {
     // Agent List Navigation
     // =========================================================================
 
+    /// Save current messages to cache for the current agent.
+    fn save_messages_to_cache(&mut self) {
+        if let Some(agent) = self.selected_agent() {
+            let agent_id = agent.agent_id.clone();
+            if !self.messages.is_empty() {
+                self.message_cache.insert(agent_id, std::mem::take(&mut self.messages));
+            }
+        }
+    }
+    
+    /// Load messages from cache for the given agent.
+    fn load_messages_from_cache(&mut self, agent_id: &str) {
+        self.messages = self.message_cache.get(agent_id).cloned().unwrap_or_default();
+        self.chat_scroll = 0;
+    }
+    
+    /// Switch to viewing a different agent's chat.
+    fn switch_agent_view(&mut self, new_index: usize) {
+        // Save current agent's messages
+        self.save_messages_to_cache();
+        
+        // Update selection
+        self.selected_agent = Some(new_index);
+        
+        // Load new agent's messages from cache
+        if let Some(agent) = self.agents.get(new_index) {
+            self.load_messages_from_cache(&agent.agent_id.clone());
+        }
+    }
+
     /// Move selection up in the agent list.
     pub fn select_prev_agent(&mut self) {
         if self.agents.is_empty() {
             return;
         }
 
-        self.selected_agent = Some(match self.selected_agent {
+        let new_index = match self.selected_agent {
             Some(0) => self.agents.len() - 1,
             Some(i) => i - 1,
             None => 0,
-        });
+        };
+        
+        self.switch_agent_view(new_index);
     }
 
     /// Move selection down in the agent list.
@@ -465,11 +501,13 @@ impl App {
             return;
         }
 
-        self.selected_agent = Some(match self.selected_agent {
+        let new_index = match self.selected_agent {
             Some(i) if i >= self.agents.len() - 1 => 0,
             Some(i) => i + 1,
             None => 0,
-        });
+        };
+        
+        self.switch_agent_view(new_index);
     }
 
     // =========================================================================
@@ -555,14 +593,15 @@ impl App {
     pub async fn refresh_agents(&mut self) -> Result<(), ClientError> {
         self.agents = self.client.list_agents().await?;
 
-        // Adjust selection if needed
-        if let Some(i) = self.selected_agent {
+        // Auto-select first agent if nothing selected, or adjust if out of bounds
+        if self.agents.is_empty() {
+            self.selected_agent = None;
+        } else if self.selected_agent.is_none() {
+            // Auto-select first agent
+            self.selected_agent = Some(0);
+        } else if let Some(i) = self.selected_agent {
             if i >= self.agents.len() {
-                self.selected_agent = if self.agents.is_empty() {
-                    None
-                } else {
-                    Some(self.agents.len() - 1)
-                };
+                self.selected_agent = Some(self.agents.len() - 1);
             }
         }
 
@@ -654,6 +693,102 @@ impl App {
     // WebSocket Session
     // =========================================================================
 
+    /// Ensure the selected agent is ready (running/idle), waking or starting it if necessary.
+    /// 
+    /// This method will:
+    /// - Do nothing if agent is already Running or Idle
+    /// - Wake the agent if Hibernating
+    /// - Start the agent if Stopped
+    /// - Wait for the agent to reach Running/Idle state
+    /// 
+    /// Returns Ok(true) if action was taken (wake/start), Ok(false) if already ready.
+    pub async fn ensure_agent_ready(&mut self) -> Result<bool, String> {
+        let agent = self.selected_agent().ok_or("No agent selected")?;
+        
+        match agent.status {
+            AgentState::Running | AgentState::Idle => {
+                // Already ready
+                Ok(false)
+            }
+            AgentState::Hibernating => {
+                // Wake the agent
+                self.set_status("Waking agent...");
+                self.wake_selected_agent().await.map_err(|e| e.to_string())?;
+                
+                // Wait for agent to be ready
+                self.wait_for_agent_ready().await?;
+                Ok(true)
+            }
+            AgentState::Stopped => {
+                // Start the agent
+                self.set_status("Starting agent...");
+                self.start_selected_agent().await.map_err(|e| e.to_string())?;
+                
+                // Wait for agent to be ready
+                self.wait_for_agent_ready().await?;
+                Ok(true)
+            }
+            AgentState::Provisioning | AgentState::Stopping => {
+                // Already transitioning, wait for it
+                self.set_status("Waiting for agent...");
+                self.wait_for_agent_ready().await?;
+                Ok(true)
+            }
+            AgentState::Error => {
+                // Try to restart the agent
+                self.set_status("Restarting failed agent...");
+                self.start_selected_agent().await.map_err(|e| e.to_string())?;
+                
+                // Wait for agent to be ready
+                self.wait_for_agent_ready().await?;
+                Ok(true)
+            }
+        }
+    }
+    
+    /// Wait for the selected agent to reach Running or Idle state.
+    /// 
+    /// Polls every 500ms, up to 60 seconds.
+    async fn wait_for_agent_ready(&mut self) -> Result<(), String> {
+        use std::time::{Duration, Instant};
+        
+        let timeout = Duration::from_secs(60);
+        let poll_interval = Duration::from_millis(500);
+        let start = Instant::now();
+        
+        loop {
+            // Refresh agent list to get current state
+            self.refresh_agents().await.map_err(|e| e.to_string())?;
+            
+            let agent = self.selected_agent().ok_or("Agent no longer exists")?;
+            
+            match agent.status {
+                AgentState::Running | AgentState::Idle => {
+                    return Ok(());
+                }
+                AgentState::Error => {
+                    let error = agent.error_message.clone().unwrap_or_else(|| "Unknown error".to_string());
+                    return Err(format!("Agent failed: {error}"));
+                }
+                AgentState::Provisioning | AgentState::Stopping => {
+                    // Still transitioning, keep waiting
+                    let status = agent.status.as_str();
+                    self.set_status(format!("Agent {status}..."));
+                }
+                _ => {
+                    // Unexpected state
+                    return Err(format!("Agent in unexpected state: {:?}", agent.status));
+                }
+            }
+            
+            if start.elapsed() > timeout {
+                return Err("Timeout waiting for agent to be ready".to_string());
+            }
+            
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Connect to the selected agent's chat session.
     pub async fn connect_to_agent(&mut self) -> Result<mpsc::Receiver<WsEvent>, String> {
         let agent = self.selected_agent().ok_or("No agent selected")?;
@@ -685,17 +820,38 @@ impl App {
 
         self.ws_sender = Some(sender);
         self.current_session_id = Some(session_id);
-        self.messages.clear();
-        self.chat_scroll = 0;
+        self.connected_agent_id = Some(agent_id.clone());
+        
+        // Load cached messages for this agent (preserves history)
+        self.load_messages_from_cache(&agent_id);
         self.ws_connected = true;
 
         self.set_status("Connected to agent");
 
         Ok(receiver)
     }
+    
+    /// Ensure agent is ready, then connect to it.
+    /// 
+    /// This is the preferred method for connecting - it will automatically
+    /// wake/start agents that are hibernating/stopped.
+    pub async fn ensure_ready_and_connect(&mut self) -> Result<mpsc::Receiver<WsEvent>, String> {
+        // First ensure agent is ready (wake/start if needed)
+        self.ensure_agent_ready().await?;
+        
+        // Now connect
+        self.connect_to_agent().await
+    }
 
     /// Disconnect from the current session.
     pub async fn disconnect(&mut self) {
+        // Save messages to cache before disconnecting
+        if let Some(agent_id) = self.connected_agent_id.take() {
+            if !self.messages.is_empty() {
+                self.message_cache.insert(agent_id, std::mem::take(&mut self.messages));
+            }
+        }
+        
         if let Some(session_id) = self.current_session_id.take() {
             let _ = self.client.close_session(&session_id).await;
         }
@@ -764,35 +920,81 @@ impl App {
                 // Return true to trigger immediate UI redraw
                 true
             }
-            WsEvent::ThinkingDelta(_thinking) => {
-                // Optionally show thinking indicator in status bar
-                self.set_status("Agent thinking...");
+            WsEvent::ThinkingDelta(thinking) => {
+                // Show thinking content in the chat with dimmed styling
+                // Add thinking block header if this is the start of thinking
+                if !self.streaming_text_buffer.ends_with("*thinking...*\n") 
+                    && !self.streaming_text_buffer.contains("💭") 
+                {
+                    self.streaming_text_buffer.push_str("\n💭 *thinking...*\n");
+                }
+                
+                // Append thinking content (dimmed in markdown via italics)
+                self.streaming_text_buffer.push_str(&format!("*{thinking}*"));
+                self.update_streaming_message_live();
+                
+                // Show truncated thinking in status bar
+                let preview = if thinking.len() > 60 {
+                    format!("{}...", &thinking[..60])
+                } else {
+                    thinking
+                };
+                self.set_status(format!("Thinking: {preview}"));
                 true
             }
             WsEvent::ToolStart { tool_name, args } => {
-                // Show that the server is executing a tool
-                self.set_status(format!("Executing: {tool_name}..."));
+                // End any thinking block before showing tool
+                if self.streaming_text_buffer.contains("💭") 
+                    && !self.streaming_text_buffer.ends_with("\n\n") 
+                {
+                    self.streaming_text_buffer.push_str("\n\n");
+                }
                 
-                // Format tool call like a command
+                // Format tool call as a compact bullet point (no newline yet - result will follow)
                 let args_display = format_tool_args(&tool_name, &args);
                 let display = if args_display.is_empty() {
-                    tool_name.clone() // Just show tool name when no args
+                    format!("`{tool_name}`")
                 } else {
-                    args_display
+                    format!("`{args_display}`")
                 };
-                self.streaming_text_buffer.push_str(&format!("\n\n🔧 `{display}`\n"));
+                
+                // Add the tool display without newline - result will complete the line
+                self.streaming_text_buffer.push_str(&display);
                 self.update_streaming_message_live();
+                
+                // Show detailed status
+                let status_detail = if args_display.is_empty() {
+                    tool_name.clone()
+                } else if args_display.len() > 50 {
+                    format!("{tool_name}: {}...", &args_display[..50])
+                } else {
+                    format!("{tool_name}: {args_display}")
+                };
+                self.set_status(format!("Running: {status_detail}"));
                 true
             }
             WsEvent::ToolComplete { tool_name, result, is_error } => {
-                // Show tool execution result with proper formatting
-                let icon = if is_error { "❌" } else { "✅" };
-                let status = if is_error { "Error" } else { "Success" };
+                // Update status
+                let status = if is_error { "Error" } else { "Done" };
                 self.set_status(format!("{tool_name}: {status}"));
                 
-                // Parse and format the result for clean display
+                // Parse and format the result compactly
                 let display_result = format_tool_result(&result);
-                self.streaming_text_buffer.push_str(&format!("\n{icon} **Result:**\n```\n{display_result}\n```\n\n"));
+                
+                // Format result inline with tool, or on next lines if multi-line
+                let formatted_result = if display_result.lines().count() > 1 {
+                    // Multi-line: show in code block on next line
+                    format!("\n```\n{display_result}\n```\n")
+                } else if display_result.is_empty() || display_result == "OK" || display_result == "ok" {
+                    // Simple success, just add checkmark and newline
+                    if is_error { " x\n".to_string() } else { " +\n".to_string() }
+                } else {
+                    // Single line result - show inline
+                    let marker = if is_error { " x " } else { " + " };
+                    format!("{marker}{display_result}\n")
+                };
+                
+                self.streaming_text_buffer.push_str(&formatted_result);
                 self.update_streaming_message_live();
                 true
             }
