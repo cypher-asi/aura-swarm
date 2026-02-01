@@ -110,7 +110,7 @@ where
     // Update the agent status via the control plane
     match state
         .control
-        .update_agent_status_internal(&agent_id, body.status)
+        .update_agent_status_internal(&agent_id, body.status, body.message.clone())
         .await
     {
         Ok(()) => {

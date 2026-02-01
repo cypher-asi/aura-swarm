@@ -123,6 +123,7 @@ pub trait ControlPlane: Send + Sync {
         &self,
         agent_id: &AgentId,
         status: AgentState,
+        error_message: Option<String>,
     ) -> Result<()>;
 }
 
@@ -596,17 +597,25 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         &self,
         agent_id: &AgentId,
         status: AgentState,
+        error_message: Option<String>,
     ) -> Result<()> {
         // Verify agent exists
         if self.store.get_agent(agent_id)?.is_none() {
             return Err(ControlError::AgentNotFound(*agent_id));
         }
 
-        self.store.update_agent_status(agent_id, status)?;
+        // Use update_agent_error if there's an error message, otherwise just update status
+        if error_message.is_some() || status == AgentState::Error {
+            self.store
+                .update_agent_error(agent_id, status, error_message.clone())?;
+        } else {
+            self.store.update_agent_status(agent_id, status)?;
+        }
 
         tracing::info!(
             agent_id = %agent_id,
             status = ?status,
+            error_message = ?error_message,
             "Updated agent status (internal)"
         );
 

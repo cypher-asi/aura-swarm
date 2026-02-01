@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Event, Pod};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::runtime::watcher::{self, watcher, Config as WatcherConfig};
 use kube::Client;
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use aura_swarm_core::AgentId;
 use aura_swarm_store::{AgentSpec, AgentState};
@@ -142,6 +142,11 @@ impl K8sScheduler {
         Api::namespaced(self.client.clone(), &self.config.namespace)
     }
 
+    /// Get the events API client for the configured namespace.
+    fn events_api(&self) -> Api<Event> {
+        Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
     /// Run the reconciliation loop, watching for pod changes and notifying the gateway.
     ///
     /// This method runs indefinitely, processing pod events as they occur.
@@ -149,6 +154,12 @@ impl K8sScheduler {
     ///
     /// Status updates are sent to the gateway's internal endpoint via HTTP.
     pub async fn run_reconciler(&self) {
+        // Run both pod watcher and event watcher concurrently
+        tokio::join!(self.run_pod_watcher(), self.run_event_watcher());
+    }
+
+    /// Watch for pod changes.
+    async fn run_pod_watcher(&self) {
         let pods = self.pods_api();
         let config = WatcherConfig::default().labels("app=swarm-agent");
 
@@ -183,7 +194,103 @@ impl K8sScheduler {
             }
         }
 
-        warn!("Reconciliation loop exited unexpectedly");
+        warn!("Pod reconciliation loop exited unexpectedly");
+    }
+
+    /// Watch for Kubernetes Events (Warning events indicate errors).
+    async fn run_event_watcher(&self) {
+        let events = self.events_api();
+        // Watch events for Pods in our namespace
+        let config = WatcherConfig::default().fields("involvedObject.kind=Pod");
+
+        let watch = watcher(events, config);
+
+        futures::pin_mut!(watch);
+
+        info!(
+            namespace = %self.config.namespace,
+            "Starting event watcher for pod errors"
+        );
+
+        while let Some(event) = watch.next().await {
+            match event {
+                Ok(watcher::Event::Apply(k8s_event) | watcher::Event::InitApply(k8s_event)) => {
+                    self.handle_k8s_event(&k8s_event).await;
+                }
+                Ok(watcher::Event::Init | watcher::Event::InitDone | watcher::Event::Delete(_)) => {
+                    // Ignore init and delete events for events
+                }
+                Err(e) => {
+                    debug!(error = %e, "Event watcher error, will retry");
+                }
+            }
+        }
+
+        warn!("Event watcher loop exited unexpectedly");
+    }
+
+    /// Handle a Kubernetes Event (check for pod creation errors).
+    async fn handle_k8s_event(&self, event: &Event) {
+        // Only process Warning events
+        let event_type = event.type_.as_deref().unwrap_or("Normal");
+        if event_type != "Warning" {
+            return;
+        }
+
+        // Get the involved pod name
+        let involved = &event.involved_object;
+        let Some(ref pod_name) = involved.name else {
+            return;
+        };
+
+        // Only process events for our agent pods
+        if !pod_name.starts_with("agent-") {
+            return;
+        }
+
+        let reason = event.reason.as_deref().unwrap_or("Unknown");
+        let message = event.message.as_deref().unwrap_or("No message");
+
+        // Check for critical errors that should transition to Error state
+        let error_reasons = [
+            "FailedCreatePodSandBox",
+            "FailedMount",
+            "FailedScheduling",
+            "FailedAttachVolume",
+            "NetworkNotReady",
+        ];
+
+        if error_reasons.contains(&reason) {
+            warn!(
+                pod_name,
+                reason,
+                message,
+                "Pod creation error detected from event"
+            );
+
+            // Try to extract agent ID from pod name (agent-{hex})
+            if let Some(hex) = pod_name.strip_prefix("agent-") {
+                if let Ok(agent_id) = AgentId::from_hex(hex) {
+                    let error_msg = format!("{reason}: {message}");
+                    if let Err(e) = self
+                        .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
+                        .await
+                    {
+                        error!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Failed to notify gateway of pod error from event"
+                        );
+                    } else {
+                        info!(
+                            agent_id = %agent_id,
+                            reason,
+                            "Notified gateway of pod error from Kubernetes event"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_pod_update(&self, pod: &Pod) {
@@ -204,17 +311,27 @@ impl K8sScheduler {
             self.endpoint_cache.insert(agent_id, format!("{ip}:8080"));
         }
 
-        // Map pod phase to agent state
-        let new_state = match (phase, ready) {
-            ("Running", true) => AgentState::Running,
-            ("Running", false) | ("Pending", _) => AgentState::Provisioning,
-            ("Failed", _) => AgentState::Error,
-            ("Succeeded", _) => AgentState::Stopped,
-            _ => return, // Don't update for unknown states
+        // Check for container errors (waiting state with error reasons)
+        let (container_error, error_message) = Self::extract_container_error(pod);
+
+        // Map pod phase to agent state, considering container errors
+        let (new_state, message) = if container_error {
+            (AgentState::Error, error_message)
+        } else {
+            match (phase, ready) {
+                ("Running", true) => (AgentState::Running, None),
+                ("Running", false) | ("Pending", _) => (AgentState::Provisioning, None),
+                ("Failed", _) => {
+                    let msg = pod.status.as_ref().and_then(|s| s.message.clone());
+                    (AgentState::Error, msg)
+                }
+                ("Succeeded", _) => (AgentState::Stopped, None),
+                _ => return, // Don't update for unknown states
+            }
         };
 
         // Notify the gateway of the status change
-        if let Err(e) = self.notify_status_change(&agent_id, new_state, None).await {
+        if let Err(e) = self.notify_status_change(&agent_id, new_state, message.clone()).await {
             error!(
                 agent_id = %agent_id,
                 error = %e,
@@ -226,9 +343,84 @@ impl K8sScheduler {
                 phase,
                 ready,
                 new_state = ?new_state,
+                message = ?message,
                 "Notified gateway of agent status change"
             );
         }
+    }
+
+    /// Extract container error information from pod status.
+    ///
+    /// Checks container statuses for waiting states that indicate failures
+    /// (e.g., ImagePullBackOff, CrashLoopBackOff, CreateContainerError).
+    fn extract_container_error(pod: &Pod) -> (bool, Option<String>) {
+        let Some(status) = pod.status.as_ref() else {
+            return (false, None);
+        };
+
+        // Check pod conditions for failure reasons
+        if let Some(conditions) = &status.conditions {
+            for condition in conditions {
+                // PodScheduled=False with reason means scheduling failed
+                if condition.type_ == "PodScheduled"
+                    && condition.status == "False"
+                    && condition.reason.as_deref() != Some("Unschedulable")
+                {
+                    if let Some(msg) = &condition.message {
+                        return (true, Some(msg.clone()));
+                    }
+                }
+            }
+        }
+
+        // Check container statuses for waiting errors
+        let container_statuses = status
+            .container_statuses
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .chain(status.init_container_statuses.as_ref().into_iter().flatten());
+
+        for cs in container_statuses {
+            if let Some(state) = &cs.state {
+                if let Some(waiting) = &state.waiting {
+                    // These reasons indicate a persistent error, not just "ContainerCreating"
+                    let error_reasons = [
+                        "ImagePullBackOff",
+                        "ErrImagePull",
+                        "CrashLoopBackOff",
+                        "CreateContainerError",
+                        "CreateContainerConfigError",
+                        "InvalidImageName",
+                        "RunContainerError",
+                    ];
+
+                    if let Some(reason) = &waiting.reason {
+                        if error_reasons.contains(&reason.as_str()) {
+                            let msg = waiting
+                                .message
+                                .clone()
+                                .unwrap_or_else(|| reason.clone());
+                            return (true, Some(msg));
+                        }
+                    }
+                }
+
+                // Also check terminated state for errors
+                if let Some(terminated) = &state.terminated {
+                    if terminated.exit_code != 0 {
+                        let msg = terminated
+                            .message
+                            .clone()
+                            .or_else(|| terminated.reason.clone())
+                            .unwrap_or_else(|| format!("Exit code: {}", terminated.exit_code));
+                        return (true, Some(msg));
+                    }
+                }
+            }
+        }
+
+        (false, None)
     }
 
     async fn handle_pod_deleted(&self, pod: &Pod) {

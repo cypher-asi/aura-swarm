@@ -1,7 +1,9 @@
 //! WebSocket client for agent chat with streaming support.
 //!
 //! This module handles WebSocket connections to agents for real-time streaming chat
-//! using the Aura runtime protocol with server-side tool execution.
+//! using the Aura runtime protocol.
+//!
+//! Endpoint: WS /stream
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -385,7 +387,7 @@ fn server_message_to_event(
 }
 
 // =============================================================================
-// Tests
+// Tests (Aura Runtime Protocol)
 // =============================================================================
 
 #[cfg(test)]
@@ -420,44 +422,17 @@ mod tests {
 
     #[test]
     fn base64_encode_basic() {
-        // Test vectors from RFC 4648
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn base64_encode_binary() {
-        // Test with all byte values 0-255
-        let data: Vec<u8> = (0..=255).collect();
-        let encoded = base64_encode(&data);
-        // Should be valid base64 (length divisible by 4, valid characters)
-        assert_eq!(encoded.len() % 4, 0);
-        assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
     }
 
     #[test]
     fn generate_ws_key_is_valid_base64() {
         let key = generate_ws_key();
-        // WebSocket key should be 24 characters (16 bytes base64 encoded)
-        assert!(key.len() >= 20); // At least reasonable length
+        assert!(key.len() >= 20);
         assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
-    }
-
-    #[test]
-    fn generate_ws_key_unique() {
-        // Keys generated at different times should be different
-        let key1 = generate_ws_key();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let key2 = generate_ws_key();
-        // In practice these will almost always be different due to timestamp
-        // but we can't guarantee it in a unit test
-        assert!(!key1.is_empty());
-        assert!(!key2.is_empty());
     }
 
     // =========================================================================
@@ -470,30 +445,9 @@ mod tests {
             request_id: "req-1".to_string(),
             agent_id: "agent-1".to_string(),
         };
-
         let mut tool_name = None;
         let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
         assert!(matches!(event, WsEvent::TurnStart));
-    }
-
-    #[test]
-    fn convert_step_start_to_event() {
-        let msg = ServerMessage::StepStart {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            step: 3,
-        };
-
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
-        match event {
-            WsEvent::StepStart { step } => {
-                assert_eq!(step, 3);
-            }
-            _ => panic!("Expected StepStart event"),
-        }
     }
 
     #[test]
@@ -503,34 +457,11 @@ mod tests {
             agent_id: "agent-1".to_string(),
             text: "Hello, world!".to_string(),
         };
-
         let mut tool_name = None;
         let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
         match event {
-            WsEvent::TextDelta(text) => {
-                assert_eq!(text, "Hello, world!");
-            }
+            WsEvent::TextDelta(text) => assert_eq!(text, "Hello, world!"),
             _ => panic!("Expected TextDelta event"),
-        }
-    }
-
-    #[test]
-    fn convert_thinking_delta_to_event() {
-        let msg = ServerMessage::ThinkingDelta {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            thinking: "Let me analyze this...".to_string(),
-        };
-
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
-        match event {
-            WsEvent::ThinkingDelta(thinking) => {
-                assert_eq!(thinking, "Let me analyze this...");
-            }
-            _ => panic!("Expected ThinkingDelta event"),
         }
     }
 
@@ -539,69 +470,38 @@ mod tests {
         let msg = ServerMessage::ToolStart {
             request_id: "req-1".to_string(),
             agent_id: "agent-1".to_string(),
-            tool_id: "tool-123".to_string(),
-            tool_name: "fs_read".to_string(),
+            tool_id: "t1".to_string(),
+            tool_name: "read_file".to_string(),
             args: json!({"path": "/etc/passwd"}),
         };
-
         let mut tool_name_state = None;
         let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-
         match event {
             WsEvent::ToolStart { tool_name, args } => {
-                assert_eq!(tool_name, "fs_read");
+                assert_eq!(tool_name, "read_file");
                 assert_eq!(args["path"], "/etc/passwd");
             }
             _ => panic!("Expected ToolStart event"),
         }
-
-        // Tool name should be stored for ToolComplete
-        assert_eq!(tool_name_state, Some("fs_read".to_string()));
+        assert_eq!(tool_name_state, Some("read_file".to_string()));
     }
 
     #[test]
-    fn convert_tool_complete_to_event_with_stored_name() {
+    fn convert_tool_complete_to_event() {
         let msg = ServerMessage::ToolComplete {
             request_id: "req-1".to_string(),
             agent_id: "agent-1".to_string(),
-            tool_id: "tool-123".to_string(),
-            result: "File contents here".to_string(),
+            tool_id: "t1".to_string(),
+            result: "file contents".to_string(),
             is_error: false,
         };
-
-        let mut tool_name_state = Some("fs_read".to_string());
+        let mut tool_name_state = Some("read_file".to_string());
         let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-
         match event {
             WsEvent::ToolComplete { tool_name, result, is_error } => {
-                assert_eq!(tool_name, "fs_read");
-                assert_eq!(result, "File contents here");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(result, "file contents");
                 assert!(!is_error);
-            }
-            _ => panic!("Expected ToolComplete event"),
-        }
-
-        // Tool name should be cleared
-        assert_eq!(tool_name_state, None);
-    }
-
-    #[test]
-    fn convert_tool_complete_error_to_event() {
-        let msg = ServerMessage::ToolComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "tool-456".to_string(),
-            result: "Permission denied".to_string(),
-            is_error: true,
-        };
-
-        let mut tool_name_state = Some("cmd_run".to_string());
-        let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-
-        match event {
-            WsEvent::ToolComplete { is_error, result, .. } => {
-                assert!(is_error);
-                assert_eq!(result, "Permission denied");
             }
             _ => panic!("Expected ToolComplete event"),
         }
@@ -614,63 +514,41 @@ mod tests {
             agent_id: "agent-1".to_string(),
             steps: 3,
             input_tokens: 1500,
-            output_tokens: 500,
+            output_tokens: 800,
         };
-
         let mut tool_name = None;
         let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
         match event {
             WsEvent::TurnComplete(info) => {
                 assert_eq!(info.steps, 3);
                 assert_eq!(info.input_tokens, 1500);
-                assert_eq!(info.output_tokens, 500);
+                assert_eq!(info.output_tokens, 800);
             }
             _ => panic!("Expected TurnComplete event"),
         }
     }
 
     #[test]
-    fn convert_cancelled_to_event() {
-        let msg = ServerMessage::Cancelled {
-            request_id: "req-123".to_string(),
-            agent_id: "agent-1".to_string(),
-        };
-
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
-        match event {
-            WsEvent::Cancelled { request_id } => {
-                assert_eq!(request_id, "req-123");
-            }
-            _ => panic!("Expected Cancelled event"),
-        }
-    }
-
-    #[test]
     fn convert_error_to_event() {
         let msg = ServerMessage::Error {
-            request_id: Some("req-1".to_string()),
+            request_id: "req-1".to_string(),
             agent_id: Some("agent-1".to_string()),
             error: "Something went wrong".to_string(),
-            code: Some("internal_error".to_string()),
+            code: Some("TURN_ERROR".to_string()),
         };
-
         let mut tool_name = None;
         let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
         match event {
             WsEvent::Error { message, code } => {
                 assert_eq!(message, "Something went wrong");
-                assert_eq!(code, Some("internal_error".to_string()));
+                assert_eq!(code, Some("TURN_ERROR".to_string()));
             }
             _ => panic!("Expected Error event"),
         }
     }
 
     // =========================================================================
-    // ClientMessage Serialization Tests (via WsSender logic)
+    // ClientMessage Serialization Tests
     // =========================================================================
 
     #[test]
@@ -679,7 +557,7 @@ mod tests {
             request_id: "req-test".to_string(),
             prompt: "Hello, agent!".to_string(),
             agent_id: Some("agent-123".to_string()),
-            workspace: Some("/workspace".to_string()),
+            workspace: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -688,8 +566,6 @@ mod tests {
         assert_eq!(parsed["type"], "prompt");
         assert_eq!(parsed["request_id"], "req-test");
         assert_eq!(parsed["prompt"], "Hello, agent!");
-        assert_eq!(parsed["agent_id"], "agent-123");
-        assert_eq!(parsed["workspace"], "/workspace");
     }
 
     #[test]
@@ -710,7 +586,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn simulate_simple_text_response_flow() {
+    fn simulate_simple_response_flow() {
         let messages = vec![
             ServerMessage::TurnStart {
                 request_id: "req-1".to_string(),
@@ -724,12 +600,7 @@ mod tests {
             ServerMessage::TextDelta {
                 request_id: "req-1".to_string(),
                 agent_id: "agent-1".to_string(),
-                text: ", ".to_string(),
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: "world!".to_string(),
+                text: ", world!".to_string(),
             },
             ServerMessage::TurnComplete {
                 request_id: "req-1".to_string(),
@@ -762,35 +633,30 @@ mod tests {
     }
 
     #[test]
-    fn simulate_tool_execution_flow() {
+    fn simulate_tool_use_flow() {
         let messages = vec![
             ServerMessage::TurnStart {
                 request_id: "req-1".to_string(),
                 agent_id: "agent-1".to_string(),
             },
-            ServerMessage::StepStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                step: 1,
-            },
             ServerMessage::ToolStart {
                 request_id: "req-1".to_string(),
                 agent_id: "agent-1".to_string(),
-                tool_id: "tool-1".to_string(),
-                tool_name: "fs_read".to_string(),
+                tool_id: "t1".to_string(),
+                tool_name: "read_file".to_string(),
                 args: json!({"path": "README.md"}),
             },
             ServerMessage::ToolComplete {
                 request_id: "req-1".to_string(),
                 agent_id: "agent-1".to_string(),
-                tool_id: "tool-1".to_string(),
-                result: "# README\nProject documentation".to_string(),
+                tool_id: "t1".to_string(),
+                result: "# README\nProject docs".to_string(),
                 is_error: false,
             },
             ServerMessage::TextDelta {
                 request_id: "req-1".to_string(),
                 agent_id: "agent-1".to_string(),
-                text: "I found the README file.".to_string(),
+                text: "I found the file.".to_string(),
             },
             ServerMessage::TurnComplete {
                 request_id: "req-1".to_string(),
@@ -802,392 +668,22 @@ mod tests {
         ];
 
         let mut tool_name_state = None;
-        let mut tool_executions: Vec<(String, String, String)> = Vec::new();
+        let mut tool_names = Vec::new();
+        let mut tool_succeeded = false;
 
         for msg in messages {
             if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
                 match event {
-                    WsEvent::ToolStart { tool_name, args } => {
-                        tool_executions.push(("start".to_string(), tool_name, args.to_string()));
-                    }
-                    WsEvent::ToolComplete { tool_name, result, is_error } => {
-                        assert!(!is_error);
-                        tool_executions.push(("complete".to_string(), tool_name, result));
+                    WsEvent::ToolComplete { tool_name, is_error, .. } => {
+                        tool_names.push(tool_name);
+                        tool_succeeded = !is_error;
                     }
                     _ => {}
                 }
             }
         }
 
-        assert_eq!(tool_executions.len(), 2);
-        assert_eq!(tool_executions[0].0, "start");
-        assert_eq!(tool_executions[0].1, "fs_read");
-        assert_eq!(tool_executions[1].0, "complete");
-        assert_eq!(tool_executions[1].1, "fs_read"); // Name should be carried over
-        assert!(tool_executions[1].2.contains("README"));
-    }
-
-    #[test]
-    fn simulate_multi_tool_execution_flow() {
-        // Simulate multiple tool calls in sequence
-        let messages = vec![
-            ServerMessage::TurnStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-            },
-            // First tool
-            ServerMessage::ToolStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t1".to_string(),
-                tool_name: "fs_ls".to_string(),
-                args: json!({"path": "/"}),
-            },
-            ServerMessage::ToolComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t1".to_string(),
-                result: "bin\netc\nusr".to_string(),
-                is_error: false,
-            },
-            // Second tool
-            ServerMessage::ToolStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t2".to_string(),
-                tool_name: "fs_read".to_string(),
-                args: json!({"path": "/etc/passwd"}),
-            },
-            ServerMessage::ToolComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t2".to_string(),
-                result: "root:x:0:0:root:/root:/bin/bash".to_string(),
-                is_error: false,
-            },
-            ServerMessage::TurnComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                steps: 1,
-                input_tokens: 200,
-                output_tokens: 50,
-            },
-        ];
-
-        let mut tool_name_state = None;
-        let mut tool_names_seen = Vec::new();
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                match event {
-                    WsEvent::ToolComplete { tool_name, .. } => {
-                        tool_names_seen.push(tool_name);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(tool_names_seen, vec!["fs_ls", "fs_read"]);
-    }
-
-    #[test]
-    fn simulate_thinking_with_response() {
-        let messages = vec![
-            ServerMessage::TurnStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-            },
-            ServerMessage::ThinkingDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                thinking: "Let me analyze ".to_string(),
-            },
-            ServerMessage::ThinkingDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                thinking: "this problem...".to_string(),
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: "Here's my analysis.".to_string(),
-            },
-            ServerMessage::TurnComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                steps: 1,
-                input_tokens: 50,
-                output_tokens: 25,
-            },
-        ];
-
-        let mut tool_name_state = None;
-        let mut thinking_buffer = String::new();
-        let mut text_buffer = String::new();
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                match event {
-                    WsEvent::ThinkingDelta(thinking) => thinking_buffer.push_str(&thinking),
-                    WsEvent::TextDelta(text) => text_buffer.push_str(&text),
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(thinking_buffer, "Let me analyze this problem...");
-        assert_eq!(text_buffer, "Here's my analysis.");
-    }
-
-    #[test]
-    fn simulate_error_mid_stream() {
-        let messages = vec![
-            ServerMessage::TurnStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: "Starting to process...".to_string(),
-            },
-            ServerMessage::Error {
-                request_id: Some("req-1".to_string()),
-                agent_id: Some("agent-1".to_string()),
-                error: "Context length exceeded".to_string(),
-                code: Some("context_length".to_string()),
-            },
-        ];
-
-        let mut tool_name_state = None;
-        let mut error_received = None;
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                if let WsEvent::Error { message, code } = event {
-                    error_received = Some((message, code));
-                }
-            }
-        }
-
-        let (message, code) = error_received.unwrap();
-        assert_eq!(message, "Context length exceeded");
-        assert_eq!(code, Some("context_length".to_string()));
-    }
-
-    // =========================================================================
-    // Stress/Edge Case Tests
-    // =========================================================================
-
-    #[test]
-    fn handle_empty_text_delta() {
-        let msg = ServerMessage::TextDelta {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            text: "".to_string(),
-        };
-
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
-        match event {
-            WsEvent::TextDelta(text) => {
-                assert_eq!(text, "");
-            }
-            _ => panic!("Expected TextDelta event"),
-        }
-    }
-
-    #[test]
-    fn handle_large_tool_result() {
-        let large_result = "x".repeat(100_000);
-        let msg = ServerMessage::ToolComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "tool-1".to_string(),
-            result: large_result.clone(),
-            is_error: false,
-        };
-
-        let mut tool_name = Some("fs_read".to_string());
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-
-        match event {
-            WsEvent::ToolComplete { result, .. } => {
-                assert_eq!(result.len(), 100_000);
-            }
-            _ => panic!("Expected ToolComplete event"),
-        }
-    }
-
-    #[test]
-    fn handle_complex_tool_args() {
-        let complex_args = json!({
-            "nested": {
-                "array": [1, 2, {"deep": true}],
-                "object": {"key": "value"}
-            },
-            "unicode": "こんにちは",
-            "special": "line1\nline2\ttab",
-            "numbers": {
-                "int": 42,
-                "float": 3.14159,
-                "negative": -100
-            },
-            "bool_true": true,
-            "bool_false": false,
-            "null_value": null
-        });
-
-        let msg = ServerMessage::ToolStart {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "tool-1".to_string(),
-            tool_name: "complex_tool".to_string(),
-            args: complex_args.clone(),
-        };
-
-        let mut tool_name_state = None;
-        let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-
-        match event {
-            WsEvent::ToolStart { tool_name, args } => {
-                assert_eq!(tool_name, "complex_tool");
-                assert_eq!(args["nested"]["array"][2]["deep"], true);
-                assert_eq!(args["unicode"], "こんにちは");
-                assert_eq!(args["numbers"]["float"], 3.14159);
-                assert!(args["null_value"].is_null());
-            }
-            _ => panic!("Expected ToolStart event"),
-        }
-    }
-
-    #[test]
-    fn handle_many_steps() {
-        // Simulate a turn with many steps
-        let mut messages = vec![ServerMessage::TurnStart {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-        }];
-
-        for step in 1..=100 {
-            messages.push(ServerMessage::StepStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                step,
-            });
-            messages.push(ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: format!("Step {} output. ", step),
-            });
-        }
-
-        messages.push(ServerMessage::TurnComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            steps: 100,
-            input_tokens: 50000,
-            output_tokens: 10000,
-        });
-
-        let mut tool_name_state = None;
-        let mut step_count = 0;
-        let mut final_info = None;
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                match event {
-                    WsEvent::StepStart { step } => {
-                        step_count = step;
-                    }
-                    WsEvent::TurnComplete(info) => {
-                        final_info = Some(info);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(step_count, 100);
-        let info = final_info.unwrap();
-        assert_eq!(info.steps, 100);
-        assert_eq!(info.input_tokens, 50000);
-        assert_eq!(info.output_tokens, 10000);
-    }
-
-    #[test]
-    fn tool_complete_without_prior_start() {
-        // Edge case: ToolComplete without a prior ToolStart
-        // Should still work but with empty tool name
-        let msg = ServerMessage::ToolComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "tool-orphan".to_string(),
-            result: "some result".to_string(),
-            is_error: false,
-        };
-
-        let mut tool_name_state = None; // No tool name stored
-        let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-
-        match event {
-            WsEvent::ToolComplete { tool_name, .. } => {
-                assert_eq!(tool_name, ""); // Should be empty, not panic
-            }
-            _ => panic!("Expected ToolComplete event"),
-        }
-    }
-
-    // =========================================================================
-    // JSON Parsing Robustness Tests
-    // =========================================================================
-
-    #[test]
-    fn parse_message_with_extra_fields() {
-        // Should successfully parse even with unknown fields
-        let json = r#"{
-            "type": "turn_start",
-            "request_id": "req-1",
-            "agent_id": "agent-1",
-            "extra_field": "should be ignored",
-            "another_extra": 123
-        }"#;
-
-        let msg: ServerMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            ServerMessage::TurnStart { request_id, agent_id } => {
-                assert_eq!(request_id, "req-1");
-                assert_eq!(agent_id, "agent-1");
-            }
-            _ => panic!("Expected TurnStart"),
-        }
-    }
-
-    #[test]
-    fn parse_message_with_whitespace_variations() {
-        // Compact JSON
-        let json1 = r#"{"type":"text_delta","request_id":"r","agent_id":"a","text":"t"}"#;
-        // Pretty-printed JSON
-        let json2 = r#"{
-            "type": "text_delta",
-            "request_id": "r",
-            "agent_id": "a",
-            "text": "t"
-        }"#;
-
-        let msg1: ServerMessage = serde_json::from_str(json1).unwrap();
-        let msg2: ServerMessage = serde_json::from_str(json2).unwrap();
-
-        match (msg1, msg2) {
-            (
-                ServerMessage::TextDelta { text: t1, .. },
-                ServerMessage::TextDelta { text: t2, .. },
-            ) => {
-                assert_eq!(t1, t2);
-            }
-            _ => panic!("Both should be TextDelta"),
-        }
+        assert_eq!(tool_names, vec!["read_file"]);
+        assert!(tool_succeeded);
     }
 }

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use aura_swarm_core::AgentId;
-use aura_swarm_scheduler::{K8sScheduler, PodStatus, Scheduler, SchedulerConfig, SchedulerError};
+use aura_swarm_scheduler::{K8sScheduler, Scheduler, SchedulerConfig, SchedulerError};
 use aura_swarm_store::AgentSpec;
 use axum::{
     extract::{Path, State},
