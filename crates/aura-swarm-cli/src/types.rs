@@ -199,6 +199,7 @@ pub struct ApiErrorResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Send a prompt to the agent.
+    #[serde(rename = "prompt")]
     Prompt {
         /// Unique request ID for tracking.
         request_id: String,
@@ -304,6 +305,7 @@ pub enum ServerMessage {
         #[serde(default)]
         agent_id: Option<String>,
         /// Error message.
+        #[serde(alias = "message")]
         error: String,
         /// Optional error code.
         #[serde(default)]

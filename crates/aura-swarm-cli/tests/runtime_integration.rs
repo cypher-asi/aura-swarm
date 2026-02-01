@@ -34,6 +34,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
+    #[serde(rename = "prompt")]
     Prompt {
         request_id: String,
         prompt: String,
