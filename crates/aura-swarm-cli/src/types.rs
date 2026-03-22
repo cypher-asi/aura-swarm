@@ -353,54 +353,9 @@ pub struct ToolCallbackRequest {
     pub input: serde_json::Value,
 }
 
-/// A tool callback response from the client back to the harness.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallbackResponse {
-    /// Callback ID matching the request.
-    pub callback_id: String,
-    /// Tool execution result.
-    pub result: String,
-    /// Whether the execution was an error.
-    pub is_error: bool,
-}
-
 // =============================================================================
 // Harness Protocol Types (aura-harness /stream endpoint)
 // =============================================================================
-
-/// Client -> Server: Messages sent to the aura-harness runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum HarnessClientMessage {
-    /// Initialize the session (must be the first message).
-    SessionInit(HarnessSessionInit),
-    /// Send a user message for processing.
-    UserMessage {
-        /// The user's message text.
-        content: String,
-    },
-    /// Cancel the current turn.
-    Cancel,
-    /// External tool callback response (client -> harness).
-    ToolCallbackResponse(ToolCallbackResponse),
-}
-
-/// Payload for harness `session_init`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HarnessSessionInit {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-}
 
 /// Server -> Client: Messages from the aura-harness runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -765,52 +720,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn harness_session_init_serializes_correctly() {
-        let msg = HarnessClientMessage::SessionInit(HarnessSessionInit {
-            system_prompt: Some("You are a helpful assistant.".to_string()),
-            model: Some("claude-opus-4-6-20250514".to_string()),
-            max_tokens: Some(16384),
-            max_turns: Some(25),
-            workspace: None,
-            token: None,
-        });
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "session_init");
-        assert_eq!(parsed["system_prompt"], "You are a helpful assistant.");
-        assert_eq!(parsed["model"], "claude-opus-4-6-20250514");
-        assert_eq!(parsed["max_tokens"], 16384);
-        assert_eq!(parsed["max_turns"], 25);
-        assert!(parsed.get("workspace").is_none());
-        assert!(parsed.get("token").is_none());
-    }
-
-    #[test]
-    fn harness_user_message_serializes_correctly() {
-        let msg = HarnessClientMessage::UserMessage {
-            content: "Hello".to_string(),
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "user_message");
-        assert_eq!(parsed["content"], "Hello");
-    }
-
-    #[test]
-    fn harness_cancel_serializes_correctly() {
-        let msg = HarnessClientMessage::Cancel;
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "cancel");
-    }
-
-    #[test]
     fn harness_session_ready_deserializes() {
         let json = r#"{"type":"session_ready","session_id":"sess-123","tools":[{"name":"fs_read","description":"Read a file"}]}"#;
         let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
@@ -946,23 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn harness_session_init_omits_none_fields() {
-        let msg = HarnessClientMessage::SessionInit(HarnessSessionInit::default());
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "session_init");
-        assert!(parsed.get("system_prompt").is_none());
-        assert!(parsed.get("model").is_none());
-        assert!(parsed.get("max_tokens").is_none());
-        assert!(parsed.get("max_turns").is_none());
-    }
-
-    // =========================================================================
-    // Tool Callback Protocol Tests
-    // =========================================================================
-
-    #[test]
     fn tool_callback_request_serializes_correctly() {
         let req = ToolCallbackRequest {
             callback_id: "cb-001".to_string(),
@@ -986,32 +878,6 @@ mod tests {
         assert_eq!(req.callback_id, "cb-002");
         assert_eq!(req.tool_name, "get_task_context");
         assert_eq!(req.input["task_id"], "t-1");
-    }
-
-    #[test]
-    fn tool_callback_response_serializes_correctly() {
-        let resp = ToolCallbackResponse {
-            callback_id: "cb-001".to_string(),
-            result: "Task marked as done".to_string(),
-            is_error: false,
-        };
-
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["callback_id"], "cb-001");
-        assert_eq!(parsed["result"], "Task marked as done");
-        assert_eq!(parsed["is_error"], false);
-    }
-
-    #[test]
-    fn tool_callback_response_deserializes_error() {
-        let json = r#"{"callback_id":"cb-003","result":"Tool not found","is_error":true}"#;
-        let resp: ToolCallbackResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(resp.callback_id, "cb-003");
-        assert_eq!(resp.result, "Tool not found");
-        assert!(resp.is_error);
     }
 
     #[test]
@@ -1045,20 +911,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn harness_client_message_tool_callback_response_serializes() {
-        let msg = HarnessClientMessage::ToolCallbackResponse(ToolCallbackResponse {
-            callback_id: "cb-100".to_string(),
-            result: "context data here".to_string(),
-            is_error: false,
-        });
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "tool_callback_response");
-        assert_eq!(parsed["callback_id"], "cb-100");
-        assert_eq!(parsed["result"], "context data here");
-        assert_eq!(parsed["is_error"], false);
-    }
 }

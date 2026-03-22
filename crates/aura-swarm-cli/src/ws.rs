@@ -14,8 +14,7 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::types::{
-    ClientMessage, HarnessClientMessage, HarnessServerMessage, HarnessSessionInit,
-    HarnessToolInfo, ServerMessage, ToolCallbackResponse, TurnCompleteInfo,
+    ClientMessage, HarnessServerMessage, HarnessToolInfo, ServerMessage, TurnCompleteInfo,
 };
 
 /// Error type for WebSocket operations.
@@ -85,56 +84,6 @@ impl WsSender {
             .map_err(|e| WsError::Send(e.to_string()))
     }
 
-    /// Send a harness `session_init` message.
-    pub async fn send_session_init(&self, init: HarnessSessionInit) -> Result<(), WsError> {
-        let msg = HarnessClientMessage::SessionInit(init);
-        let json = serde_json::to_string(&msg)?;
-        self.tx
-            .send(json)
-            .await
-            .map_err(|e| WsError::Send(e.to_string()))
-    }
-
-    /// Send a harness `user_message`.
-    pub async fn send_user_message(&self, content: &str) -> Result<(), WsError> {
-        let msg = HarnessClientMessage::UserMessage {
-            content: content.to_string(),
-        };
-        let json = serde_json::to_string(&msg)?;
-        self.tx
-            .send(json)
-            .await
-            .map_err(|e| WsError::Send(e.to_string()))
-    }
-
-    /// Send a harness `cancel` message.
-    pub async fn send_harness_cancel(&self) -> Result<(), WsError> {
-        let msg = HarnessClientMessage::Cancel;
-        let json = serde_json::to_string(&msg)?;
-        self.tx
-            .send(json)
-            .await
-            .map_err(|e| WsError::Send(e.to_string()))
-    }
-
-    /// Send a tool callback response to the harness.
-    pub async fn send_tool_callback_response(
-        &self,
-        callback_id: &str,
-        result: &str,
-        is_error: bool,
-    ) -> Result<(), WsError> {
-        let msg = HarnessClientMessage::ToolCallbackResponse(ToolCallbackResponse {
-            callback_id: callback_id.to_string(),
-            result: result.to_string(),
-            is_error,
-        });
-        let json = serde_json::to_string(&msg)?;
-        self.tx
-            .send(json)
-            .await
-            .map_err(|e| WsError::Send(e.to_string()))
-    }
 }
 
 /// Events from the WebSocket connection.
@@ -189,8 +138,6 @@ pub enum WsEvent {
         callback_id: String,
         /// Tool name.
         tool_name: String,
-        /// Tool input.
-        input: serde_json::Value,
     },
     /// Connection closed.
     Disconnected,
@@ -376,7 +323,6 @@ fn harness_message_to_event(
         HarnessServerMessage::ToolCallbackRequest(req) => Some(WsEvent::ToolCallbackRequest {
             callback_id: req.callback_id,
             tool_name: req.tool_name,
-            input: req.input,
         }),
     }
 }
@@ -1044,11 +990,9 @@ mod tests {
             WsEvent::ToolCallbackRequest {
                 callback_id,
                 tool_name,
-                input,
             } => {
                 assert_eq!(callback_id, "cb-42");
                 assert_eq!(tool_name, "get_task_context");
-                assert_eq!(input["task_id"], "t-1");
             }
             _ => panic!("Expected ToolCallbackRequest event"),
         }
