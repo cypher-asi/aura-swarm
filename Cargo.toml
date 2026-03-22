@@ -8,6 +8,7 @@ members = [
     "crates/aura-swarm-scheduler",
     "crates/aura-swarm-gateway",
     "crates/aura-swarm-cli",
+    "crates/aura-swarm-protocol",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ k8s-openapi = { version = "0.24", features = ["v1_31"] }
 # Utilities
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+ulid = { version = "1", features = ["serde"] }
 blake3 = "1"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
