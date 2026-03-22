@@ -27,8 +27,11 @@ pub struct ZosLoginResponse {
 }
 
 /// Raw response from the zOS login endpoint.
+///
+/// zOS returns camelCase JSON (`accessToken`, `identityToken`).
 #[derive(Debug, Deserialize)]
 struct RawZosLoginResponse {
+    #[serde(rename = "accessToken")]
     access_token: String,
 }
 
