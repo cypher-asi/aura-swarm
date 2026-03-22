@@ -336,6 +336,35 @@ pub struct TurnCompleteInfo {
 }
 
 // =============================================================================
+// Tool Callback Protocol (Harness -> Client -> Harness)
+// =============================================================================
+
+/// A tool callback request from the harness runtime.
+///
+/// When the harness encounters an external tool call, it sends this message
+/// through the WS connection to the client for execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallbackRequest {
+    /// Unique ID for this callback (used to match response).
+    pub callback_id: String,
+    /// Name of the external tool being invoked.
+    pub tool_name: String,
+    /// Tool input arguments.
+    pub input: serde_json::Value,
+}
+
+/// A tool callback response from the client back to the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallbackResponse {
+    /// Callback ID matching the request.
+    pub callback_id: String,
+    /// Tool execution result.
+    pub result: String,
+    /// Whether the execution was an error.
+    pub is_error: bool,
+}
+
+// =============================================================================
 // Harness Protocol Types (aura-harness /stream endpoint)
 // =============================================================================
 
@@ -352,6 +381,8 @@ pub enum HarnessClientMessage {
     },
     /// Cancel the current turn.
     Cancel,
+    /// External tool callback response (client -> harness).
+    ToolCallbackResponse(ToolCallbackResponse),
 }
 
 /// Payload for harness `session_init`.
@@ -407,6 +438,8 @@ pub enum HarnessServerMessage {
         message: String,
         recoverable: bool,
     },
+    /// External tool callback request (harness -> client).
+    ToolCallbackRequest(ToolCallbackRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,5 +956,109 @@ mod tests {
         assert!(parsed.get("model").is_none());
         assert!(parsed.get("max_tokens").is_none());
         assert!(parsed.get("max_turns").is_none());
+    }
+
+    // =========================================================================
+    // Tool Callback Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn tool_callback_request_serializes_correctly() {
+        let req = ToolCallbackRequest {
+            callback_id: "cb-001".to_string(),
+            tool_name: "task_done".to_string(),
+            input: serde_json::json!({"status": "success", "summary": "Task completed"}),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["callback_id"], "cb-001");
+        assert_eq!(parsed["tool_name"], "task_done");
+        assert_eq!(parsed["input"]["status"], "success");
+    }
+
+    #[test]
+    fn tool_callback_request_deserializes_correctly() {
+        let json = r#"{"callback_id":"cb-002","tool_name":"get_task_context","input":{"task_id":"t-1"}}"#;
+        let req: ToolCallbackRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.callback_id, "cb-002");
+        assert_eq!(req.tool_name, "get_task_context");
+        assert_eq!(req.input["task_id"], "t-1");
+    }
+
+    #[test]
+    fn tool_callback_response_serializes_correctly() {
+        let resp = ToolCallbackResponse {
+            callback_id: "cb-001".to_string(),
+            result: "Task marked as done".to_string(),
+            is_error: false,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["callback_id"], "cb-001");
+        assert_eq!(parsed["result"], "Task marked as done");
+        assert_eq!(parsed["is_error"], false);
+    }
+
+    #[test]
+    fn tool_callback_response_deserializes_error() {
+        let json = r#"{"callback_id":"cb-003","result":"Tool not found","is_error":true}"#;
+        let resp: ToolCallbackResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(resp.callback_id, "cb-003");
+        assert_eq!(resp.result, "Tool not found");
+        assert!(resp.is_error);
+    }
+
+    #[test]
+    fn tool_callback_roundtrip() {
+        let original = ToolCallbackRequest {
+            callback_id: "cb-rt".to_string(),
+            tool_name: "domain_tool".to_string(),
+            input: serde_json::json!({"key": "value", "nested": {"a": 1}}),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: ToolCallbackRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.callback_id, original.callback_id);
+        assert_eq!(deserialized.tool_name, original.tool_name);
+        assert_eq!(deserialized.input, original.input);
+    }
+
+    #[test]
+    fn harness_server_message_tool_callback_request_deserializes() {
+        let json = r#"{"type":"tool_callback_request","callback_id":"cb-100","tool_name":"get_task_context","input":{"task_id":"t-42"}}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::ToolCallbackRequest(req) => {
+                assert_eq!(req.callback_id, "cb-100");
+                assert_eq!(req.tool_name, "get_task_context");
+                assert_eq!(req.input["task_id"], "t-42");
+            }
+            _ => panic!("Expected ToolCallbackRequest"),
+        }
+    }
+
+    #[test]
+    fn harness_client_message_tool_callback_response_serializes() {
+        let msg = HarnessClientMessage::ToolCallbackResponse(ToolCallbackResponse {
+            callback_id: "cb-100".to_string(),
+            result: "context data here".to_string(),
+            is_error: false,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "tool_callback_response");
+        assert_eq!(parsed["callback_id"], "cb-100");
+        assert_eq!(parsed["result"], "context data here");
+        assert_eq!(parsed["is_error"], false);
     }
 }

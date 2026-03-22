@@ -1083,6 +1083,19 @@ impl App {
                 self.set_status("Cancelled");
                 true
             }
+            WsEvent::ToolCallbackRequest {
+                callback_id,
+                tool_name,
+                ..
+            } => {
+                tracing::info!(
+                    callback_id = %callback_id,
+                    tool_name = %tool_name,
+                    "Received tool callback request (not yet handled by CLI)"
+                );
+                self.set_status(format!("Tool callback: {tool_name} (id: {callback_id})"));
+                true
+            }
             WsEvent::Disconnected => {
                 self.ws_connected = false;
                 self.ws_sender = None;

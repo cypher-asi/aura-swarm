@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::types::{
     ClientMessage, HarnessClientMessage, HarnessServerMessage, HarnessSessionInit,
-    HarnessToolInfo, ServerMessage, TurnCompleteInfo,
+    HarnessToolInfo, ServerMessage, ToolCallbackResponse, TurnCompleteInfo,
 };
 
 /// Error type for WebSocket operations.
@@ -116,6 +116,25 @@ impl WsSender {
             .await
             .map_err(|e| WsError::Send(e.to_string()))
     }
+
+    /// Send a tool callback response to the harness.
+    pub async fn send_tool_callback_response(
+        &self,
+        callback_id: &str,
+        result: &str,
+        is_error: bool,
+    ) -> Result<(), WsError> {
+        let msg = HarnessClientMessage::ToolCallbackResponse(ToolCallbackResponse {
+            callback_id: callback_id.to_string(),
+            result: result.to_string(),
+            is_error,
+        });
+        let json = serde_json::to_string(&msg)?;
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| WsError::Send(e.to_string()))
+    }
 }
 
 /// Events from the WebSocket connection.
@@ -163,6 +182,15 @@ pub enum WsEvent {
     Cancelled {
         /// ID of the cancelled request.
         request_id: String,
+    },
+    /// External tool callback requested by the harness.
+    ToolCallbackRequest {
+        /// Callback ID for matching the response.
+        callback_id: String,
+        /// Tool name.
+        tool_name: String,
+        /// Tool input.
+        input: serde_json::Value,
     },
     /// Connection closed.
     Disconnected,
@@ -344,6 +372,11 @@ fn harness_message_to_event(
         } => Some(WsEvent::Error {
             message,
             code: Some(code),
+        }),
+        HarnessServerMessage::ToolCallbackRequest(req) => Some(WsEvent::ToolCallbackRequest {
+            callback_id: req.callback_id,
+            tool_name: req.tool_name,
+            input: req.input,
         }),
     }
 }
@@ -993,6 +1026,31 @@ mod tests {
                 assert_eq!(code, Some("rate_limit".to_string()));
             }
             _ => panic!("Expected Error event"),
+        }
+    }
+
+    #[test]
+    fn harness_tool_callback_request_to_event() {
+        use crate::types::ToolCallbackRequest;
+
+        let msg = HarnessServerMessage::ToolCallbackRequest(ToolCallbackRequest {
+            callback_id: "cb-42".to_string(),
+            tool_name: "get_task_context".to_string(),
+            input: serde_json::json!({"task_id": "t-1"}),
+        });
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::ToolCallbackRequest {
+                callback_id,
+                tool_name,
+                input,
+            } => {
+                assert_eq!(callback_id, "cb-42");
+                assert_eq!(tool_name, "get_task_context");
+                assert_eq!(input["task_id"], "t-1");
+            }
+            _ => panic!("Expected ToolCallbackRequest event"),
         }
     }
 
