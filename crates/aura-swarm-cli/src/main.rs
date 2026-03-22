@@ -1,8 +1,16 @@
 //! Aura Swarm CLI - Terminal UI for managing agents.
 //!
 //! This is the entry point for the `aswarm` binary.
+//!
+//! # Subcommands
+//!
+//! - `aswarm login`  — authenticate with zOS (email/password)
+//! - `aswarm logout` — clear stored credentials
+//! - `aswarm whoami` — show the currently authenticated user
+//! - `aswarm` (no subcommand) — launch the TUI
 
 mod app;
+mod auth;
 mod client;
 mod markdown;
 mod types;
@@ -12,7 +20,8 @@ mod ws;
 use std::io;
 use std::time::Duration;
 
-use clap::Parser;
+use aura_swarm_auth::AuthConfig;
+use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -35,29 +44,50 @@ use ws::WsEvent;
 #[command(name = "aswarm")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// zOS access token for authentication.
-    #[arg(long, env = "AURA_SWARM_TOKEN")]
-    token: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// zOS API base URL.
+    #[arg(
+        long,
+        env = "AURA_SWARM_ZOS_URL",
+        default_value = "https://zosapi.zero.tech",
+        global = true
+    )]
+    zos_url: String,
+
+    /// zOS access token (overrides stored credentials).
+    #[arg(long, env = "AURA_SWARM_TOKEN", global = true)]
+    token: Option<String>,
 
     /// Gateway URL.
     #[arg(
         long,
         env = "AURA_SWARM_GATEWAY",
-        default_value = "http://localhost:8080"
+        default_value = "http://localhost:8080",
+        global = true
     )]
     gateway: String,
 
     /// Enable debug logging.
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "false", global = true)]
     debug: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Log in to zOS with email and password.
+    Login,
+    /// Log out and clear stored credentials.
+    Logout,
+    /// Show the currently authenticated user.
+    Whoami,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Parse arguments
     let args = Args::parse();
 
-    // Initialize logging
     if args.debug {
         tracing_subscriber::fmt()
             .with_env_filter("aura_swarm_cli=debug,warn")
@@ -65,28 +95,93 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    // Create client
-    let client = GatewayClient::new(&args.gateway, &args.token);
+    match args.command {
+        Some(Command::Login) => cmd_login(&args.zos_url).await,
+        Some(Command::Logout) => cmd_logout(),
+        Some(Command::Whoami) => cmd_whoami(&args.zos_url, args.token).await,
+        None => cmd_tui(args).await,
+    }
+}
 
-    // Setup terminal with mouse capture enabled
+// ---------------------------------------------------------------------------
+// Subcommand handlers
+// ---------------------------------------------------------------------------
+
+async fn cmd_login(zos_url: &str) -> anyhow::Result<()> {
+    println!("Logging in to {zos_url} …");
+
+    let token = auth::login_interactive(zos_url).await?;
+    auth::save_credentials(&token)?;
+
+    let config = AuthConfig {
+        base_url: zos_url.to_owned(),
+        ..AuthConfig::default()
+    };
+    let client = aura_swarm_auth::ZosClient::new(config);
+
+    match client.fetch_user_info(&token).await {
+        Ok(info) => {
+            let id = info.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            println!("Logged in as {id} — credentials saved.");
+        }
+        Err(_) => {
+            println!("Logged in — credentials saved. (Could not fetch user info.)");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_logout() -> anyhow::Result<()> {
+    auth::clear_credentials()?;
+    println!("Logged out — credentials removed.");
+    Ok(())
+}
+
+async fn cmd_whoami(zos_url: &str, token_flag: Option<String>) -> anyhow::Result<()> {
+    let token = auth::resolve_token(token_flag)?;
+
+    let config = AuthConfig {
+        base_url: zos_url.to_owned(),
+        ..AuthConfig::default()
+    };
+    let client = aura_swarm_auth::ZosClient::new(config);
+    let info = client.fetch_user_info(&token).await?;
+
+    let id = info.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let zid = info
+        .get("primaryZID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+
+    println!("User ID : {id}");
+    println!("Primary ZID: {zid}");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TUI (default — no subcommand)
+// ---------------------------------------------------------------------------
+
+async fn cmd_tui(args: Args) -> anyhow::Result<()> {
+    let token = auth::resolve_token(args.token)?;
+    let client = GatewayClient::new(&args.gateway, &token);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app
     let mut app = App::new(client);
 
-    // Initial agent load
     if let Err(e) = app.refresh_agents().await {
         app.set_error(format!("Failed to load agents: {e}"));
     }
 
-    // Run the event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
