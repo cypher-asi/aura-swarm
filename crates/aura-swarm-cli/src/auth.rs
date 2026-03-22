@@ -8,6 +8,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use aura_swarm_auth::{AuthConfig, ZosClient};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal;
 use serde::{Deserialize, Serialize};
 
 /// On-disk credential format.
@@ -101,12 +103,60 @@ pub async fn login_interactive(zos_url: &str) -> anyhow::Result<String> {
         anyhow::bail!("Email cannot be empty");
     }
 
-    // Prompt password (masked)
-    let password = rpassword::prompt_password("Password: ")?;
+    let password = prompt_password("Password: ")?;
     if password.is_empty() {
         anyhow::bail!("Password cannot be empty");
     }
 
     let resp = client.login(&email, &password).await?;
     Ok(resp.access_token)
+}
+
+/// Read a password from the terminal, printing `*` for each character.
+///
+/// Handles typing, paste (rapid character events), backspace, and Esc to cancel.
+fn prompt_password(prompt: &str) -> anyhow::Result<String> {
+    let mut stdout = io::stdout();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+
+    terminal::enable_raw_mode()?;
+    let result = read_password_raw(&mut stdout);
+    terminal::disable_raw_mode()?;
+
+    writeln!(stdout)?;
+    stdout.flush()?;
+
+    result
+}
+
+fn read_password_raw(stdout: &mut io::Stdout) -> anyhow::Result<String> {
+    let mut password = String::new();
+
+    loop {
+        let ev = event::read()?;
+
+        if let Event::Key(key) = ev {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Enter => return Ok(password),
+                KeyCode::Esc => anyhow::bail!("Cancelled"),
+                KeyCode::Backspace => {
+                    if password.pop().is_some() {
+                        write!(stdout, "\x08 \x08")?;
+                        stdout.flush()?;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    password.push(c);
+                    write!(stdout, "*")?;
+                    stdout.flush()?;
+                }
+                _ => {}
+            }
+        }
+    }
 }

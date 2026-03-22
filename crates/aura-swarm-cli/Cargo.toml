@@ -55,7 +55,6 @@ base64 = "0.22"
 # Auth (zOS login)
 aura-swarm-auth = { path = "../aura-swarm-auth" }
 dirs = "6"
-rpassword = "7"
 
 [lints]
 workspace = true
