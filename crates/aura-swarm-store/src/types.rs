@@ -2,7 +2,7 @@
 //!
 //! These types represent the persisted state of agents, sessions, and users.
 
-use aura_swarm_core::{AgentId, SessionId, UserId};
+use aura_swarm_core::{AgentId, IdentityId, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Agent {
     /// Unique identifier for the agent.
     pub agent_id: AgentId,
-    /// Owner user ID.
-    pub user_id: UserId,
+    /// Owner identity ID (from Zero-ID).
+    pub identity_id: IdentityId,
     /// Human-readable name.
     pub name: String,
     /// Current lifecycle state.
@@ -43,6 +43,10 @@ pub struct AgentSpec {
     /// If not specified, uses the scheduler's default.
     #[serde(default)]
     pub isolation: Option<IsolationLevel>,
+    /// Engine type for the agent runtime.
+    /// Defaults to Harness if not specified (backwards-compatible via serde default).
+    #[serde(default)]
+    pub engine_type: EngineType,
 }
 
 impl Default for AgentSpec {
@@ -52,8 +56,24 @@ impl Default for AgentSpec {
             memory_mb: 512,
             runtime_version: "latest".to_string(),
             isolation: None, // Uses scheduler default
+            engine_type: EngineType::default(),
         }
     }
+}
+
+/// The reasoning engine type for an agent.
+///
+/// Determines which container image and runtime configuration
+/// the scheduler uses when provisioning the agent pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineType {
+    /// aura-harness reasoning engine with AgentLoop, streaming,
+    /// tool caching, blocking detection, and context compaction.
+    #[default]
+    Harness,
+    /// Previous aura-runtime image (basic WS forwarding).
+    Legacy,
 }
 
 /// Isolation level for agent execution.
@@ -75,7 +95,7 @@ pub enum IsolationLevel {
 }
 
 impl IsolationLevel {
-    /// Get the Kubernetes RuntimeClass name for this isolation level.
+    /// Get the Kubernetes `RuntimeClass` name for this isolation level.
     ///
     /// Returns `None` for container isolation (uses default runtime),
     /// or `Some("kata-fc")` for microVM isolation.
@@ -139,8 +159,8 @@ pub struct Session {
     pub session_id: SessionId,
     /// Agent this session is connected to.
     pub agent_id: AgentId,
-    /// User who owns this session.
-    pub user_id: UserId,
+    /// Identity who owns this session (from Zero-ID).
+    pub identity_id: IdentityId,
     /// Current session status.
     pub status: SessionStatus,
     /// Creation timestamp.
@@ -171,8 +191,8 @@ impl SessionStatus {
 /// A user record stored in the database (synced from Zero-ID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
-    /// Unique identifier for the user.
-    pub user_id: UserId,
+    /// Unique identifier for the user (identity ID from Zero-ID).
+    pub identity_id: IdentityId,
     /// User's email address.
     pub email: String,
     /// Whether the email has been verified.
