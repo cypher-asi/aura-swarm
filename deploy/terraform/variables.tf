@@ -116,7 +116,8 @@ variable "ecr_repositories" {
   default = [
     "gateway",
     "control",
-    "scheduler"
+    "scheduler",
+    "harness"
   ]
 }
 

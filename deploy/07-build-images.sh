@@ -33,11 +33,14 @@ DEV_MODE=false
 REFRESH_K8S=false
 REFRESH_GATEWAY_ONLY=false
 AURA_RUNTIME_PATH="${PROJECT_ROOT}/../aura-runtime"
+AURA_HARNESS_PATH="${PROJECT_ROOT}/../aura-harness"
+BUILD_HARNESS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --all)
             BUILD_RUNTIME=true
+            BUILD_HARNESS=true
             shift
             ;;
         --runtime)
@@ -47,6 +50,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --runtime-path)
             AURA_RUNTIME_PATH="$2"
+            shift 2
+            ;;
+        --harness)
+            BUILD_PLATFORM=false
+            BUILD_HARNESS=true
+            shift
+            ;;
+        --harness-path)
+            AURA_HARNESS_PATH="$2"
             shift 2
             ;;
         --dev-mode)
@@ -64,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--all] [--runtime] [--runtime-path PATH] [--dev-mode] [--refresh] [--refresh-gateway]"
+            echo "Usage: $0 [--all] [--runtime] [--runtime-path PATH] [--harness] [--harness-path PATH] [--dev-mode] [--refresh] [--refresh-gateway]"
             exit 1
             ;;
     esac
@@ -76,6 +88,7 @@ echo "=============================================="
 echo ""
 echo "Build platform services: ${BUILD_PLATFORM}"
 echo "Build aura-runtime: ${BUILD_RUNTIME}"
+echo "Build aura-harness: ${BUILD_HARNESS}"
 echo "Dev mode (mock auth): ${DEV_MODE}"
 echo "Refresh K8s after build: ${REFRESH_K8S}$(if [[ "$REFRESH_GATEWAY_ONLY" == "true" ]]; then echo " (gateway only)"; fi)"
 echo ""
@@ -268,6 +281,55 @@ if [[ "$BUILD_RUNTIME" == "true" ]]; then
 fi
 
 #------------------------------------------------------------------------------
+# Build aura-harness
+#------------------------------------------------------------------------------
+
+if [[ "$BUILD_HARNESS" == "true" ]]; then
+    echo ""
+    echo "=============================================="
+    echo "  Building Aura Harness"
+    echo "=============================================="
+    echo ""
+    
+    if [[ ! -d "${AURA_HARNESS_PATH}" ]]; then
+        echo -e "${RED}✗${NC} Aura harness not found at: ${AURA_HARNESS_PATH}"
+        echo "Use --harness-path to specify the location"
+        exit 1
+    fi
+    
+    if [[ ! -f "${AURA_HARNESS_PATH}/Dockerfile" ]]; then
+        echo -e "${RED}✗${NC} Dockerfile not found in aura-harness"
+        echo "Expected: ${AURA_HARNESS_PATH}/Dockerfile"
+        exit 1
+    fi
+    
+    # Create ECR repo for aura-harness if it doesn't exist
+    HARNESS_REPO_NAME="${RESOURCE_PREFIX}-harness"
+    if ! aws ecr describe-repositories --repository-names "${HARNESS_REPO_NAME}" &> /dev/null; then
+        echo "Creating ECR repository: ${HARNESS_REPO_NAME}"
+        aws ecr create-repository \
+            --repository-name "${HARNESS_REPO_NAME}" \
+            --image-scanning-configuration scanOnPush=true
+    fi
+    
+    HARNESS_IMAGE="${ECR_REGISTRY}/${HARNESS_REPO_NAME}:${IMAGE_TAG}"
+    
+    echo "Building aura-harness image..."
+    docker build \
+        --no-cache \
+        -t "${HARNESS_REPO_NAME}:${IMAGE_TAG}" \
+        -t "${HARNESS_IMAGE}" \
+        "${AURA_HARNESS_PATH}"
+    
+    echo -e "${GREEN}✓${NC} Built ${HARNESS_REPO_NAME}:${IMAGE_TAG}"
+    
+    echo "Pushing to ECR..."
+    docker push "${HARNESS_IMAGE}"
+    
+    echo -e "${GREEN}✓${NC} Pushed ${HARNESS_IMAGE}"
+fi
+
+#------------------------------------------------------------------------------
 # Summary
 #------------------------------------------------------------------------------
 
@@ -286,6 +348,10 @@ fi
 
 if [[ "$BUILD_RUNTIME" == "true" ]]; then
     echo "  ${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
+fi
+
+if [[ "$BUILD_HARNESS" == "true" ]]; then
+    echo "  ${ECR_REGISTRY}/${RESOURCE_PREFIX}-harness:${IMAGE_TAG}"
 fi
 
 echo ""
@@ -358,6 +424,30 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
             echo -e "${GREEN}✓${NC} Agent pods deleted. They will be recreated with the new image when sessions are opened."
             echo ""
             echo -e "${YELLOW}Note:${NC} Agents will be in 'Stopped' state. Use the CLI to start them again."
+        else
+            echo "No running agent pods found."
+        fi
+    fi
+    
+    # Restart agent pods if harness was rebuilt
+    if [[ "$BUILD_HARNESS" == "true" ]]; then
+        echo ""
+        echo "=============================================="
+        echo "  Restarting Harness Agent Pods"
+        echo "=============================================="
+        echo ""
+        
+        AGENT_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        if [[ "$AGENT_COUNT" -gt 0 ]]; then
+            echo "Found ${AGENT_COUNT} running agent pod(s)."
+            echo "Deleting all agent pods to pull new harness image..."
+            echo ""
+            
+            kubectl delete pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --wait=false
+            
+            echo ""
+            echo -e "${GREEN}✓${NC} Agent pods deleted. They will be recreated with the new image when sessions are opened."
         else
             echo "No running agent pods found."
         fi

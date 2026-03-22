@@ -42,6 +42,11 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: AURA_RUNTIME_IMAGE
+            - name: AURA_HARNESS_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: AURA_HARNESS_IMAGE
             - name: DEFAULT_ISOLATION
               valueFrom:
                 configMapKeyRef:
@@ -65,6 +70,30 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: STATE_PVC_NAME
+                  optional: true
+            # z-billing integration
+            - name: Z_BILLING_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_URL
+            - name: Z_BILLING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aura-swarm-secrets
+                  key: Z_BILLING_API_KEY
+                  optional: true
+            - name: Z_BILLING_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_ENABLED
+                  optional: true
+            - name: Z_BILLING_FAIL_CLOSED
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_FAIL_CLOSED
                   optional: true
           resources:
             requests:
