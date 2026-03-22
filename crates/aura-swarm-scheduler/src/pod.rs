@@ -4,7 +4,7 @@
 //! for Aura agent pods with all necessary configuration.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{AgentSpec, EngineType};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
@@ -75,7 +75,10 @@ fn build_metadata(
         chrono::Utc::now().to_rfc3339(),
     );
     // Store full IDs in annotations (no length limit)
-    annotations.insert("swarm.io/agent-id-full".to_string(), agent_id_hex.to_string());
+    annotations.insert(
+        "swarm.io/agent-id-full".to_string(),
+        agent_id_hex.to_string(),
+    );
     annotations.insert("swarm.io/user-id-full".to_string(), user_id_hex.to_string());
 
     ObjectMeta {
@@ -107,9 +110,20 @@ fn build_pod_spec(
     // runtime_class() returns None for standard containers (uses default runtime)
     let runtime_class_name = isolation.runtime_class().map(String::from);
 
+    let image = match spec.engine_type {
+        EngineType::Harness => &config.harness_image,
+        EngineType::Legacy => &config.image,
+    };
+
     PodSpec {
         runtime_class_name,
-        containers: vec![build_container(agent_id_hex, user_id_hex, spec, config)],
+        containers: vec![build_container(
+            agent_id_hex,
+            user_id_hex,
+            spec,
+            config,
+            image,
+        )],
         volumes: Some(vec![build_state_volume(config)]),
         restart_policy: Some("Always".to_string()),
         termination_grace_period_seconds: Some(30),
@@ -123,16 +137,22 @@ fn build_container(
     user_id_hex: &str,
     spec: &AgentSpec,
     config: &SchedulerConfig,
+    image: &str,
 ) -> Container {
     Container {
         name: "aura".to_string(),
-        image: Some(config.image.clone()),
+        image: Some(image.to_string()),
         ports: Some(vec![ContainerPort {
             container_port: AURA_PORT,
             name: Some("http".to_string()),
             ..Default::default()
         }]),
-        env: Some(build_env_vars(agent_id_hex, user_id_hex, config)),
+        env: Some(build_env_vars(
+            agent_id_hex,
+            user_id_hex,
+            spec.engine_type,
+            config,
+        )),
         resources: Some(build_resources(spec)),
         volume_mounts: Some(vec![build_state_mount(agent_id_hex)]),
         readiness_probe: Some(build_readiness_probe()),
@@ -144,8 +164,13 @@ fn build_container(
 /// Name of the Kubernetes secret containing LLM API keys.
 const LLM_SECRETS_NAME: &str = "aura-swarm-secrets";
 
-fn build_env_vars(agent_id_hex: &str, user_id_hex: &str, config: &SchedulerConfig) -> Vec<EnvVar> {
-    vec![
+fn build_env_vars(
+    agent_id_hex: &str,
+    user_id_hex: &str,
+    engine_type: EngineType,
+    config: &SchedulerConfig,
+) -> Vec<EnvVar> {
+    let mut vars = vec![
         // Agent identity
         EnvVar {
             name: "AGENT_ID".to_string(),
@@ -176,7 +201,34 @@ fn build_env_vars(agent_id_hex: &str, user_id_hex: &str, config: &SchedulerConfi
         // LLM API keys (injected from Kubernetes secret)
         build_secret_env_var("ANTHROPIC_API_KEY", LLM_SECRETS_NAME, "ANTHROPIC_API_KEY"),
         build_secret_env_var("OPENAI_API_KEY", LLM_SECRETS_NAME, "OPENAI_API_KEY"),
-    ]
+    ];
+
+    if engine_type == EngineType::Harness {
+        vars.extend([
+            EnvVar {
+                name: "AURA_DATA_DIR".to_string(),
+                value: Some("/state".to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "AURA_LLM_ROUTING".to_string(),
+                value: Some("direct".to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "ENABLE_FS_TOOLS".to_string(),
+                value: Some("true".to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "ENABLE_CMD_TOOLS".to_string(),
+                value: Some("true".to_string()),
+                ..Default::default()
+            },
+        ]);
+    }
+
+    vars
 }
 
 /// Build an environment variable that references a Kubernetes secret.
@@ -276,12 +328,12 @@ fn build_security_context() -> PodSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_swarm_core::UserId;
-    use aura_swarm_store::IsolationLevel;
+    use aura_swarm_core::IdentityId;
+    use aura_swarm_store::{EngineType, IsolationLevel};
 
     fn test_agent_id() -> AgentId {
-        let user_id = UserId::from_bytes([1u8; 32]);
-        AgentId::generate(&user_id, "test-agent")
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
+        AgentId::generate(&identity_id, "test-agent")
     }
 
     fn test_spec() -> AgentSpec {
@@ -289,7 +341,8 @@ mod tests {
             cpu_millicores: 500,
             memory_mb: 512,
             runtime_version: "latest".to_string(),
-            isolation: None, // Uses scheduler default
+            isolation: None,
+            engine_type: EngineType::default(),
         }
     }
 
@@ -305,11 +358,11 @@ mod tests {
     #[test]
     fn build_pod_has_required_fields() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
 
         // Metadata
         let meta = &pod.metadata;
@@ -351,16 +404,17 @@ mod tests {
     #[test]
     fn build_pod_uses_spec_resources() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
             cpu_millicores: 1000,
             memory_mb: 2048,
             runtime_version: "v1.0".to_string(),
             isolation: None,
+            engine_type: EngineType::default(),
         };
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let resources = container.resources.as_ref().unwrap();
 
@@ -379,14 +433,14 @@ mod tests {
     #[test]
     fn build_pod_uses_default_isolation_when_none_specified() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
             isolation: None, // Should use scheduler default (MicroVM)
             ..test_spec()
         };
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-fc"));
@@ -395,14 +449,14 @@ mod tests {
     #[test]
     fn build_pod_uses_agent_isolation_when_specified() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::Container), // Override to container
             ..test_spec()
         };
         let config = SchedulerConfig::default(); // Default is MicroVM
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
         // Container isolation uses default runtime (no RuntimeClass specified)
@@ -412,7 +466,7 @@ mod tests {
     #[test]
     fn build_pod_respects_scheduler_default_isolation() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
             isolation: None, // Use scheduler default
             ..test_spec()
@@ -420,7 +474,7 @@ mod tests {
         let mut config = SchedulerConfig::default();
         config.default_isolation = IsolationLevel::Container; // Change default
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
         // Container isolation uses default runtime (no RuntimeClass specified)
@@ -430,11 +484,11 @@ mod tests {
     #[test]
     fn build_pod_injects_llm_api_keys_from_secret() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_hex(), &spec, &config);
+        let pod = build_pod(&agent_id, &identity_id.to_string(), &spec, &config);
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let env = container.env.as_ref().unwrap();
 
