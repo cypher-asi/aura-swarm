@@ -82,7 +82,7 @@ impl HttpSchedulerClient {
     ///
     /// # Arguments
     ///
-    /// * `base_url` - The base URL of the scheduler service (e.g., "http://scheduler:8080")
+    /// * `base_url` - The base URL of the scheduler service (e.g., `http://scheduler:8080`)
     ///
     /// # Panics
     ///
@@ -140,11 +140,7 @@ impl SchedulerClient for HttpSchedulerClient {
         user_id_hex: &str,
         spec: &AgentSpec,
     ) -> Result<()> {
-        let url = format!(
-            "{}/v1/agents/{}/schedule",
-            self.base_url,
-            agent_id.to_hex()
-        );
+        let url = format!("{}/v1/agents/{}/schedule", self.base_url, agent_id.to_hex());
 
         let request = ScheduleRequest {
             user_id: user_id_hex,
@@ -164,11 +160,10 @@ impl SchedulerClient for HttpSchedulerClient {
             Ok(())
         } else {
             let status = response.status();
-            let error = response
-                .json::<ErrorResponse>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_else(|_| format!("Scheduler returned status {status}"));
+            let error = response.json::<ErrorResponse>().await.map_or_else(
+                |_| format!("Scheduler returned status {status}"),
+                |e| e.error,
+            );
 
             tracing::error!(
                 agent_id = %agent_id,
@@ -177,9 +172,7 @@ impl SchedulerClient for HttpSchedulerClient {
                 "Failed to schedule agent"
             );
 
-            Err(ControlError::Internal(format!(
-                "Scheduler error: {error}"
-            )))
+            Err(ControlError::Internal(format!("Scheduler error: {error}")))
         }
     }
 
@@ -198,11 +191,10 @@ impl SchedulerClient for HttpSchedulerClient {
             Ok(())
         } else {
             let status = response.status();
-            let error = response
-                .json::<ErrorResponse>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_else(|_| format!("Scheduler returned status {status}"));
+            let error = response.json::<ErrorResponse>().await.map_or_else(
+                |_| format!("Scheduler returned status {status}"),
+                |e| e.error,
+            );
 
             tracing::error!(
                 agent_id = %agent_id,
@@ -211,9 +203,7 @@ impl SchedulerClient for HttpSchedulerClient {
                 "Failed to terminate agent"
             );
 
-            Err(ControlError::Internal(format!(
-                "Scheduler error: {error}"
-            )))
+            Err(ControlError::Internal(format!("Scheduler error: {error}")))
         }
     }
 
@@ -236,15 +226,12 @@ impl SchedulerClient for HttpSchedulerClient {
             Err(ControlError::AgentNotFound(*agent_id))
         } else {
             let status = response.status();
-            let error = response
-                .json::<ErrorResponse>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_else(|_| format!("Scheduler returned status {status}"));
+            let error = response.json::<ErrorResponse>().await.map_or_else(
+                |_| format!("Scheduler returned status {status}"),
+                |e| e.error,
+            );
 
-            Err(ControlError::Internal(format!(
-                "Scheduler error: {error}"
-            )))
+            Err(ControlError::Internal(format!("Scheduler error: {error}")))
         }
     }
 
@@ -270,15 +257,12 @@ impl SchedulerClient for HttpSchedulerClient {
             Ok(resp.endpoint)
         } else {
             let status = response.status();
-            let error = response
-                .json::<ErrorResponse>()
-                .await
-                .map(|e| e.error)
-                .unwrap_or_else(|_| format!("Scheduler returned status {status}"));
+            let error = response.json::<ErrorResponse>().await.map_or_else(
+                |_| format!("Scheduler returned status {status}"),
+                |e| e.error,
+            );
 
-            Err(ControlError::Internal(format!(
-                "Scheduler error: {error}"
-            )))
+            Err(ControlError::Internal(format!("Scheduler error: {error}")))
         }
     }
 }

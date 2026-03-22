@@ -22,6 +22,7 @@ aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-auth = { path = "../aura-swarm-auth" }
 aura-swarm-control = { path = "../aura-swarm-control" }
 aura-swarm-store = { path = "../aura-swarm-store" }
+z-billing-client = { git = "ssh://git@github.com/cypher-asi/z-billing.git" }
 
 # Web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
@@ -49,6 +50,8 @@ tempfile.workspace = true
 aura-swarm-store = { path = "../aura-swarm-store" }
 tokio = { workspace = true, features = ["test-util"] }
 axum-test = "15"
+reqwest = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

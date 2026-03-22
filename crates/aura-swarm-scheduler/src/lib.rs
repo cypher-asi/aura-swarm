@@ -55,11 +55,11 @@
 //! let scheduler = K8sScheduler::new(config).await?;
 //!
 //! // Schedule an agent
-//! let user_id = UserId::from_bytes([0u8; 32]);
+//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //! let agent_id = AgentId::generate(&user_id, "my-agent");
 //! let spec = AgentSpec::default();
 //!
-//! scheduler.schedule_agent(&agent_id, &user_id.to_hex(), &spec).await?;
+//! scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
 //!
 //! // Check if it's ready
 //! let status = scheduler.get_pod_status(&agent_id).await?;
@@ -86,11 +86,11 @@
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let scheduler = MockScheduler::new();
 //!
-//! let user_id = UserId::from_bytes([0u8; 32]);
+//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //! let agent_id = AgentId::generate(&user_id, "test-agent");
 //! let spec = AgentSpec::default();
 //!
-//! scheduler.schedule_agent(&agent_id, &user_id.to_hex(), &spec).await?;
+//! scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
 //! assert_eq!(scheduler.pod_count(), 1);
 //! # Ok(())
 //! # }
@@ -101,12 +101,14 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 
+pub mod billing;
 pub mod cache;
 pub mod error;
 pub mod k8s;
 pub mod pod;
 pub mod types;
 
+pub use billing::{ComputeUsageReporter, PodUsageInfo, SchedulerBillingConfig};
 pub use error::{Result, SchedulerError};
 pub use k8s::{K8sScheduler, Scheduler};
 pub use types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};

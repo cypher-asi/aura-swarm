@@ -14,7 +14,7 @@ The specifications are organized by component, starting with the system overview
 | 04 | [04-agent-registry.md](./04-agent-registry.md) | `aura-swarm-store` | RocksDB schema, column families, key layouts |
 | 05 | [05-scheduler.md](./05-scheduler.md) | `aura-swarm-scheduler` | K8s reconciler, pod templates, health monitoring |
 | 06 | [06-agent-runtime.md](./06-agent-runtime.md) | Aura | Runtime contract, sandbox, hibernation |
-| 07 | [07-auth.md](./07-auth.md) | `aura-swarm-auth` | Zero-ID integration, JWT validation |
+| 07 | [07-auth.md](./07-auth.md) | `aura-swarm-auth` | zOS integration, JWT validation |
 | 08 | [08-networking.md](./08-networking.md) | — | Internal routing, agent resolution, egress |
 | 09 | [09-observability.md](./09-observability.md) | — | Logs, metrics, traces |
 | 10 | [10-security.md](./10-security.md) | — | MicroVM hardening, secrets, audit |
@@ -41,7 +41,7 @@ graph TD
     end
     
     subgraph external [External Services]
-        ZeroId[Zero-ID Server]
+        zOS[zOS API Server]
         Storage[EFS /state]
     end
     
@@ -90,7 +90,7 @@ graph TD
 
 | Term | Definition |
 |------|------------|
-| **User** | An authenticated individual identified by `user_id` from Zero-ID |
+| **User** | An authenticated individual identified by `user_id` from zOS |
 | **Agent** | A long-running Aura runtime instance, owned by a user |
 | **MicroVM** | Firecracker-backed VM providing kernel-level isolation per agent |
 | **Session** | An interactive WebSocket connection between a user and their agent |
@@ -102,7 +102,7 @@ graph TD
 
 | Decision | Approach |
 |----------|----------|
-| **Authentication** | Simple email/password via Zero-ID server; JWT tokens |
+| **Authentication** | Simple email/password via zOS; JWT tokens |
 | **Agent Ownership** | Per-user; no multi-tenant namespaces in v0.1.0 |
 | **Database** | Single RocksDB instance; key layout supports future sharding |
 | **Replication** | Not required; single-node deployment |
@@ -127,7 +127,7 @@ All platform services are implemented in **Rust** following the conventions in [
 aura-swarm/
 ├─ aura-swarm-core          # IDs, schemas, errors (shared types)
 ├─ aura-swarm-store         # RocksDB storage implementation
-├─ aura-swarm-auth          # Zero-ID JWT validation
+├─ aura-swarm-auth          # zOS JWT validation
 ├─ aura-swarm-control       # Agent lifecycle, session management
 ├─ aura-swarm-scheduler     # K8s reconciler, pod management
 ├─ aura-swarm-gateway       # Public HTTP/WebSocket API

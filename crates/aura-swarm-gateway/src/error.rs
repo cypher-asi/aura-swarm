@@ -45,6 +45,19 @@ pub enum ApiError {
     /// Agent pod is not reachable.
     #[error("agent unavailable")]
     AgentUnavailable,
+
+    /// Insufficient credits for the operation.
+    #[error("insufficient credits: balance={balance} cents, required={required} cents")]
+    InsufficientCredits {
+        /// Current balance in cents.
+        balance: i64,
+        /// Required amount in cents.
+        required: i64,
+    },
+
+    /// Billing account not found.
+    #[error("billing account not found")]
+    BillingAccountNotFound,
 }
 
 /// Error response body.
@@ -73,6 +86,9 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AgentUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => {
+                StatusCode::PAYMENT_REQUIRED
+            }
         }
     }
 
@@ -88,6 +104,8 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::Internal(_) => "internal_error",
             Self::AgentUnavailable => "agent_unavailable",
+            Self::InsufficientCredits { .. } => "insufficient_credits",
+            Self::BillingAccountNotFound => "billing_account_not_found",
         }
     }
 }
@@ -114,14 +132,14 @@ impl From<AuthError> for ApiError {
             | AuthError::InvalidIssuer
             | AuthError::InvalidAudience
             | AuthError::InvalidUserId
-            | AuthError::InvalidIdentityId
-            | AuthError::InvalidNamespaceId
-            | AuthError::InvalidSessionId
             | AuthError::MissingClaim(_)
-            | AuthError::InvalidToken(_)
-            | AuthError::LoginFailed(_) => Self::Unauthorized,
-            AuthError::MfaRequired | AuthError::IdentityFrozen => Self::Forbidden,
-            AuthError::RateLimited => Self::RateLimited,
+            | AuthError::InvalidToken(_) => Self::Unauthorized,
+            AuthError::ZosApi { status, .. } => match status {
+                401 => Self::Unauthorized,
+                403 => Self::Forbidden,
+                429 => Self::RateLimited,
+                _ => Self::Internal("authentication service error".to_string()),
+            },
             AuthError::KeyNotFound(_) | AuthError::JwksFetchFailed(_) | AuthError::Internal(_) => {
                 tracing::error!(error = %err, "Auth internal error");
                 Self::Internal("authentication service error".to_string())
@@ -148,6 +166,10 @@ impl From<ControlError> for ApiError {
             ControlError::SessionAlreadyActive(id) => {
                 Self::Conflict(format!("agent {id} already has an active session"))
             }
+            ControlError::InsufficientCredits { balance, required } => {
+                Self::InsufficientCredits { balance, required }
+            }
+            ControlError::BillingAccountNotFound => Self::BillingAccountNotFound,
             ControlError::Auth(auth_err) => Self::from(auth_err),
             ControlError::Store(store_err) => {
                 tracing::error!(error = %store_err, "Store error");

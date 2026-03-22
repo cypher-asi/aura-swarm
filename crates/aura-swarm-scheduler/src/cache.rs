@@ -72,9 +72,11 @@ impl EndpointCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_swarm_core::UserId;
 
     fn test_agent_id() -> AgentId {
-        AgentId::from_bytes([1u8; 32])
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        AgentId::generate_deterministic(&user_id, "test", 42)
     }
 
     #[test]
@@ -85,7 +87,7 @@ mod tests {
         assert!(cache.get(&agent_id).is_none());
         assert!(!cache.contains(&agent_id));
 
-        cache.insert(agent_id.clone(), "10.0.0.1:8080".to_string());
+        cache.insert(agent_id, "10.0.0.1:8080".to_string());
 
         assert_eq!(cache.get(&agent_id), Some("10.0.0.1:8080".to_string()));
         assert!(cache.contains(&agent_id));
@@ -96,8 +98,8 @@ mod tests {
         let cache = EndpointCache::new();
         let agent_id = test_agent_id();
 
-        cache.insert(agent_id.clone(), "10.0.0.1:8080".to_string());
-        cache.insert(agent_id.clone(), "10.0.0.2:8080".to_string());
+        cache.insert(agent_id, "10.0.0.1:8080".to_string());
+        cache.insert(agent_id, "10.0.0.2:8080".to_string());
 
         assert_eq!(cache.get(&agent_id), Some("10.0.0.2:8080".to_string()));
         assert_eq!(cache.len(), 1);
@@ -108,7 +110,7 @@ mod tests {
         let cache = EndpointCache::new();
         let agent_id = test_agent_id();
 
-        cache.insert(agent_id.clone(), "10.0.0.1:8080".to_string());
+        cache.insert(agent_id, "10.0.0.1:8080".to_string());
         let removed = cache.remove(&agent_id);
 
         assert_eq!(removed, Some("10.0.0.1:8080".to_string()));
@@ -119,9 +121,16 @@ mod tests {
     #[test]
     fn cache_clear() {
         let cache = EndpointCache::new();
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 
-        cache.insert(AgentId::from_bytes([1u8; 32]), "10.0.0.1:8080".to_string());
-        cache.insert(AgentId::from_bytes([2u8; 32]), "10.0.0.2:8080".to_string());
+        cache.insert(
+            AgentId::generate_deterministic(&user_id, "a1", 1),
+            "10.0.0.1:8080".to_string(),
+        );
+        cache.insert(
+            AgentId::generate_deterministic(&user_id, "a2", 2),
+            "10.0.0.2:8080".to_string(),
+        );
 
         assert_eq!(cache.len(), 2);
 

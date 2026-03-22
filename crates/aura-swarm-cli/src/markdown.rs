@@ -12,7 +12,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 /// Convert markdown text to styled ratatui Lines.
-/// 
+///
 /// `available_width` is used to properly handle code blocks - code lines
 /// longer than this will be truncated rather than wrapped to avoid
 /// line number overlap issues.
@@ -49,13 +49,14 @@ impl SyntaxHighlighter {
 
         for line in LinesWithEndings::from(code) {
             let mut spans = Vec::new();
-            
+
             match highlighter.highlight_line(line, &self.syntax_set) {
                 Ok(ranges) => {
                     for (style, text) in ranges {
-                        let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                        let fg =
+                            Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
                         let mut ratatui_style = Style::default().fg(fg);
-                        
+
                         if style.font_style.contains(FontStyle::BOLD) {
                             ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
                         }
@@ -65,7 +66,7 @@ impl SyntaxHighlighter {
                         if style.font_style.contains(FontStyle::UNDERLINE) {
                             ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
                         }
-                        
+
                         // Remove trailing newline from text
                         let text = text.trim_end_matches('\n').trim_end_matches('\r');
                         if !text.is_empty() {
@@ -82,7 +83,7 @@ impl SyntaxHighlighter {
                     ));
                 }
             }
-            
+
             result.push(spans);
         }
 
@@ -160,7 +161,7 @@ impl MarkdownRenderer {
         }
 
         let style = self.current_style();
-        
+
         // Handle newlines within text - preserve blank lines
         let parts: Vec<&str> = text.split('\n').collect();
         for (i, part) in parts.iter().enumerate() {
@@ -173,9 +174,10 @@ impl MarkdownRenderer {
                     self.lines.push(Line::from(""));
                 }
             }
-            
+
             if !part.is_empty() {
-                self.current_spans.push(Span::styled((*part).to_string(), style));
+                self.current_spans
+                    .push(Span::styled((*part).to_string(), style));
             }
         }
     }
@@ -189,7 +191,7 @@ impl MarkdownRenderer {
 
         let gutter_style = Style::default().fg(Color::DarkGray);
         let line_num_style = Style::default().fg(Color::Rgb(100, 100, 100));
-        
+
         // Calculate dimensions
         let code_lines: Vec<&str> = content.lines().collect();
         let num_lines = code_lines.len();
@@ -199,14 +201,14 @@ impl MarkdownRenderer {
         } else {
             0
         };
-        
+
         // Calculate prefix width: "│ " (2) + line_num + " │ " (3) or just "│ " (2)
         let prefix_width = if show_line_nums {
             2 + line_num_width + 3
         } else {
             4 // "│ " + "  " for single line padding
         };
-        
+
         // Max code width before truncation
         let max_code_width = self.available_width.saturating_sub(prefix_width + 2); // -2 for safety margin
 
@@ -214,14 +216,25 @@ impl MarkdownRenderer {
         if !lang.is_empty() {
             self.lines.push(Line::from(vec![
                 Span::styled("┌─ ", gutter_style),
-                Span::styled(lang.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    lang.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ", gutter_style),
-                Span::styled("─".repeat(self.available_width.saturating_sub(lang.len() + 5).min(40)), gutter_style),
+                Span::styled(
+                    "─".repeat(self.available_width.saturating_sub(lang.len() + 5).min(40)),
+                    gutter_style,
+                ),
             ]));
         } else {
             self.lines.push(Line::from(vec![
                 Span::styled("┌", gutter_style),
-                Span::styled("─".repeat(self.available_width.saturating_sub(2).min(44)), gutter_style),
+                Span::styled(
+                    "─".repeat(self.available_width.saturating_sub(2).min(44)),
+                    gutter_style,
+                ),
             ]));
         }
 
@@ -231,10 +244,10 @@ impl MarkdownRenderer {
         // Render each line
         for (i, highlighted_spans) in highlighted_lines.iter().enumerate() {
             let mut spans = Vec::new();
-            
+
             // Left border
             spans.push(Span::styled("│ ", gutter_style));
-            
+
             // Line number (right-aligned)
             if show_line_nums {
                 spans.push(Span::styled(
@@ -243,10 +256,10 @@ impl MarkdownRenderer {
                 ));
                 spans.push(Span::styled(" │ ", gutter_style));
             }
-            
+
             // Calculate current code line width
             let code_width: usize = highlighted_spans.iter().map(|s| s.content.len()).sum();
-            
+
             if code_width <= max_code_width {
                 // Fits - add all spans
                 spans.extend(highlighted_spans.iter().cloned());
@@ -269,16 +282,19 @@ impl MarkdownRenderer {
                 }
                 spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
             }
-            
+
             self.lines.push(Line::from(spans));
         }
 
         // Bottom border
         self.lines.push(Line::from(vec![
             Span::styled("└", gutter_style),
-            Span::styled("─".repeat(self.available_width.saturating_sub(2).min(44)), gutter_style),
+            Span::styled(
+                "─".repeat(self.available_width.saturating_sub(2).min(44)),
+                gutter_style,
+            ),
         ]));
-        
+
         // Add blank line after code block
         self.lines.push(Line::from(""));
     }
@@ -296,7 +312,9 @@ impl MarkdownRenderer {
                     // Inline code
                     self.current_spans.push(Span::styled(
                         format!("`{code}`"),
-                        Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 40)),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(40, 40, 40)),
                     ));
                 }
                 Event::SoftBreak => {
@@ -336,14 +354,14 @@ impl MarkdownRenderer {
                 if !self.lines.is_empty() || !self.current_spans.is_empty() {
                     self.add_blank_line();
                 }
-                
+
                 let prefix = match level {
                     pulldown_cmark::HeadingLevel::H1 => "# ",
                     pulldown_cmark::HeadingLevel::H2 => "## ",
                     pulldown_cmark::HeadingLevel::H3 => "### ",
                     _ => "#### ",
                 };
-                
+
                 self.current_spans.push(Span::styled(
                     prefix.to_string(),
                     Style::default().fg(Color::Magenta),
@@ -371,7 +389,11 @@ impl MarkdownRenderer {
                 self.code_block_lang = match kind {
                     CodeBlockKind::Fenced(lang) => {
                         let lang = lang.to_string();
-                        if lang.is_empty() { None } else { Some(lang) }
+                        if lang.is_empty() {
+                            None
+                        } else {
+                            Some(lang)
+                        }
                     }
                     CodeBlockKind::Indented => None,
                 };
@@ -393,10 +415,8 @@ impl MarkdownRenderer {
                 } else {
                     format!("{indent}• ")
                 };
-                self.current_spans.push(Span::styled(
-                    bullet,
-                    Style::default().fg(Color::Cyan),
-                ));
+                self.current_spans
+                    .push(Span::styled(bullet, Style::default().fg(Color::Cyan)));
             }
             Tag::Emphasis => {
                 self.push_style(Modifier::ITALIC);

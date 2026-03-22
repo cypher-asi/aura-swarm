@@ -31,7 +31,7 @@ The `aura-swarm-store` crate provides embedded RocksDB storage for the control p
 | `agents_by_status` | Status index | `status \| user_id \| agent_id` |
 | `sessions` | Session records | `session_id` |
 | `sessions_by_agent` | Agent sessions index | `agent_id \| session_id` |
-| `users` | User cache (from Zero-ID) | `user_id` |
+| `users` | User cache (from zOS) | `user_id` |
 
 ### 2.2 Key Layouts
 
@@ -114,7 +114,7 @@ pub struct SessionRecord {
     pub closed_at: Option<i64>,
 }
 
-/// Cached user info from Zero-ID
+/// Cached user info from zOS
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub user_id: UserId,

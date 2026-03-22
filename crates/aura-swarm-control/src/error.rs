@@ -3,7 +3,7 @@
 //! This module defines all errors that can occur during agent lifecycle
 //! and session management operations.
 
-use aura_swarm_core::{AgentId, SessionId, UserId};
+use aura_swarm_core::{AgentId, UserId, SessionId};
 use aura_swarm_store::AgentState;
 use thiserror::Error;
 
@@ -60,6 +60,19 @@ pub enum ControlError {
     #[error("agent {0} already has an active session")]
     SessionAlreadyActive(AgentId),
 
+    /// Insufficient credits for the operation.
+    #[error("insufficient credits: balance={balance} cents, required={required} cents")]
+    InsufficientCredits {
+        /// Current balance in cents.
+        balance: i64,
+        /// Required amount in cents.
+        required: i64,
+    },
+
+    /// Billing account not found for user.
+    #[error("billing account not found for user")]
+    BillingAccountNotFound,
+
     /// Storage layer error.
     #[error("storage error: {0}")]
     Store(#[from] aura_swarm_store::StoreError),
@@ -79,7 +92,8 @@ impl ControlError {
     pub const fn http_status_code(&self) -> u16 {
         match self {
             Self::AgentNotFound(_) | Self::SessionNotFound(_) => 404,
-            Self::QuotaExceeded { .. } => 429,
+            Self::QuotaExceeded { .. } => 429, // Too Many Requests
+            Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => 402, // Payment Required
             Self::NotOwner { .. } => 403,
             Self::InvalidState { .. }
             | Self::AgentNotRunnable(_)
@@ -96,15 +110,29 @@ impl ControlError {
     }
 }
 
+impl From<crate::billing::BillingCheckError> for ControlError {
+    fn from(err: crate::billing::BillingCheckError) -> Self {
+        match err {
+            crate::billing::BillingCheckError::InsufficientCredits { balance, required } => {
+                Self::InsufficientCredits { balance, required }
+            }
+            crate::billing::BillingCheckError::AccountNotFound { .. } => {
+                Self::BillingAccountNotFound
+            }
+            crate::billing::BillingCheckError::ServiceError(msg) => Self::Internal(msg),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn error_status_codes() {
-        let agent_id = AgentId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
         let session_id = aura_swarm_core::SessionId::generate();
-        let user_id = UserId::from_bytes([2u8; 32]);
 
         assert_eq!(
             ControlError::AgentNotFound(agent_id).http_status_code(),
@@ -115,11 +143,19 @@ mod tests {
             404
         );
         assert_eq!(
-            ControlError::QuotaExceeded { user_id, limit: 10 }.http_status_code(),
+            ControlError::QuotaExceeded {
+                user_id,
+                limit: 10
+            }
+            .http_status_code(),
             429
         );
         assert_eq!(
-            ControlError::NotOwner { user_id, agent_id }.http_status_code(),
+            ControlError::NotOwner {
+                user_id,
+                agent_id
+            }
+            .http_status_code(),
             403
         );
         assert_eq!(

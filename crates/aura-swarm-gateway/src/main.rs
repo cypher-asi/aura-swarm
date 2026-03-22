@@ -7,7 +7,7 @@
 //! # Dev Mode
 //!
 //! Build with `--features dev-mode` and set `DEV_MODE=true` to use a mock
-//! JWT validator that doesn't require network access to Zero-ID.
+//! JWT validator that doesn't require network access to zOS.
 //! Use tokens in format: `test-token:<identity-uuid>:<namespace-uuid>`
 //!
 //! # Scheduler Integration
@@ -19,12 +19,15 @@ use std::sync::Arc;
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[cfg(not(feature = "dev-mode"))]
-use aura_swarm_auth::{AuthConfig, JwksValidator};
 #[cfg(feature = "dev-mode")]
 use aura_swarm_auth::MockJwtValidator;
-use aura_swarm_control::{ControlConfig, ControlPlaneService, HttpSchedulerClient};
-use aura_swarm_gateway::{create_router, GatewayConfig, GatewayState};
+#[cfg(not(feature = "dev-mode"))]
+use aura_swarm_auth::{AuthConfig, JwksValidator};
+use aura_swarm_control::{
+    BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlaneService,
+    HttpSchedulerClient,
+};
+use aura_swarm_gateway::{create_router, BillingService, GatewayConfig, GatewayState};
 use aura_swarm_store::RocksStore;
 
 #[tokio::main]
@@ -44,15 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data/aura-swarm".into());
     let auth_base_url =
-        std::env::var("AUTH_BASE_URL").unwrap_or_else(|_| "https://zid.zero.tech".into());
-    let auth_audience = std::env::var("AUTH_AUDIENCE").unwrap_or_else(|_| "zero-vault".into());
+        std::env::var("AUTH_BASE_URL").unwrap_or_else(|_| "https://zosapi.zero.tech".into());
+    let auth_audience = std::env::var("AUTH_AUDIENCE").ok();
     let scheduler_url = std::env::var("SCHEDULER_URL").ok();
 
     tracing::info!(
         listen_addr = %listen_addr,
         data_dir = %data_dir,
         auth_base_url = %auth_base_url,
-        auth_audience = %auth_audience,
+        auth_audience = ?auth_audience,
         scheduler_url = ?scheduler_url,
         "Gateway configuration loaded"
     );
@@ -71,14 +74,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("No SCHEDULER_URL set - running without scheduler integration");
     }
 
-    let control = Arc::new(ControlPlaneService::with_optional_scheduler(
+    // Initialize billing checker for credit checks (control plane side)
+    let gateway_config = GatewayConfig::from_env();
+    let control_billing = if gateway_config.billing.is_configured() {
+        let billing_config = ControlBillingConfig::from_env();
+        tracing::info!(url = %billing_config.url, "Control plane billing checker enabled");
+        Some(Arc::new(BillingChecker::new(billing_config)))
+    } else {
+        tracing::info!("Control plane billing checker not configured (no Z_BILLING_API_KEY)");
+        None
+    };
+
+    let control = Arc::new(ControlPlaneService::with_integrations(
         store,
         ControlConfig::default(),
         scheduler_client,
+        control_billing,
     ));
 
     tracing::info!(
         has_scheduler = control.has_scheduler(),
+        has_billing = control.has_billing(),
         "Control plane initialized"
     );
 
@@ -86,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dev-mode")]
     let jwt_validator = {
         tracing::warn!("DEV MODE ENABLED - using mock JWT validator");
-        tracing::warn!("Use tokens in format: test-token:<identity-uuid>:<namespace-uuid>");
+        tracing::warn!("Use tokens in format: test-token:<user-uuid>");
         Arc::new(MockJwtValidator::default())
     };
 
@@ -101,9 +117,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!("JWT validator initialized");
 
-    // Build gateway state and configuration
-    let gateway_config = GatewayConfig::default();
-    let state = GatewayState::new(control, jwt_validator, gateway_config);
+    // Initialize gateway billing service for LLM usage tracking
+    let billing = if gateway_config.billing.is_configured() {
+        tracing::info!(url = %gateway_config.billing.url, "Gateway billing service enabled");
+        Some(Arc::new(BillingService::new(gateway_config.billing.clone())))
+    } else {
+        tracing::info!("Gateway billing service not configured (no Z_BILLING_API_KEY)");
+        None
+    };
+
+    // Build gateway state with optional billing
+    let state = match billing {
+        Some(b) => GatewayState::with_billing(control, jwt_validator, gateway_config, b),
+        None => GatewayState::new(control, jwt_validator, gateway_config),
+    };
 
     // Create the full router with all API endpoints
     let app = create_router(state);

@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use aura_swarm_core::AgentId;
-use aura_swarm_scheduler::{K8sScheduler, Scheduler, SchedulerConfig, SchedulerError};
+use aura_swarm_scheduler::{
+    ComputeUsageReporter, K8sScheduler, Scheduler, SchedulerBillingConfig, SchedulerConfig,
+    SchedulerError,
+};
 use aura_swarm_store::AgentSpec;
 use axum::{
     extract::{Path, State},
@@ -95,7 +98,7 @@ impl ErrorResponse {
 
 /// Schedule (create) an agent pod.
 ///
-/// POST /v1/agents/:agent_id/schedule
+/// `POST /v1/agents/:agent_id/schedule`
 async fn schedule_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -143,7 +146,7 @@ async fn schedule_handler(
 
 /// Terminate an agent pod.
 ///
-/// DELETE /v1/agents/:agent_id
+/// `DELETE /v1/agents/:agent_id`
 async fn terminate_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -182,7 +185,7 @@ async fn terminate_handler(
 
 /// Get the status of an agent's pod.
 ///
-/// GET /v1/agents/:agent_id/status
+/// `GET /v1/agents/:agent_id/status`
 async fn status_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -225,7 +228,7 @@ struct EndpointResponse {
 
 /// Get the network endpoint for an agent's pod.
 ///
-/// GET /v1/agents/:agent_id/endpoint
+/// `GET /v1/agents/:agent_id/endpoint`
 async fn endpoint_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -295,8 +298,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Loaded scheduler configuration"
     );
 
-    // Initialize K8s scheduler
-    let scheduler = Arc::new(K8sScheduler::new(config).await?);
+    // Initialize billing reporter if configured
+    let billing_config = SchedulerBillingConfig::from_env();
+    let billing_reporter = if billing_config.is_configured() {
+        let reporter = Arc::new(ComputeUsageReporter::new(billing_config.clone()));
+        tracing::info!(
+            url = %billing_config.url,
+            report_interval_seconds = billing_config.report_interval_seconds,
+            "Billing reporter enabled"
+        );
+        Some(reporter)
+    } else {
+        tracing::info!("Billing reporter not configured (no Z_BILLING_API_KEY)");
+        None
+    };
+
+    // Initialize K8s scheduler with optional billing
+    let scheduler = match &billing_reporter {
+        Some(reporter) => Arc::new(K8sScheduler::with_billing(config, Arc::clone(reporter)).await?),
+        None => Arc::new(K8sScheduler::new(config).await?),
+    };
     tracing::info!("Connected to Kubernetes cluster");
 
     // Start the reconciler as a background task
@@ -305,6 +326,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciler_scheduler.run_reconciler().await;
     });
     tracing::info!("Started pod reconciliation loop");
+
+    // Start billing reporter background task if configured
+    if let Some(reporter) = billing_reporter {
+        let report_interval = reporter.report_interval();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(report_interval);
+            loop {
+                interval.tick().await;
+                let count = reporter.report_all_usage().await;
+                if count > 0 {
+                    tracing::debug!(count, "Reported compute usage for pods");
+                }
+            }
+        });
+        tracing::info!("Started billing reporter background task");
+    }
 
     // Create app state
     let state = AppState { scheduler };

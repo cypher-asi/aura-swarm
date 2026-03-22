@@ -53,7 +53,7 @@ graph TB
     end
     
     subgraph external [External Services]
-        ZeroID[Zero-ID Server]
+        zOS[zOS API Server]
         EFS[EFS Storage]
     end
     
@@ -94,7 +94,7 @@ graph TB
 | **aura-swarm-control** | Agent CRUD, lifecycle management, session routing |
 | **aura-swarm-store** | RocksDB persistence for agents, users, sessions |
 | **aura-swarm-scheduler** | Kubernetes reconciler, pod lifecycle, health monitoring |
-| **aura-swarm-auth** | Zero-ID integration, token validation |
+| **aura-swarm-auth** | zOS integration, token validation |
 | **Aura Runtime** | AI agent execution inside microVM |
 
 ---
@@ -286,7 +286,7 @@ The control plane uses an embedded RocksDB database:
 ```
 aura-swarm-store/
 └── db/
-    ├── users/           # User records (from Zero-ID sync)
+    ├── users/           # User records (from zOS sync)
     ├── agents/          # Agent metadata and status
     ├── agents_by_user/  # Index: user_id -> agent_ids
     └── sessions/        # Active session records
@@ -366,7 +366,7 @@ graph TB
 
 ## 8. External Dependencies
 
-### 8.1 Zero-ID
+### 8.1 zOS
 
 Authentication provider for user identity:
 

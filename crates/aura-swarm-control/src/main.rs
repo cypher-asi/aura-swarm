@@ -7,13 +7,7 @@ use std::sync::Arc;
 
 use aura_swarm_control::ControlPlaneService;
 use aura_swarm_store::RocksStore;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

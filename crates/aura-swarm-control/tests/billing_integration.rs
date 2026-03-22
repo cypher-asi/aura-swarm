@@ -10,7 +10,7 @@ use aura_swarm_control::{
     BillingCheckError, BillingChecker, BillingConfig, ControlConfig, ControlPlane,
     ControlPlaneService, CreateAgentRequest, NoopSchedulerClient,
 };
-use aura_swarm_core::IdentityId;
+use aura_swarm_core::UserId;
 use aura_swarm_store::{RocksStore, Store};
 use serde_json::json;
 use tempfile::TempDir;
@@ -25,8 +25,8 @@ const SERVICE_API_KEY: &str = "test-service-key";
 // Test Setup
 // ============================================================================
 
-fn create_identity_id() -> IdentityId {
-    IdentityId::from_uuid(uuid::Uuid::new_v4())
+fn create_user_id() -> UserId {
+    UserId::from_uuid(uuid::Uuid::new_v4())
 }
 
 /// Generate a unique UUID for each test (z-billing uses UUID format).
@@ -34,12 +34,11 @@ fn unique_user_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Generate a unique aura-swarm IdentityId and return both the IdentityId and its string representation.
-/// The string is what gets passed to billing, so tests should create accounts with it.
-fn unique_identity_id_and_str() -> (IdentityId, String) {
-    let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
-    let identity_str = identity_id.to_string();
-    (identity_id, identity_str)
+/// Generate a unique aura-swarm UserId and return both the UserId and its string representation.
+fn unique_user_id_and_str() -> (UserId, String) {
+    let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+    let user_str = user_id.to_string();
+    (user_id, user_str)
 }
 
 fn setup_store() -> (Arc<RocksStore>, TempDir) {
@@ -104,10 +103,10 @@ async fn control_plane_without_billing_allows_agent_creation() {
     let config = ControlConfig::default();
     let service = ControlPlaneService::new(store, config);
 
-    let identity_id = create_identity_id();
+    let user_id = create_user_id();
     let request = CreateAgentRequest::new("test-agent");
 
-    let result = service.create_agent(&identity_id, request).await;
+    let result = service.create_agent(&user_id, request).await;
     assert!(result.is_ok());
 }
 
@@ -218,11 +217,9 @@ mod live {
     #[tokio::test]
     #[ignore = "requires z-billing service at localhost:8081"]
     async fn control_plane_with_billing_checks_balance() {
-        // Generate IdentityId and its string representation (what control plane sends to billing)
-        let (identity_id, identity_str) = unique_identity_id_and_str();
+        let (user_id, user_str) = unique_user_id_and_str();
 
-        // Create funded account using the identity ID string (what billing will receive)
-        create_funded_account(&identity_str, 10000)
+        create_funded_account(&user_str, 10000)
             .await
             .expect("Failed to create test account");
 
@@ -245,18 +242,16 @@ mod live {
         let request = CreateAgentRequest::new("test-agent");
 
         // Should succeed with sufficient balance
-        let result = service.create_agent(&identity_id, request).await;
+        let result = service.create_agent(&user_id, request).await;
         assert!(result.is_ok(), "create_agent failed: {result:?}");
     }
 
     #[tokio::test]
     #[ignore = "requires z-billing service at localhost:8081"]
     async fn control_plane_rejects_agent_with_insufficient_balance() {
-        // Generate IdentityId and its string representation
-        let (identity_id, identity_str) = unique_identity_id_and_str();
+        let (user_id, user_str) = unique_user_id_and_str();
 
-        // Create account with low balance
-        create_funded_account(&identity_str, 50)
+        create_funded_account(&user_str, 50)
             .await
             .expect("Failed to create test account");
 
@@ -279,7 +274,7 @@ mod live {
         let request = CreateAgentRequest::new("test-agent");
 
         // Should fail due to insufficient balance
-        let result = service.create_agent(&identity_id, request).await;
+        let result = service.create_agent(&user_id, request).await;
         assert!(result.is_err(), "Expected error for insufficient balance");
 
         // Verify error type
@@ -290,11 +285,9 @@ mod live {
     #[tokio::test]
     #[ignore = "requires z-billing service at localhost:8081"]
     async fn control_plane_session_checks_balance() {
-        // Generate IdentityId and its string representation
-        let (identity_id, identity_str) = unique_identity_id_and_str();
+        let (user_id, user_str) = unique_user_id_and_str();
 
-        // Create funded account
-        create_funded_account(&identity_str, 10000)
+        create_funded_account(&user_str, 10000)
             .await
             .expect("Failed to create test account");
 
@@ -316,7 +309,7 @@ mod live {
 
         // Create agent first
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&identity_id, request).await.unwrap();
+        let agent = service.create_agent(&user_id, request).await.unwrap();
 
         // Simulate agent is running
         Store::update_agent_status(&*store, &agent.agent_id, AgentState::Running).unwrap();
@@ -324,7 +317,7 @@ mod live {
         // Create session (should check balance)
         let result = service
             .create_session(
-                &identity_id,
+                &user_id,
                 &agent.agent_id,
                 aura_swarm_store::SessionConfig::default(),
             )

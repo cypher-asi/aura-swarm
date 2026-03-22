@@ -29,7 +29,7 @@ use crate::state::GatewayState;
 #[derive(Clone)]
 struct WsBillingContext {
     billing: Option<Arc<BillingService>>,
-    identity_id: String,
+    user_id: String,
     agent_id: String,
     session_id: String,
 }
@@ -91,7 +91,7 @@ where
     // Validate session ownership
     let session = state
         .control
-        .get_session(&user.identity_id, &session_id)
+        .get_session(&user.user_id, &session_id)
         .await?;
 
     // Check session is active
@@ -102,7 +102,7 @@ where
     // Get agent details to check engine_type
     let agent = state
         .control
-        .get_agent(&user.identity_id, &session.agent_id)
+        .get_agent(&user.user_id, &session.agent_id)
         .await?;
     let engine_type = agent.spec.engine_type;
     let session_config = session.config.clone();
@@ -117,11 +117,11 @@ where
     let timeout = state.config.websocket_timeout();
     let agent_id_str = session.agent_id.to_string();
     let session_id_str = session_id.to_string();
-    let identity_id_str = user.identity_id.to_string();
+    let user_id_str = user.user_id.to_string();
 
     let billing_ctx = WsBillingContext {
         billing: state.billing.clone(),
-        identity_id: identity_id_str.clone(),
+        user_id: user_id_str.clone(),
         agent_id: agent_id_str.clone(),
         session_id: session_id_str.clone(),
     };
@@ -129,7 +129,7 @@ where
     tracing::info!(
         session_id = %session_id_str,
         agent_id = %agent_id_str,
-        identity_id = %identity_id_str,
+        user_id = %user_id_str,
         "WebSocket connection initiated"
     );
 
@@ -383,7 +383,7 @@ fn maybe_report_usage(text: &str, billing_ctx: &WsBillingContext) {
 
     let event = LlmUsageEvent {
         event_id: make_event_id(&billing_ctx.session_id, &usage.message_id),
-        user_id: billing_ctx.identity_id.clone(),
+        user_id: billing_ctx.user_id.clone(),
         agent_id: Some(billing_ctx.agent_id.clone()),
         provider: usage.provider,
         model: usage.model,

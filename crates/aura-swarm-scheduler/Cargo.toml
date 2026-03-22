@@ -18,6 +18,7 @@ test-utils = []
 # Internal crates
 aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-store = { path = "../aura-swarm-store" }
+z-billing-client = { git = "ssh://git@github.com/cypher-asi/z-billing.git" }
 
 # HTTP server (for binary)
 axum = "0.7"
@@ -48,6 +49,7 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

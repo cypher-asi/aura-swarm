@@ -110,7 +110,7 @@ where
 
     let session = state
         .control
-        .create_session(&user.identity_id, &agent_id, config)
+        .create_session(&user.user_id, &agent_id, config)
         .await?;
 
     let response = CreateSessionResponse {
@@ -141,7 +141,7 @@ where
 
     let session = state
         .control
-        .get_session(&user.identity_id, &session_id)
+        .get_session(&user.user_id, &session_id)
         .await?;
 
     Ok(Json(SessionResponse::from(session)))
@@ -165,7 +165,7 @@ where
 
     let sessions = state
         .control
-        .list_sessions(&user.identity_id, &agent_id)
+        .list_sessions(&user.user_id, &agent_id)
         .await?;
 
     let response = ListSessionsResponse {
@@ -193,7 +193,7 @@ where
 
     state
         .control
-        .close_session(&user.identity_id, &session_id)
+        .close_session(&user.user_id, &session_id)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

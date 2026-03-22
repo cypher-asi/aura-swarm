@@ -34,7 +34,7 @@
 //! use std::sync::Arc;
 //! use aura_swarm_control::{ControlPlane, ControlPlaneService, CreateAgentRequest};
 //! use aura_swarm_store::RocksStore;
-//! use aura_swarm_core::IdentityId;
+//! use aura_swarm_core::UserId;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Initialize store
@@ -44,9 +44,9 @@
 //! let control = ControlPlaneService::with_defaults(store);
 //!
 //! // Create an agent
-//! let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
+//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //! let request = CreateAgentRequest::new("my-agent");
-//! let agent = control.create_agent(&identity_id, request).await?;
+//! let agent = control.create_agent(&user_id, request).await?;
 //!
 //! println!("Created agent: {}", agent.agent_id);
 //! # Ok(())
@@ -89,5 +89,5 @@ pub use service::{ControlPlane, ControlPlaneService};
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 
 // Re-export commonly used types from dependencies for convenience
-pub use aura_swarm_core::{AgentId, IdentityId, SessionId};
+pub use aura_swarm_core::{AgentId, UserId, SessionId};
 pub use aura_swarm_store::{Agent, AgentSpec, AgentState, Session, SessionConfig, SessionStatus};

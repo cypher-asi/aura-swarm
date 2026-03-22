@@ -2,7 +2,7 @@
 //!
 //! These types represent the persisted state of agents, sessions, and users.
 
-use aura_swarm_core::{AgentId, IdentityId, SessionId};
+use aura_swarm_core::{AgentId, UserId, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Agent {
     /// Unique identifier for the agent.
     pub agent_id: AgentId,
-    /// Owner identity ID (from Zero-ID).
-    pub identity_id: IdentityId,
+    /// Owner user ID (from zOS).
+    pub user_id: UserId,
     /// Human-readable name.
     pub name: String,
     /// Current lifecycle state.
@@ -159,8 +159,8 @@ pub struct Session {
     pub session_id: SessionId,
     /// Agent this session is connected to.
     pub agent_id: AgentId,
-    /// Identity who owns this session (from Zero-ID).
-    pub identity_id: IdentityId,
+    /// User who owns this session.
+    pub user_id: UserId,
     /// Current session status.
     pub status: SessionStatus,
     /// Per-session configuration for the harness runtime.
@@ -239,11 +239,11 @@ impl SessionStatus {
     }
 }
 
-/// A user record stored in the database (synced from Zero-ID).
+/// A user record stored in the database (synced from zOS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
-    /// Unique identifier for the user (identity ID from Zero-ID).
-    pub identity_id: IdentityId,
+    /// Unique identifier for the user (from zOS).
+    pub user_id: UserId,
     /// User's email address.
     pub email: String,
     /// Whether the email has been verified.

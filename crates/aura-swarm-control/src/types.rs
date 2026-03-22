@@ -151,6 +151,7 @@ mod tests {
             memory_mb: 1024,
             runtime_version: "v1.0.0".to_string(),
             isolation: None,
+            engine_type: Default::default(),
         };
         let req = CreateAgentRequest::with_spec("my-agent", spec.clone());
         assert_eq!(req.name, "my-agent");

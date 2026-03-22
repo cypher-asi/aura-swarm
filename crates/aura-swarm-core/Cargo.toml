@@ -10,8 +10,9 @@ description = "Core types and utilities for aura-swarm"
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-blake3 = { workspace = true }
 hex = { workspace = true }
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = { workspace = true }

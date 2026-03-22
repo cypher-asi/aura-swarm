@@ -1,6 +1,6 @@
 //! JWKS (JSON Web Key Set) fetching and caching.
 //!
-//! This module handles fetching public keys from the Zero-ID JWKS endpoint
+//! This module handles fetching public keys from the zOS JWKS endpoint
 //! and caching them for efficient validation.
 
 use std::collections::HashMap;
@@ -24,18 +24,22 @@ pub struct JwksResponse {
 /// A single JWK (JSON Web Key).
 #[derive(Debug, Deserialize)]
 pub struct JwkKey {
-    /// Key type (e.g., "OKP" for Ed25519).
+    /// Key type (e.g., "OKP" for Ed25519, "RSA" for RSA).
     pub kty: String,
     /// Curve (e.g., "Ed25519").
     pub crv: Option<String>,
-    /// Public key (base64url encoded).
+    /// Public key (base64url encoded, for OKP keys).
     pub x: Option<String>,
+    /// RSA modulus (base64url encoded).
+    pub n: Option<String>,
+    /// RSA exponent (base64url encoded).
+    pub e: Option<String>,
     /// Key ID.
     pub kid: Option<String>,
     /// Key use (e.g., "sig").
     #[serde(rename = "use")]
     pub key_use: Option<String>,
-    /// Algorithm (e.g., `EdDSA`).
+    /// Algorithm (e.g., `EdDSA`, `RS256`).
     pub alg: Option<String>,
 }
 
@@ -49,7 +53,6 @@ impl Default for CachedKeys {
     fn default() -> Self {
         Self {
             keys: HashMap::new(),
-            // Set to far past so first access triggers fetch
             fetched_at: Instant::now()
                 .checked_sub(Duration::from_secs(3600))
                 .unwrap_or_else(Instant::now),
@@ -90,7 +93,6 @@ impl JwksProvider {
     ///
     /// Returns an error if the key is not found or JWKS fetch fails.
     pub async fn get_key(&self, kid: &str) -> Result<DecodingKey> {
-        // Check cache first
         {
             let cache = self.cache.read();
             let refresh_interval = Duration::from_secs(self.config.jwks_refresh_seconds);
@@ -101,10 +103,8 @@ impl JwksProvider {
             }
         }
 
-        // Refresh keys
         self.refresh_keys().await?;
 
-        // Try again
         let cache = self.cache.read();
         cache
             .keys
@@ -151,7 +151,6 @@ impl JwksProvider {
     fn parse_key(key: &JwkKey) -> Result<Option<DecodingKey>> {
         match key.kty.as_str() {
             "OKP" => {
-                // Ed25519 key
                 let crv = key.crv.as_deref().unwrap_or("");
                 if crv != "Ed25519" {
                     tracing::warn!(crv = crv, "Unsupported OKP curve");
@@ -170,9 +169,20 @@ impl JwksProvider {
                 Ok(Some(DecodingKey::from_ed_der(&public_key)))
             }
             "RSA" => {
-                // RSA key (for future compatibility)
-                tracing::debug!("Skipping RSA key (not supported in v0.1.0)");
-                Ok(None)
+                let n = key
+                    .n
+                    .as_ref()
+                    .ok_or_else(|| AuthError::InvalidToken("missing n parameter".to_string()))?;
+                let e = key
+                    .e
+                    .as_ref()
+                    .ok_or_else(|| AuthError::InvalidToken("missing e parameter".to_string()))?;
+
+                Ok(Some(
+                    DecodingKey::from_rsa_components(n, e).map_err(|e| {
+                        AuthError::InvalidToken(format!("invalid RSA key: {e}"))
+                    })?,
+                ))
             }
             other => {
                 tracing::warn!(kty = other, "Unknown key type");
@@ -199,11 +209,12 @@ mod tests {
 
     #[test]
     fn parse_ed25519_key() {
-        // Example Ed25519 public key (32 bytes, base64url encoded)
         let key = JwkKey {
             kty: "OKP".to_string(),
             crv: Some("Ed25519".to_string()),
             x: Some("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo".to_string()),
+            n: None,
+            e: None,
             kid: Some("test-key".to_string()),
             key_use: Some("sig".to_string()),
             alg: Some("EdDSA".to_string()),
@@ -214,11 +225,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_rsa_key() {
+        let key = JwkKey {
+            kty: "RSA".to_string(),
+            crv: None,
+            x: None,
+            n: Some("0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw".to_string()),
+            e: Some("AQAB".to_string()),
+            kid: Some("rsa-test-key".to_string()),
+            key_use: Some("sig".to_string()),
+            alg: Some("RS256".to_string()),
+        };
+
+        let result = JwksProvider::parse_key(&key).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
     fn skip_unsupported_curve() {
         let key = JwkKey {
             kty: "OKP".to_string(),
-            crv: Some("X25519".to_string()), // Not Ed25519
+            crv: Some("X25519".to_string()),
             x: Some("somekey".to_string()),
+            n: None,
+            e: None,
             kid: Some("test-key".to_string()),
             key_use: None,
             alg: None,

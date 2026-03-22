@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::billing::BillingConfig;
+
 /// Configuration for the gateway service.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
@@ -32,6 +34,10 @@ pub struct GatewayConfig {
     /// Request timeout in seconds.
     #[serde(default = "GatewayConfig::default_request_timeout")]
     pub request_timeout_seconds: u64,
+
+    /// Billing configuration for z-billing integration.
+    #[serde(default)]
+    pub billing: BillingConfig,
 }
 
 impl GatewayConfig {
@@ -77,7 +83,43 @@ impl Default for GatewayConfig {
             websocket_timeout_seconds: Self::default_ws_timeout(),
             max_body_bytes: Self::default_max_body(),
             request_timeout_seconds: Self::default_request_timeout(),
+            billing: BillingConfig::default(),
         }
+    }
+}
+
+impl GatewayConfig {
+    /// Load configuration from environment variables.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        if let Ok(val) = std::env::var("LISTEN_ADDR") {
+            config.listen_addr = val;
+        }
+        if let Ok(val) = std::env::var("CORS_ORIGINS") {
+            config.cors_origins = val.split(',').map(str::trim).map(String::from).collect();
+        }
+        if let Ok(val) = std::env::var("RATE_LIMIT_RPS") {
+            if let Ok(n) = val.parse() {
+                config.rate_limit_rps = n;
+            }
+        }
+        if let Ok(val) = std::env::var("WS_TIMEOUT_SECONDS") {
+            if let Ok(n) = val.parse() {
+                config.websocket_timeout_seconds = n;
+            }
+        }
+        if let Ok(val) = std::env::var("MAX_BODY_BYTES") {
+            if let Ok(n) = val.parse() {
+                config.max_body_bytes = n;
+            }
+        }
+
+        // Load billing config from environment
+        config.billing = BillingConfig::from_env();
+
+        config
     }
 }
 

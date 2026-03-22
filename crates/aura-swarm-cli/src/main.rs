@@ -35,7 +35,7 @@ use ws::WsEvent;
 #[command(name = "aswarm")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// JWT token for authentication.
+    /// zOS access token for authentication.
     #[arg(long, env = "AURA_SWARM_TOKEN")]
     token: String,
 
@@ -88,7 +88,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -333,7 +337,7 @@ async fn handle_command_mode(
             if app.selected_agent().is_some() && !app.is_connected() {
                 // Show immediate feedback about agent state
                 show_agent_wake_status(app);
-                
+
                 match app.ensure_ready_and_connect().await {
                     Ok(mut rx) => {
                         let ws_tx = ws_tx.clone();
@@ -393,7 +397,7 @@ async fn handle_input_mode(
                 } else if app.selected_agent().is_some() {
                     // Show immediate feedback about agent state
                     show_agent_wake_status(app);
-                    
+
                     // Auto-connect (wake/start if needed) and send
                     match app.ensure_ready_and_connect().await {
                         Ok(mut rx) => {
@@ -421,7 +425,7 @@ async fn handle_input_mode(
             } else if !app.is_connected() && app.selected_agent().is_some() {
                 // Show immediate feedback about agent state
                 show_agent_wake_status(app);
-                
+
                 // Connect on Enter if not connected and input is empty (auto-wake/start)
                 match app.ensure_ready_and_connect().await {
                     Ok(mut rx) => {
@@ -558,10 +562,16 @@ fn show_agent_wake_status(app: &mut App) {
                 app.set_status(format!("Starting agent '{}'...", agent.name));
             }
             AgentState::Provisioning => {
-                app.set_status(format!("Agent '{}' is provisioning, please wait...", agent.name));
+                app.set_status(format!(
+                    "Agent '{}' is provisioning, please wait...",
+                    agent.name
+                ));
             }
             AgentState::Stopping => {
-                app.set_status(format!("Agent '{}' is stopping, please wait...", agent.name));
+                app.set_status(format!(
+                    "Agent '{}' is stopping, please wait...",
+                    agent.name
+                ));
             }
             AgentState::Error => {
                 app.set_status(format!("Restarting failed agent '{}'...", agent.name));

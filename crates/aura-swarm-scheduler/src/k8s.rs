@@ -3,6 +3,7 @@
 //! This module provides the `K8sScheduler` which manages agent pods in a
 //! Kubernetes cluster using the Kata Containers runtime for microVM isolation.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use aura_swarm_core::AgentId;
 use aura_swarm_store::{AgentSpec, AgentState};
 
+use crate::billing::ComputeUsageReporter;
 use crate::cache::EndpointCache;
 use crate::pod::{build_pod, pod_name_for_agent};
 use crate::types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
@@ -82,6 +84,8 @@ pub struct K8sScheduler {
     config: SchedulerConfig,
     endpoint_cache: EndpointCache,
     http_client: reqwest::Client,
+    /// Optional billing reporter for compute usage tracking.
+    billing_reporter: Option<Arc<ComputeUsageReporter>>,
 }
 
 impl K8sScheduler {
@@ -106,7 +110,22 @@ impl K8sScheduler {
             config,
             endpoint_cache: EndpointCache::new(),
             http_client,
+            billing_reporter: None,
         })
+    }
+
+    /// Create a new scheduler with billing integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Kubernetes client cannot be created.
+    pub async fn with_billing(
+        config: SchedulerConfig,
+        billing_reporter: Arc<ComputeUsageReporter>,
+    ) -> Result<Self> {
+        let mut scheduler = Self::new(config).await?;
+        scheduler.billing_reporter = Some(billing_reporter);
+        Ok(scheduler)
     }
 
     /// Create a new scheduler with a pre-configured client.
@@ -128,7 +147,19 @@ impl K8sScheduler {
             config,
             endpoint_cache: EndpointCache::new(),
             http_client,
+            billing_reporter: None,
         }
+    }
+
+    /// Set the billing reporter after construction.
+    pub fn set_billing_reporter(&mut self, reporter: Arc<ComputeUsageReporter>) {
+        self.billing_reporter = Some(reporter);
+    }
+
+    /// Get the billing reporter if configured.
+    #[must_use]
+    pub fn billing_reporter(&self) -> Option<&Arc<ComputeUsageReporter>> {
+        self.billing_reporter.as_ref()
     }
 
     /// Get a reference to the scheduler config.
@@ -263,9 +294,7 @@ impl K8sScheduler {
         if error_reasons.contains(&reason) {
             warn!(
                 pod_name,
-                reason,
-                message,
-                "Pod creation error detected from event"
+                reason, message, "Pod creation error detected from event"
             );
 
             // Pod name is truncated (agent-{first 16 hex chars}), so we need to
@@ -342,7 +371,10 @@ impl K8sScheduler {
         };
 
         // Notify the gateway of the status change
-        if let Err(e) = self.notify_status_change(&agent_id, new_state, message.clone()).await {
+        if let Err(e) = self
+            .notify_status_change(&agent_id, new_state, message.clone())
+            .await
+        {
             error!(
                 agent_id = %agent_id,
                 error = %e,
@@ -363,7 +395,7 @@ impl K8sScheduler {
     /// Extract container error information from pod status.
     ///
     /// Checks container statuses for waiting states that indicate failures
-    /// (e.g., ImagePullBackOff, CrashLoopBackOff, CreateContainerError).
+    /// (e.g., `ImagePullBackOff`, `CrashLoopBackOff`, `CreateContainerError`).
     fn extract_container_error(pod: &Pod) -> (bool, Option<String>) {
         let Some(status) = pod.status.as_ref() else {
             return (false, None);
@@ -390,7 +422,13 @@ impl K8sScheduler {
             .as_ref()
             .into_iter()
             .flatten()
-            .chain(status.init_container_statuses.as_ref().into_iter().flatten());
+            .chain(
+                status
+                    .init_container_statuses
+                    .as_ref()
+                    .into_iter()
+                    .flatten(),
+            );
 
         for cs in container_statuses {
             if let Some(state) = &cs.state {
@@ -408,10 +446,7 @@ impl K8sScheduler {
 
                     if let Some(reason) = &waiting.reason {
                         if error_reasons.contains(&reason.as_str()) {
-                            let msg = waiting
-                                .message
-                                .clone()
-                                .unwrap_or_else(|| reason.clone());
+                            let msg = waiting.message.clone().unwrap_or_else(|| reason.clone());
                             return (true, Some(msg));
                         }
                     }
@@ -445,7 +480,11 @@ impl K8sScheduler {
         // Notify gateway that pod is deleted (transition to Stopped)
         // Note: The gateway will check if agent is hibernating and skip if so
         if let Err(e) = self
-            .notify_status_change(&agent_id, AgentState::Stopped, Some("Pod deleted".to_string()))
+            .notify_status_change(
+                &agent_id,
+                AgentState::Stopped,
+                Some("Pod deleted".to_string()),
+            )
             .await
         {
             error!(
@@ -596,6 +635,20 @@ impl Scheduler for K8sScheduler {
         let pod = build_pod(agent_id, user_id_hex, spec, &self.config);
         pods.create(&PostParams::default(), &pod).await?;
 
+        // Register with billing reporter if configured
+        if let Some(reporter) = &self.billing_reporter {
+            reporter.register_pod(
+                &agent_id.to_hex(),
+                user_id_hex,
+                spec.cpu_millicores,
+                spec.memory_mb,
+            );
+            debug!(
+                agent_id = %agent_id,
+                "Registered pod with billing reporter"
+            );
+        }
+
         info!(
             agent_id = %agent_id,
             pod_name,
@@ -610,6 +663,15 @@ impl Scheduler for K8sScheduler {
     async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
         let pods = self.pods_api();
         let pod_name = pod_name_for_agent(agent_id);
+
+        // Unregister from billing reporter if configured
+        if let Some(reporter) = &self.billing_reporter {
+            reporter.unregister_pod(&agent_id.to_hex());
+            debug!(
+                agent_id = %agent_id,
+                "Unregistered pod from billing reporter"
+            );
+        }
 
         // Remove from endpoint cache
         self.endpoint_cache.remove(agent_id);
@@ -877,7 +939,7 @@ mod tests {
     use aura_swarm_core::UserId;
 
     fn test_agent_id() -> AgentId {
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         AgentId::generate(&user_id, "test-agent")
     }
 
@@ -889,12 +951,12 @@ mod tests {
     async fn mock_scheduler_schedule_and_terminate() {
         let scheduler = MockScheduler::new();
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
 
         // Schedule
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
             .await
             .unwrap();
         assert_eq!(scheduler.pod_count(), 1);
@@ -916,16 +978,16 @@ mod tests {
     async fn mock_scheduler_idempotent_schedule() {
         let scheduler = MockScheduler::new();
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
 
         // Schedule twice
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
             .await
             .unwrap();
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
             .await
             .unwrap();
 
@@ -937,11 +999,11 @@ mod tests {
     async fn mock_scheduler_endpoint() {
         let scheduler = MockScheduler::new();
         let agent_id = test_agent_id();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
 
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
             .await
             .unwrap();
 
@@ -963,18 +1025,18 @@ mod tests {
     #[tokio::test]
     async fn mock_scheduler_list_pods() {
         let scheduler = MockScheduler::new();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
 
         let agent1 = AgentId::generate(&user_id, "agent-1");
         let agent2 = AgentId::generate(&user_id, "agent-2");
 
         scheduler
-            .schedule_agent(&agent1, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent1, &user_id.to_string(), &spec)
             .await
             .unwrap();
         scheduler
-            .schedule_agent(&agent2, &user_id.to_hex(), &spec)
+            .schedule_agent(&agent2, &user_id.to_string(), &spec)
             .await
             .unwrap();
 

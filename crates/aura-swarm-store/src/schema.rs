@@ -19,7 +19,7 @@ pub mod cf {
     /// Index: sessions by agent, keyed by `agent_id || session_id`.
     pub const SESSIONS_BY_AGENT: &str = "sessions_by_agent";
 
-    /// User records (synced from Zero-ID), keyed by `user_id`.
+    /// User records (synced from zOS), keyed by `user_id`.
     pub const USERS: &str = "users";
 }
 

@@ -169,7 +169,8 @@ mod tests {
 
     #[test]
     fn validate_transition_ok() {
-        let agent_id = AgentId::from_bytes([1u8; 32]);
+        let user_id = aura_swarm_core::UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
         let result = validate_transition(&agent_id, AgentState::Running, AgentState::Idle);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AgentState::Idle);
@@ -177,7 +178,8 @@ mod tests {
 
     #[test]
     fn validate_transition_err() {
-        let agent_id = AgentId::from_bytes([1u8; 32]);
+        let user_id = aura_swarm_core::UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
         let result = validate_transition(&agent_id, AgentState::Stopped, AgentState::Running);
         assert!(result.is_err());
 

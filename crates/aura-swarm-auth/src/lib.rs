@@ -1,9 +1,9 @@
 //! JWT authentication for aura-swarm.
 //!
-//! This crate provides JWT validation with Zero-ID integration, including:
+//! This crate provides JWT validation with zOS integration, including:
 //!
 //! - JWKS (JSON Web Key Set) fetching and caching
-//! - Ed25519 (`EdDSA`) signature validation
+//! - EdDSA and RS256 signature validation
 //! - Claims extraction and validation
 //!
 //! # Architecture
@@ -25,7 +25,7 @@
 //!                          └────────┬─────────┘
 //!                                   │ HTTPS
 //!                          ┌────────▼─────────┐
-//!                          │   Zero-ID        │
+//!                          │   zOS            │
 //!                          │   JWKS endpoint  │
 //!                          └──────────────────┘
 //! ```
@@ -37,8 +37,8 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = AuthConfig {
-//!     base_url: "https://auth.zero.tech".to_string(),
-//!     audience: "swarm-platform".to_string(),
+//!     base_url: "https://zosapi.zero.tech".to_string(),
+//!     audience: None,
 //!     jwks_refresh_seconds: 300,
 //! };
 //!
@@ -48,8 +48,7 @@
 //! let token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...";
 //! let claims = validator.validate(token).await?;
 //!
-//! println!("Identity ID: {}", claims.identity_id);
-//! println!("Namespace ID: {}", claims.namespace_id);
+//! println!("User ID: {}", claims.user_id);
 //! # Ok(())
 //! # }
 //! ```
@@ -64,20 +63,20 @@ pub mod error;
 pub mod jwks;
 pub mod jwt;
 
-pub use client::{LoginRequest, LoginResponse, RefreshRequest, ZidClient};
+pub use client::{ZosClient, ZosLoginRequest, ZosLoginResponse};
 pub use error::{AuthError, Result};
 pub use jwt::{JwksValidator, JwtValidator, ValidatedClaims};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use jwt::MockJwtValidator;
 
-/// Configuration for authentication with Zero-ID.
+/// Configuration for authentication with zOS.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    /// Base URL for ZID (e.g., `https://auth.zero.tech`).
+    /// Base URL for the zOS API (e.g., `https://zosapi.zero.tech`).
     pub base_url: String,
-    /// Expected JWT audience (`aud` claim).
-    pub audience: String,
+    /// Expected JWT audience (`aud` claim). If `None`, audience is not validated.
+    pub audience: Option<String>,
     /// How often to refresh the JWKS cache, in seconds.
     pub jwks_refresh_seconds: u64,
 }
@@ -89,16 +88,16 @@ impl AuthConfig {
         format!("{}/.well-known/jwks.json", self.base_url)
     }
 
-    /// Get the email login endpoint URL.
+    /// Get the login endpoint URL.
     #[must_use]
     pub fn login_url(&self) -> String {
-        format!("{}/v1/auth/login/email", self.base_url)
+        format!("{}/api/v2/accounts/login", self.base_url)
     }
 
-    /// Get the token refresh endpoint URL.
+    /// Get the user info endpoint URL.
     #[must_use]
-    pub fn refresh_url(&self) -> String {
-        format!("{}/v1/auth/refresh", self.base_url)
+    pub fn user_info_url(&self) -> String {
+        format!("{}/api/users/current", self.base_url)
     }
 
     /// Get the expected JWT issuer.
@@ -111,8 +110,8 @@ impl AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://auth.zero.tech".to_string(),
-            audience: "swarm-platform".to_string(),
+            base_url: "https://zosapi.zero.tech".to_string(),
+            audience: None,
             jwks_refresh_seconds: 300,
         }
     }
@@ -125,8 +124,8 @@ mod tests {
     #[test]
     fn default_config() {
         let config = AuthConfig::default();
-        assert_eq!(config.base_url, "https://auth.zero.tech");
-        assert_eq!(config.audience, "swarm-platform");
+        assert_eq!(config.base_url, "https://zosapi.zero.tech");
+        assert!(config.audience.is_none());
         assert_eq!(config.jwks_refresh_seconds, 300);
     }
 
@@ -135,26 +134,41 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(
             config.jwks_url(),
-            "https://auth.zero.tech/.well-known/jwks.json"
+            "https://zosapi.zero.tech/.well-known/jwks.json"
         );
         assert_eq!(
             config.login_url(),
-            "https://auth.zero.tech/v1/auth/login/email"
+            "https://zosapi.zero.tech/api/v2/accounts/login"
         );
         assert_eq!(
-            config.refresh_url(),
-            "https://auth.zero.tech/v1/auth/refresh"
+            config.user_info_url(),
+            "https://zosapi.zero.tech/api/users/current"
         );
-        assert_eq!(config.issuer(), "https://auth.zero.tech");
+        assert_eq!(config.issuer(), "https://zosapi.zero.tech");
     }
 
     #[test]
     fn auth_error_status_codes() {
         assert_eq!(AuthError::TokenExpired.http_status_code(), 401);
         assert_eq!(AuthError::InvalidSignature.http_status_code(), 401);
-        assert_eq!(AuthError::MfaRequired.http_status_code(), 403);
-        assert_eq!(AuthError::IdentityFrozen.http_status_code(), 403);
-        assert_eq!(AuthError::RateLimited.http_status_code(), 429);
+        assert_eq!(
+            AuthError::ZosApi {
+                status: 403,
+                code: "FORBIDDEN".into(),
+                message: "forbidden".into()
+            }
+            .http_status_code(),
+            403
+        );
+        assert_eq!(
+            AuthError::ZosApi {
+                status: 429,
+                code: "RATE_LIMITED".into(),
+                message: "too many requests".into()
+            }
+            .http_status_code(),
+            429
+        );
         assert_eq!(
             AuthError::JwksFetchFailed("test".into()).http_status_code(),
             500
@@ -165,8 +179,12 @@ mod tests {
     fn auth_error_retriable() {
         assert!(AuthError::TokenExpired.is_retriable());
         assert!(AuthError::JwksFetchFailed("test".into()).is_retriable());
-        assert!(AuthError::RateLimited.is_retriable());
         assert!(!AuthError::InvalidSignature.is_retriable());
-        assert!(!AuthError::MfaRequired.is_retriable());
+        assert!(!AuthError::ZosApi {
+            status: 429,
+            code: "RATE_LIMITED".into(),
+            message: "too many requests".into()
+        }
+        .is_retriable());
     }
 }

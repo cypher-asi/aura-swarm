@@ -9,22 +9,22 @@
 //!
 //! - `agents`: Primary agent records, keyed by `agent_id`
 //! - `agents_by_status`: Index for listing agents by status
-//! - `agents_by_user`: Index for listing agents by identity
+//! - `agents_by_user`: Index for listing agents by user
 //! - `sessions`: Primary session records, keyed by `session_id`
 //! - `sessions_by_agent`: Index for listing sessions by agent
-//! - `users`: User records synced from Zero-ID
+//! - `users`: User records synced from zOS
 //!
 //! # Example
 //!
 //! ```no_run
 //! use aura_swarm_store::{RocksStore, Store};
-//! use aura_swarm_core::IdentityId;
+//! use aura_swarm_core::UserId;
 //!
 //! let store = RocksStore::open("/tmp/aura-swarm-db").unwrap();
 //!
-//! // List agents for an identity
-//! let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
-//! let agents = store.list_agents_by_identity(&identity_id).unwrap();
+//! // List agents for a user
+//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+//! let agents = store.list_agents_by_user(&user_id).unwrap();
 //! ```
 
 #![forbid(unsafe_code)]
@@ -45,7 +45,7 @@ pub use types::{
     SessionConfig, SessionStatus, User, WorkspaceConfig,
 };
 
-use aura_swarm_core::{AgentId, IdentityId, SessionId};
+use aura_swarm_core::{AgentId, UserId, SessionId};
 
 /// The storage trait defining all database operations.
 ///
@@ -58,7 +58,7 @@ pub trait Store: Send + Sync {
 
     /// Insert or update an agent record.
     ///
-    /// This also maintains the identity and status indexes.
+    /// This also maintains the user and status indexes.
     ///
     /// # Errors
     ///
@@ -81,21 +81,21 @@ pub trait Store: Send + Sync {
     /// Returns `StoreError::NotFound` if the agent doesn't exist.
     fn delete_agent(&self, agent_id: &AgentId) -> Result<()>;
 
-    /// List all agents belonging to an identity.
+    /// List all agents belonging to a user.
     ///
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    fn list_agents_by_identity(&self, identity_id: &IdentityId) -> Result<Vec<Agent>>;
+    fn list_agents_by_user(&self, user_id: &UserId) -> Result<Vec<Agent>>;
 
-    /// Count agents belonging to an identity.
+    /// Count agents belonging to a user.
     ///
     /// This is more efficient than listing when you only need the count.
     ///
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    fn count_agents_by_identity(&self, identity_id: &IdentityId) -> Result<u32>;
+    fn count_agents_by_user(&self, user_id: &UserId) -> Result<u32>;
 
     /// List all agents with a given status.
     ///
@@ -188,10 +188,10 @@ pub trait Store: Send + Sync {
     /// Returns an error if the database operation fails.
     fn put_user(&self, user: &User) -> Result<()>;
 
-    /// Get a user by identity ID.
+    /// Get a user by user ID.
     ///
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    fn get_user(&self, identity_id: &IdentityId) -> Result<Option<User>>;
+    fn get_user(&self, user_id: &UserId) -> Result<Option<User>>;
 }

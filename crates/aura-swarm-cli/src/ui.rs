@@ -88,8 +88,19 @@ fn render_header_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Build the line with left and right content
     let line = Line::from(vec![
-        Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(area.width.saturating_sub(title.len() as u16 + right_text.len() as u16) as usize)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(
+            " ".repeat(
+                area.width
+                    .saturating_sub(title.len() as u16 + right_text.len() as u16)
+                    as usize,
+            ),
+        ),
         Span::raw(&display_url),
         Span::raw(" ["),
         Span::styled(status_text, status_style),
@@ -112,11 +123,18 @@ fn render_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|agent| {
             // Show FAILED prominently when in Error state with error_message
-            let (status_text, status_style) = if agent.status == AgentState::Error && agent.error_message.is_some() {
-                ("FAILED".to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            } else {
-                (agent.status.as_str().to_string(), Style::default().fg(agent.status.color()))
-            };
+            let (status_text, status_style) =
+                if agent.status == AgentState::Error && agent.error_message.is_some() {
+                    (
+                        "FAILED".to_string(),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (
+                        agent.status.as_str().to_string(),
+                        Style::default().fg(agent.status.color()),
+                    )
+                };
 
             let name_span = Span::raw(&agent.name);
             let status_span = Span::styled(format!(" {}", status_text), status_style);
@@ -206,7 +224,7 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
     let chat_area_full = inner_layout[0];
     let separator_area = inner_layout[1];
     let input_area = inner_layout[2];
-    
+
     // Apply horizontal padding to chat area
     let chat_area = Rect::new(
         chat_area_full.x + CHAT_PADDING,
@@ -254,18 +272,26 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
             if msg.is_user() {
                 // User messages: simple display with user style
                 lines.push(Line::from(vec![
-                    Span::styled("[You] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "[You] ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(&msg.content, Style::default().fg(Color::White)),
                 ]));
                 lines.push(Line::from(""));
             } else {
                 // Agent messages: render markdown
-                lines.push(Line::from(vec![
-                    Span::styled("[Agent]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    "[Agent]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )]));
                 // Add blank lines after [Agent] label for visual separation
                 lines.push(Line::from(" "));
-                
+
                 // Render markdown content with syntax highlighting
                 let md_lines = render_markdown(&msg.content, content_width);
                 lines.extend(md_lines);
@@ -276,13 +302,16 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
         // Add animated thinking indicator if streaming
         if app.is_streaming {
             // Only add a new thinking line if the last message isn't already showing streaming content
-            let needs_thinking_line = app.messages.is_empty() || 
-                app.messages.last().map_or(true, |m| m.is_user());
-            
+            let needs_thinking_line =
+                app.messages.is_empty() || app.messages.last().map_or(true, |m| m.is_user());
+
             if needs_thinking_line {
-                lines.push(Line::from(vec![
-                    Span::styled("[Agent]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    "[Agent]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )]));
                 lines.push(Line::from(vec![
                     Span::styled(app.spinner_char(), Style::default().fg(Color::Yellow)),
                     Span::styled(" thinking...", Style::default().fg(Color::DarkGray)),
@@ -328,11 +357,7 @@ fn render_chat_column(frame: &mut Frame, app: &App, area: Rect) {
                 .position(scrollbar_position)
                 .viewport_content_length(visible_lines);
 
-            frame.render_stateful_widget(
-                scrollbar,
-                chat_area_full,
-                &mut scrollbar_state,
-            );
+            frame.render_stateful_widget(scrollbar, chat_area_full, &mut scrollbar_state);
         }
     }
 
@@ -353,16 +378,23 @@ fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_a
     // Draw input prompt and text
     // Show different prompt based on mode
     let prompt = if app.command_mode {
-        ": "  // Command mode indicator
+        ": " // Command mode indicator
     } else {
-        "> "  // Normal input mode
+        "> " // Normal input mode
     };
 
     // Show input text only when not in a modal dialog
     let input_text = if in_modal { "" } else { app.input.as_str() };
-    
+
     let input_line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(if app.command_mode { Color::Yellow } else { Color::Cyan })),
+        Span::styled(
+            prompt,
+            Style::default().fg(if app.command_mode {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            }),
+        ),
         Span::styled(input_text, Style::default().fg(Color::White)),
     ]);
     let input_widget = Paragraph::new(input_line);
@@ -382,9 +414,15 @@ fn render_input_line(frame: &mut Frame, app: &App, separator_area: Rect, input_a
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Mode indicator
     let mode_indicator = if app.command_mode {
-        Span::styled(" COMMAND ", Style::default().fg(Color::Black).bg(Color::Yellow))
+        Span::styled(
+            " COMMAND ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
     } else {
-        Span::styled(" INPUT ", Style::default().fg(Color::Black).bg(Color::Green))
+        Span::styled(
+            " INPUT ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )
     };
 
     let status = if let Some(ref error) = app.error_message {
@@ -476,8 +514,7 @@ fn render_create_agent_dialog(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    let label = Paragraph::new("Enter agent name:")
-        .style(Style::default().fg(Color::White));
+    let label = Paragraph::new("Enter agent name:").style(Style::default().fg(Color::White));
     frame.render_widget(label, layout[0]);
 
     let input_block = Block::default()
@@ -515,9 +552,7 @@ fn render_confirm_delete_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    let agent_name = app
-        .selected_agent()
-        .map_or("?", |a| a.name.as_str());
+    let agent_name = app.selected_agent().map_or("?", |a| a.name.as_str());
 
     let text = Text::from(vec![
         Line::from(format!("Delete agent '{agent_name}'?")),
@@ -542,29 +577,42 @@ fn render_confirm_delete_dialog(frame: &mut Frame, app: &App, area: Rect) {
 /// Render error details when an agent has failed.
 fn render_error_details(frame: &mut Frame, error: &str, area: Rect) {
     let lines = vec![
-        Line::from(vec![
-            Span::styled("Agent failed to provision", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Agent failed to provision",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Error: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Error: ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
         Line::from(Span::styled(error, Style::default().fg(Color::White))),
         Line::from(""),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[d]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[d]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" Delete agent"),
         ]),
         Line::from(vec![
-            Span::styled("[s]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[s]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" Retry (start agent)"),
         ]),
     ];
 
-    let text = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: true });
+    let text = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
 
     frame.render_widget(text, area);
 }
@@ -583,7 +631,7 @@ fn calculate_wrapped_line_count(text: &Text, available_width: usize) -> usize {
     for line in &text.lines {
         // Calculate the display width of this line using ratatui's width method
         let line_width: usize = line.width();
-        
+
         if line_width == 0 {
             // Empty lines still take one visual line
             total += 1;

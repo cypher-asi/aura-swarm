@@ -7,7 +7,7 @@ The `aura-swarm-gateway` crate provides the public-facing HTTP and WebSocket API
 ### 1.1 Responsibilities
 
 - Expose RESTful HTTP endpoints for agent management
-- Validate JWT tokens from Zero-ID
+- Validate JWT tokens from zOS
 - Proxy WebSocket connections to agent pods
 - Rate limiting and request validation
 - CORS and security headers
@@ -17,7 +17,7 @@ The `aura-swarm-gateway` crate provides the public-facing HTTP and WebSocket API
 ```mermaid
 graph LR
     Users[Users] --> Gateway[aura-swarm-gateway]
-    Gateway --> ZeroID[Zero-ID]
+    Gateway --> zOS[zOS API]
     Gateway --> Control[aura-swarm-control]
     Gateway -.->|WebSocket| Agents[Agent Pods]
     
@@ -680,7 +680,7 @@ pub struct GatewayConfig {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct JwtConfig {
-    /// Zero-ID server URL for JWKS
+    /// zOS server URL for JWKS
     pub jwks_url: String,
     
     /// Expected issuer claim

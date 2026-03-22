@@ -1,80 +1,52 @@
-//! ZID authentication client for login and token refresh.
+//! zOS authentication client for login and user info.
 //!
-//! This module provides a client for interacting with the Zero-ID authentication API,
-//! including email/password login and token refresh functionality.
+//! This module provides a client for interacting with the zOS authentication API,
+//! including email/password login and user info retrieval.
 
-use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use aura_swarm_core::SessionId;
 
 use crate::error::{AuthError, Result};
 use crate::AuthConfig;
 
 /// Request payload for email/password login.
 #[derive(Debug, Clone, Serialize)]
-pub struct LoginRequest {
+pub struct ZosLoginRequest {
     /// User's email address.
     pub email: String,
     /// User's password.
     pub password: String,
-    /// Optional MFA code if MFA is enabled.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mfa_code: Option<String>,
 }
 
-/// Response from a successful login or token refresh.
+/// Response from a successful login.
 #[derive(Debug, Clone)]
-pub struct LoginResponse {
+pub struct ZosLoginResponse {
     /// JWT access token.
     pub access_token: String,
-    /// Refresh token for obtaining new access tokens.
-    pub refresh_token: String,
-    /// Session ID for this login session.
-    pub session_id: SessionId,
-    /// When the access token expires.
-    pub expires_at: DateTime<Utc>,
 }
 
-/// Request payload for refreshing an access token.
-#[derive(Debug, Clone, Serialize)]
-pub struct RefreshRequest {
-    /// The refresh token obtained from login.
-    pub refresh_token: String,
-    /// The current session ID.
-    pub session_id: SessionId,
-    /// Machine identifier for device tracking.
-    pub machine_id: String,
-}
-
-/// Raw response from ZID login/refresh endpoints.
+/// Raw response from the zOS login endpoint.
 #[derive(Debug, Deserialize)]
-struct RawLoginResponse {
+struct RawZosLoginResponse {
     access_token: String,
-    refresh_token: String,
-    session_id: String,
-    expires_in: u64,
 }
 
-/// Error response from ZID API.
+/// Error response from the zOS API.
 #[derive(Debug, Deserialize)]
-struct ZidErrorResponse {
-    code: String,
-    #[allow(dead_code)]
+struct ZosErrorResponse {
+    code: Option<String>,
     message: Option<String>,
 }
 
-/// Client for interacting with Zero-ID authentication API.
-pub struct ZidClient {
+/// Client for interacting with the zOS authentication API.
+pub struct ZosClient {
     config: AuthConfig,
     client: reqwest::Client,
 }
 
-impl ZidClient {
-    /// Create a new ZID client with the given configuration.
+impl ZosClient {
+    /// Create a new zOS client with the given configuration.
     ///
     /// # Panics
     ///
@@ -93,93 +65,90 @@ impl ZidClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The credentials are invalid (`LoginFailed`)
-    /// - MFA is required but not provided (`MfaRequired`)
-    /// - The identity is frozen (`IdentityFrozen`)
-    /// - Rate limit is exceeded (`RateLimited`)
-    /// - Network or server error occurs
-    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse> {
+    /// Returns `AuthError::ZosApi` if the zOS API returns an error, or
+    /// `AuthError::Internal` on network/parsing failures.
+    pub async fn login(&self, email: &str, password: &str) -> Result<ZosLoginResponse> {
         let url = self.config.login_url();
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| AuthError::Internal(format!("request failed: {e}")))?;
-
-        self.handle_response(response).await
-    }
-
-    /// Refresh an access token using a refresh token.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The refresh token is invalid or expired (`LoginFailed`)
-    /// - The session has been invalidated (`LoginFailed`)
-    /// - Rate limit is exceeded (`RateLimited`)
-    /// - Network or server error occurs
-    pub async fn refresh(&self, req: RefreshRequest) -> Result<LoginResponse> {
-        let url = self.config.refresh_url();
+        let body = ZosLoginRequest {
+            email: email.to_owned(),
+            password: password.to_owned(),
+        };
 
         let response = self
             .client
             .post(&url)
-            .json(&req)
+            .json(&body)
             .send()
             .await
             .map_err(|e| AuthError::Internal(format!("request failed: {e}")))?;
 
-        self.handle_response(response).await
-    }
-
-    /// Handle the HTTP response and convert to `LoginResponse`.
-    async fn handle_response(&self, response: reqwest::Response) -> Result<LoginResponse> {
         let status = response.status();
 
         if status.is_success() {
-            let raw: RawLoginResponse = response
+            let raw: RawZosLoginResponse = response
                 .json()
                 .await
                 .map_err(|e| AuthError::Internal(format!("invalid response: {e}")))?;
 
-            let session_id = SessionId::from_str(&raw.session_id)
-                .map_err(|_| AuthError::Internal("invalid session_id in response".to_string()))?;
-
-            let expires_in_secs = i64::try_from(raw.expires_in).unwrap_or(i64::MAX);
-            let expires_at = Utc::now() + chrono::Duration::seconds(expires_in_secs);
-
-            return Ok(LoginResponse {
+            return Ok(ZosLoginResponse {
                 access_token: raw.access_token,
-                refresh_token: raw.refresh_token,
-                session_id,
-                expires_at,
             });
         }
 
-        // Try to parse error response
-        let error_response: Option<ZidErrorResponse> = response.json().await.ok();
+        Err(self.map_error_response(status.as_u16(), response).await)
+    }
 
-        match error_response {
-            Some(err) => match err.code.as_str() {
-                "UNAUTHORIZED" => Err(AuthError::LoginFailed("invalid credentials".to_string())),
-                "MFA_REQUIRED" => Err(AuthError::MfaRequired),
-                "IDENTITY_FROZEN" => Err(AuthError::IdentityFrozen),
-                "RATE_LIMITED" => Err(AuthError::RateLimited),
-                code => Err(AuthError::LoginFailed(format!("error code: {code}"))),
-            },
-            None => {
-                // Fallback based on status code
-                match status.as_u16() {
-                    401 => Err(AuthError::LoginFailed("unauthorized".to_string())),
-                    403 => Err(AuthError::IdentityFrozen),
-                    429 => Err(AuthError::RateLimited),
-                    _ => Err(AuthError::Internal(format!("HTTP {status}"))),
-                }
-            }
+    /// Fetch information about the currently authenticated user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError::ZosApi` if the zOS API returns an error, or
+    /// `AuthError::Internal` on network/parsing failures.
+    pub async fn fetch_user_info(&self, token: &str) -> Result<serde_json::Value> {
+        let url = self.config.user_info_url();
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| AuthError::Internal(format!("request failed: {e}")))?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            let value: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| AuthError::Internal(format!("invalid response: {e}")))?;
+
+            return Ok(value);
+        }
+
+        Err(self.map_error_response(status.as_u16(), response).await)
+    }
+
+    async fn map_error_response(
+        &self,
+        status: u16,
+        response: reqwest::Response,
+    ) -> AuthError {
+        let error_body: Option<ZosErrorResponse> = response.json().await.ok();
+        let code = error_body
+            .as_ref()
+            .and_then(|e| e.code.clone())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let message = error_body
+            .as_ref()
+            .and_then(|e| e.message.clone())
+            .unwrap_or_else(|| format!("HTTP {status}"));
+
+        AuthError::ZosApi {
+            status,
+            code,
+            message,
         }
     }
 }
@@ -190,50 +159,19 @@ mod tests {
 
     #[test]
     fn login_request_serializes() {
-        let req = LoginRequest {
+        let req = ZosLoginRequest {
             email: "user@example.com".to_string(),
             password: "secret".to_string(),
-            mfa_code: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("email"));
         assert!(json.contains("password"));
-        // mfa_code should be omitted when None
-        assert!(!json.contains("mfa_code"));
-    }
-
-    #[test]
-    fn login_request_with_mfa_serializes() {
-        let req = LoginRequest {
-            email: "user@example.com".to_string(),
-            password: "secret".to_string(),
-            mfa_code: Some("123456".to_string()),
-        };
-
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("mfa_code"));
-        assert!(json.contains("123456"));
-    }
-
-    #[test]
-    fn refresh_request_serializes() {
-        let req = RefreshRequest {
-            refresh_token: "token123".to_string(),
-            session_id: SessionId::generate(),
-            machine_id: "machine-abc".to_string(),
-        };
-
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("refresh_token"));
-        assert!(json.contains("session_id"));
-        assert!(json.contains("machine_id"));
     }
 
     #[test]
     fn client_creation() {
         let config = AuthConfig::default();
-        let _client = ZidClient::new(config);
-        // Just verify it doesn't panic
+        let _client = ZosClient::new(config);
     }
 }

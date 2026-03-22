@@ -18,6 +18,7 @@ test-utils = ["aura-swarm-auth/test-utils"]
 aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-store = { path = "../aura-swarm-store" }
 aura-swarm-auth = { path = "../aura-swarm-auth" }
+z-billing-client = { git = "ssh://git@github.com/cypher-asi/z-billing.git" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
@@ -35,6 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

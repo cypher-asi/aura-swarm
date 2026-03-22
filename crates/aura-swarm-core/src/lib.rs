@@ -10,10 +10,8 @@
 //! ```
 //! use aura_swarm_core::{UserId, AgentId, SessionId};
 //!
-//! // Parse a user ID from hex
-//! let user_id = UserId::from_hex(
-//!     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-//! ).unwrap();
+//! // Create a user ID from a UUID
+//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //!
 //! // Generate an agent ID
 //! let agent_id = AgentId::generate(&user_id, "my-agent");
@@ -31,4 +29,4 @@ pub mod error;
 pub mod ids;
 
 pub use error::{CoreError, Result};
-pub use ids::{AgentId, IdError, IdentityId, NamespaceId, SessionId, UserId};
+pub use ids::{AgentId, IdError, SessionId, UserId};

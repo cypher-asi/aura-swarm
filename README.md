@@ -7,7 +7,7 @@
 
 <p align="center">
   <strong>Isolated AI Agents in MicroVMs</strong><br/>
-  A multi-user platform for running sandboxed AI agents on Firecracker microVMs, orchestrated by Kubernetes and secured by Zero-ID authentication.
+  A multi-user platform for running sandboxed AI agents on Firecracker microVMs, orchestrated by Kubernetes and secured by zOS authentication.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@ Aura Swarm is a platform for running isolated AI agents as long-lived services. 
 
 Users interact with their agents through WebSocket sessions proxied by the gateway, or through the `aswarm` terminal UI. The platform handles the full agent lifecycle — provisioning, running, hibernation, wake-on-demand, and teardown — while keeping per-user state isolated under `/state/<user_id>/<agent_id>/`.
 
-Authentication is handled via Zero-ID (JWT/JWKS), and usage is tracked through z-billing for credit-based access to LLM-powered agents.
+Authentication is handled via zOS (JWT/JWKS), and usage is tracked through z-billing for credit-based access to LLM-powered agents.
 
 ---
 
@@ -77,7 +77,7 @@ See the [full specification](docs/spec/v0.1.0/README.md) for production deployme
 |---|---|
 | `aura-swarm-core` | Shared types, strongly-typed IDs (`AgentId`, `UserId`, `SessionId`), and error definitions |
 | `aura-swarm-store` | RocksDB storage: agents, sessions, users, and secondary indexes with CBOR serialization |
-| `aura-swarm-auth` | Zero-ID integration: JWKS fetching, JWT validation, and token refresh |
+| `aura-swarm-auth` | zOS integration: JWKS fetching, JWT validation |
 | `aura-swarm-control` | Agent lifecycle management, session CRUD, and scheduler orchestration |
 | `aura-swarm-scheduler` | Kubernetes reconciler: pod creation, health monitoring, status callbacks, and resource limits |
 | `aura-swarm-gateway` | Public Axum HTTP/WebSocket API, auth middleware, billing middleware, and WebSocket proxy |

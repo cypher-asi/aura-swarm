@@ -241,7 +241,7 @@ impl ControlPlane {
 
 | Secret | Storage | Rotation |
 |--------|---------|----------|
-| JWT signing keys | Zero-ID (external) | Managed by Zero-ID |
+| JWT signing keys | zOS (external) | Managed by zOS |
 | LLM API keys | Kubernetes Secrets | Manual / External Secrets |
 | Database encryption | Not used (RocksDB unencrypted) | N/A |
 | TLS certificates | Cert-manager / ACM | Automatic |

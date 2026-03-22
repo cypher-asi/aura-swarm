@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aura_swarm_core::{AgentId, SessionId, UserId};
+use aura_swarm_core::{AgentId, UserId, SessionId};
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded,
     Options, WriteBatch,
@@ -217,8 +217,8 @@ impl Store for RocksStore {
             }
 
             // Extract agent_id from key (skip the status byte)
-            let mut agent_bytes = [0u8; 32];
-            agent_bytes.copy_from_slice(&key[1..33]);
+            let mut agent_bytes = [0u8; 16];
+            agent_bytes.copy_from_slice(&key[1..17]);
             let agent_id = AgentId::from_bytes(agent_bytes);
 
             if let Some(agent) = self.get_agent(&agent_id)? {
@@ -389,7 +389,7 @@ impl Store for RocksStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AgentSpec;
+    use crate::types::{AgentSpec, SessionConfig};
     use tempfile::TempDir;
 
     fn create_test_store() -> (RocksStore, TempDir) {
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn agent_crud() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let agent = create_test_agent(&user_id, "test-agent");
 
         // Create
@@ -441,8 +441,8 @@ mod tests {
     #[test]
     fn list_agents_by_user() {
         let (store, _dir) = create_test_store();
-        let user1 = UserId::from_bytes([1u8; 32]);
-        let user2 = UserId::from_bytes([2u8; 32]);
+        let user1 = UserId::from_uuid(uuid::Uuid::new_v4());
+        let user2 = UserId::from_uuid(uuid::Uuid::new_v4());
 
         // Create agents for user1
         let agent1a = create_test_agent(&user1, "agent-1a");
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn list_agents_by_status() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 
         let mut agent1 = create_test_agent(&user_id, "agent-1");
         agent1.status = AgentState::Running;
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn status_index_updated_on_change() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let agent = create_test_agent(&user_id, "agent");
 
         store.put_agent(&agent).unwrap();
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn session_crud() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let agent = create_test_agent(&user_id, "agent");
         store.put_agent(&agent).unwrap();
 
@@ -539,6 +539,7 @@ mod tests {
             agent_id: agent.agent_id,
             user_id,
             status: SessionStatus::Active,
+            config: SessionConfig::default(),
             created_at: chrono::Utc::now(),
             closed_at: None,
         };
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn list_sessions_by_agent() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 
         let agent1 = create_test_agent(&user_id, "agent-1");
         let agent2 = create_test_agent(&user_id, "agent-2");
@@ -580,6 +581,7 @@ mod tests {
                 agent_id: agent1.agent_id,
                 user_id,
                 status: SessionStatus::Active,
+                config: SessionConfig::default(),
                 created_at: chrono::Utc::now(),
                 closed_at: None,
             };
@@ -592,6 +594,7 @@ mod tests {
             agent_id: agent2.agent_id,
             user_id,
             status: SessionStatus::Active,
+            config: SessionConfig::default(),
             created_at: chrono::Utc::now(),
             closed_at: None,
         };
@@ -608,7 +611,7 @@ mod tests {
     #[test]
     fn user_crud() {
         let (store, _dir) = create_test_store();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 
         let user = User {
             user_id,
@@ -626,7 +629,7 @@ mod tests {
         assert_eq!(retrieved.email, "test@example.com");
 
         // Non-existent user
-        let other_id = UserId::from_bytes([2u8; 32]);
+        let other_id = UserId::from_uuid(uuid::Uuid::new_v4());
         assert!(store.get_user(&other_id).unwrap().is_none());
     }
 }

@@ -61,15 +61,37 @@ spec:
             - name: DATA_DIR
               value: "/data/aura-swarm"
             - name: AUTH_BASE_URL
-              value: "https://zid.zero.tech"
-            - name: AUTH_AUDIENCE
-              value: "zero-vault"
+              value: "https://zosapi.zero.tech"
             # Scheduler URL for agent lifecycle operations
             - name: SCHEDULER_URL
               valueFrom:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: SCHEDULER_URL
+            # z-billing integration
+            - name: Z_BILLING_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_URL
+            - name: Z_BILLING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aura-swarm-secrets
+                  key: Z_BILLING_API_KEY
+                  optional: true
+            - name: Z_BILLING_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_ENABLED
+                  optional: true
+            - name: Z_BILLING_FAIL_CLOSED
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: Z_BILLING_FAIL_CLOSED
+                  optional: true
           resources:
             requests:
               cpu: 250m
