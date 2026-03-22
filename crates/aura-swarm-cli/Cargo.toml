@@ -52,5 +52,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Base64 decoding for tool results
 base64 = "0.22"
 
+# Auth (zOS login)
+aura-swarm-auth = { path = "../aura-swarm-auth" }
+dirs = "6"
+rpassword = "5"
+
 [lints]
 workspace = true
