@@ -326,9 +326,119 @@ pub struct TurnCompleteInfo {
     /// Total number of steps.
     pub steps: u32,
     /// Input tokens used.
-    pub input_tokens: u32,
+    pub input_tokens: u64,
     /// Output tokens used.
-    pub output_tokens: u32,
+    pub output_tokens: u64,
+    /// Model used for the turn (harness protocol only).
+    pub model: Option<String>,
+    /// Stop reason for the turn (harness protocol only).
+    pub stop_reason: Option<String>,
+}
+
+// =============================================================================
+// Harness Protocol Types (aura-harness /stream endpoint)
+// =============================================================================
+
+/// Client -> Server: Messages sent to the aura-harness runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HarnessClientMessage {
+    /// Initialize the session (must be the first message).
+    SessionInit(HarnessSessionInit),
+    /// Send a user message for processing.
+    UserMessage {
+        /// The user's message text.
+        content: String,
+    },
+    /// Cancel the current turn.
+    Cancel,
+}
+
+/// Payload for harness `session_init`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HarnessSessionInit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// Server -> Client: Messages from the aura-harness runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HarnessServerMessage {
+    /// Session initialized and ready.
+    SessionReady {
+        session_id: String,
+        tools: Vec<HarnessToolInfo>,
+    },
+    /// Start of an assistant message (turn).
+    AssistantMessageStart { message_id: String },
+    /// Incremental text content.
+    TextDelta { text: String },
+    /// Incremental thinking content.
+    ThinkingDelta { thinking: String },
+    /// A tool use has started.
+    ToolUseStart { id: String, name: String },
+    /// Result of a tool execution.
+    ToolResult {
+        name: String,
+        result: String,
+        is_error: bool,
+    },
+    /// End of an assistant message (turn complete).
+    AssistantMessageEnd {
+        message_id: String,
+        stop_reason: String,
+        usage: HarnessUsage,
+        files_changed: HarnessFilesChanged,
+    },
+    /// An error occurred.
+    Error {
+        code: String,
+        message: String,
+        recoverable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessToolInfo {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cumulative_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_output_tokens: u64,
+    #[serde(default)]
+    pub context_utilization: f32,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HarnessFilesChanged {
+    #[serde(default)]
+    pub created: Vec<String>,
+    #[serde(default)]
+    pub modified: Vec<String>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
 }
 
 // =============================================================================
@@ -384,7 +494,10 @@ mod tests {
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
 
         match msg {
-            ServerMessage::TurnStart { request_id, agent_id } => {
+            ServerMessage::TurnStart {
+                request_id,
+                agent_id,
+            } => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(agent_id, "agent-1");
             }
@@ -407,7 +520,8 @@ mod tests {
 
     #[test]
     fn server_message_text_delta_deserializes() {
-        let json = r#"{"type":"text_delta","request_id":"req-1","agent_id":"agent-1","text":"Hello, "}"#;
+        let json =
+            r#"{"type":"text_delta","request_id":"req-1","agent_id":"agent-1","text":"Hello, "}"#;
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
 
         match msg {
@@ -424,7 +538,9 @@ mod tests {
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
 
         match msg {
-            ServerMessage::ToolStart { tool_name, args, .. } => {
+            ServerMessage::ToolStart {
+                tool_name, args, ..
+            } => {
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(args["path"], "/src/main.rs");
             }
@@ -438,7 +554,9 @@ mod tests {
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
 
         match msg {
-            ServerMessage::ToolComplete { result, is_error, .. } => {
+            ServerMessage::ToolComplete {
+                result, is_error, ..
+            } => {
                 assert_eq!(result, "file contents");
                 assert!(!is_error);
             }
@@ -452,7 +570,12 @@ mod tests {
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
 
         match msg {
-            ServerMessage::TurnComplete { steps, input_tokens, output_tokens, .. } => {
+            ServerMessage::TurnComplete {
+                steps,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
                 assert_eq!(steps, 3);
                 assert_eq!(input_tokens, 1500);
                 assert_eq!(output_tokens, 800);
@@ -540,8 +663,10 @@ mod tests {
     fn turn_complete_info_default() {
         let info = TurnCompleteInfo::default();
         assert_eq!(info.steps, 0);
-        assert_eq!(info.input_tokens, 0);
-        assert_eq!(info.output_tokens, 0);
+        assert_eq!(info.input_tokens, 0u64);
+        assert_eq!(info.output_tokens, 0u64);
+        assert_eq!(info.model, None);
+        assert_eq!(info.stop_reason, None);
     }
 
     // =========================================================================
@@ -600,5 +725,203 @@ mod tests {
 
         assert_eq!(tools_used, vec!["read_file"]);
         assert!(tool_succeeded);
+    }
+
+    // =========================================================================
+    // Harness Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn harness_session_init_serializes_correctly() {
+        let msg = HarnessClientMessage::SessionInit(HarnessSessionInit {
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            model: Some("claude-opus-4-6-20250514".to_string()),
+            max_tokens: Some(16384),
+            max_turns: Some(25),
+            workspace: None,
+            token: None,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "session_init");
+        assert_eq!(parsed["system_prompt"], "You are a helpful assistant.");
+        assert_eq!(parsed["model"], "claude-opus-4-6-20250514");
+        assert_eq!(parsed["max_tokens"], 16384);
+        assert_eq!(parsed["max_turns"], 25);
+        assert!(parsed.get("workspace").is_none());
+        assert!(parsed.get("token").is_none());
+    }
+
+    #[test]
+    fn harness_user_message_serializes_correctly() {
+        let msg = HarnessClientMessage::UserMessage {
+            content: "Hello".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "user_message");
+        assert_eq!(parsed["content"], "Hello");
+    }
+
+    #[test]
+    fn harness_cancel_serializes_correctly() {
+        let msg = HarnessClientMessage::Cancel;
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "cancel");
+    }
+
+    #[test]
+    fn harness_session_ready_deserializes() {
+        let json = r#"{"type":"session_ready","session_id":"sess-123","tools":[{"name":"fs_read","description":"Read a file"}]}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::SessionReady { session_id, tools } => {
+                assert_eq!(session_id, "sess-123");
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "fs_read");
+                assert_eq!(tools[0].description, "Read a file");
+            }
+            _ => panic!("Expected SessionReady"),
+        }
+    }
+
+    #[test]
+    fn harness_assistant_message_start_deserializes() {
+        let json = r#"{"type":"assistant_message_start","message_id":"msg-1"}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::AssistantMessageStart { message_id } => {
+                assert_eq!(message_id, "msg-1");
+            }
+            _ => panic!("Expected AssistantMessageStart"),
+        }
+    }
+
+    #[test]
+    fn harness_text_delta_deserializes() {
+        let json = r#"{"type":"text_delta","text":"Hello"}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::TextDelta { text } => {
+                assert_eq!(text, "Hello");
+            }
+            _ => panic!("Expected TextDelta"),
+        }
+    }
+
+    #[test]
+    fn harness_thinking_delta_deserializes() {
+        let json = r#"{"type":"thinking_delta","thinking":"Let me consider..."}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::ThinkingDelta { thinking } => {
+                assert_eq!(thinking, "Let me consider...");
+            }
+            _ => panic!("Expected ThinkingDelta"),
+        }
+    }
+
+    #[test]
+    fn harness_tool_use_start_deserializes() {
+        let json = r#"{"type":"tool_use_start","id":"tool-1","name":"fs_read"}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::ToolUseStart { id, name } => {
+                assert_eq!(id, "tool-1");
+                assert_eq!(name, "fs_read");
+            }
+            _ => panic!("Expected ToolUseStart"),
+        }
+    }
+
+    #[test]
+    fn harness_tool_result_deserializes() {
+        let json = r#"{"type":"tool_result","name":"fs_read","result":"file contents","is_error":false}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::ToolResult {
+                name,
+                result,
+                is_error,
+            } => {
+                assert_eq!(name, "fs_read");
+                assert_eq!(result, "file contents");
+                assert!(!is_error);
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn harness_assistant_message_end_deserializes() {
+        let json = r#"{"type":"assistant_message_end","message_id":"msg-1","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50,"cumulative_input_tokens":200,"cumulative_output_tokens":100,"context_utilization":0.5,"model":"claude-opus-4-6-20250514","provider":""},"files_changed":{"created":[],"modified":["src/main.rs"],"deleted":[]}}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::AssistantMessageEnd {
+                message_id,
+                stop_reason,
+                usage,
+                files_changed,
+            } => {
+                assert_eq!(message_id, "msg-1");
+                assert_eq!(stop_reason, "end_turn");
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+                assert_eq!(usage.cumulative_input_tokens, 200);
+                assert_eq!(usage.cumulative_output_tokens, 100);
+                assert!((usage.context_utilization - 0.5).abs() < f32::EPSILON);
+                assert_eq!(usage.model, "claude-opus-4-6-20250514");
+                assert!(files_changed.created.is_empty());
+                assert_eq!(files_changed.modified, vec!["src/main.rs"]);
+                assert!(files_changed.deleted.is_empty());
+            }
+            _ => panic!("Expected AssistantMessageEnd"),
+        }
+    }
+
+    #[test]
+    fn harness_error_deserializes() {
+        let json = r#"{"type":"error","code":"rate_limit","message":"Too many requests","recoverable":true}"#;
+        let msg: HarnessServerMessage = serde_json::from_str(json).unwrap();
+
+        match msg {
+            HarnessServerMessage::Error {
+                code,
+                message,
+                recoverable,
+            } => {
+                assert_eq!(code, "rate_limit");
+                assert_eq!(message, "Too many requests");
+                assert!(recoverable);
+            }
+            _ => panic!("Expected Error"),
+        }
+    }
+
+    #[test]
+    fn harness_session_init_omits_none_fields() {
+        let msg = HarnessClientMessage::SessionInit(HarnessSessionInit::default());
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["type"], "session_init");
+        assert!(parsed.get("system_prompt").is_none());
+        assert!(parsed.get("model").is_none());
+        assert!(parsed.get("max_tokens").is_none());
+        assert!(parsed.get("max_turns").is_none());
     }
 }

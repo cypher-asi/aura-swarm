@@ -13,7 +13,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::types::{ClientMessage, ServerMessage, TurnCompleteInfo};
+use crate::types::{
+    ClientMessage, HarnessClientMessage, HarnessServerMessage, HarnessSessionInit,
+    HarnessToolInfo, ServerMessage, TurnCompleteInfo,
+};
 
 /// Error type for WebSocket operations.
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +84,38 @@ impl WsSender {
             .await
             .map_err(|e| WsError::Send(e.to_string()))
     }
+
+    /// Send a harness `session_init` message.
+    pub async fn send_session_init(&self, init: HarnessSessionInit) -> Result<(), WsError> {
+        let msg = HarnessClientMessage::SessionInit(init);
+        let json = serde_json::to_string(&msg)?;
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| WsError::Send(e.to_string()))
+    }
+
+    /// Send a harness `user_message`.
+    pub async fn send_user_message(&self, content: &str) -> Result<(), WsError> {
+        let msg = HarnessClientMessage::UserMessage {
+            content: content.to_string(),
+        };
+        let json = serde_json::to_string(&msg)?;
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| WsError::Send(e.to_string()))
+    }
+
+    /// Send a harness `cancel` message.
+    pub async fn send_harness_cancel(&self) -> Result<(), WsError> {
+        let msg = HarnessClientMessage::Cancel;
+        let json = serde_json::to_string(&msg)?;
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| WsError::Send(e.to_string()))
+    }
 }
 
 /// Events from the WebSocket connection.
@@ -88,6 +123,13 @@ impl WsSender {
 pub enum WsEvent {
     /// Successfully connected.
     Connected,
+    /// Harness session initialized and ready.
+    SessionReady {
+        /// Session ID assigned by the harness.
+        session_id: String,
+        /// Tools available in the session.
+        tools: Vec<HarnessToolInfo>,
+    },
     /// A new turn has started.
     TurnStart,
     /// A new step within the turn has started.
@@ -210,71 +252,27 @@ async fn ws_reader(
     while let Some(result) = read.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                // Try to parse as ServerMessage (Aura runtime protocol)
-                match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(msg) => {
-                        let event = match msg {
-                            ServerMessage::TurnStart { request_id: _, agent_id } => {
-                                tracing::debug!(agent_id = %agent_id, "Turn started");
-                                Some(WsEvent::TurnStart)
-                            }
-                            ServerMessage::StepStart { request_id: _, agent_id, step } => {
-                                tracing::debug!(agent_id = %agent_id, step = step, "Step started");
-                                Some(WsEvent::StepStart { step })
-                            }
-                            ServerMessage::TextDelta { request_id: _, agent_id: _, text } => {
-                                Some(WsEvent::TextDelta(text))
-                            }
-                            ServerMessage::ThinkingDelta { request_id: _, agent_id: _, thinking } => {
-                                Some(WsEvent::ThinkingDelta(thinking))
-                            }
-                            ServerMessage::ToolStart { request_id: _, agent_id: _, tool_id, tool_name, args } => {
-                                tracing::debug!(tool = %tool_name, tool_id = %tool_id, "Tool execution started");
-                                current_tool_name = Some(tool_name.clone());
-                                Some(WsEvent::ToolStart {
-                                    tool_name,
-                                    args,
-                                })
-                            }
-                            ServerMessage::ToolComplete { request_id: _, agent_id: _, tool_id, result, is_error } => {
-                                tracing::debug!(tool_id = %tool_id, is_error = is_error, "Tool execution completed");
-                                let tool_name = current_tool_name.take().unwrap_or_default();
-                                Some(WsEvent::ToolComplete {
-                                    tool_name,
-                                    result,
-                                    is_error,
-                                })
-                            }
-                            ServerMessage::TurnComplete { request_id: _, agent_id, steps, input_tokens, output_tokens } => {
-                                tracing::debug!(agent_id = %agent_id, steps = steps, "Turn complete");
-                                Some(WsEvent::TurnComplete(TurnCompleteInfo {
-                                    steps,
-                                    input_tokens,
-                                    output_tokens,
-                                }))
-                            }
-                            ServerMessage::Cancelled { request_id, agent_id: _ } => {
-                                Some(WsEvent::Cancelled { request_id })
-                            }
-                            ServerMessage::Error { request_id: _, agent_id: _, error, code } => {
-                                Some(WsEvent::Error { message: error, code })
-                            }
-                        };
-                        if let Some(event) = event {
-                            let _ = tx.send(event).await;
-                        }
+                // Try harness protocol first, then legacy
+                if let Ok(harness_msg) = serde_json::from_str::<HarnessServerMessage>(&text) {
+                    if let Some(event) =
+                        harness_message_to_event(harness_msg, &mut current_tool_name)
+                    {
+                        let _ = tx.send(event).await;
                     }
-                    Err(e) => {
-                        // Log parse error but treat as raw text for debugging
-                        tracing::debug!(error = %e, text = %text, "Failed to parse server message");
-                        // Forward as error so the user knows something went wrong
-                        let _ = tx
-                            .send(WsEvent::Error {
-                                message: format!("Protocol error: {e}"),
-                                code: Some("parse_error".to_string()),
-                            })
-                            .await;
+                } else if let Ok(legacy_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                    if let Some(event) =
+                        legacy_message_to_event(legacy_msg, &mut current_tool_name)
+                    {
+                        let _ = tx.send(event).await;
                     }
+                } else {
+                    tracing::debug!(text = %text, "Failed to parse server message");
+                    let _ = tx
+                        .send(WsEvent::Error {
+                            message: format!("Protocol error: unrecognized message"),
+                            code: Some("parse_error".to_string()),
+                        })
+                        .await;
                 }
             }
             Ok(Message::Close(_)) => {
@@ -296,6 +294,147 @@ async fn ws_reader(
     }
 
     let _ = tx.send(WsEvent::Disconnected).await;
+}
+
+/// Convert a `HarnessServerMessage` to a `WsEvent`.
+fn harness_message_to_event(
+    msg: HarnessServerMessage,
+    current_tool_name: &mut Option<String>,
+) -> Option<WsEvent> {
+    match msg {
+        HarnessServerMessage::SessionReady { session_id, tools } => {
+            Some(WsEvent::SessionReady { session_id, tools })
+        }
+        HarnessServerMessage::AssistantMessageStart { .. } => Some(WsEvent::TurnStart),
+        HarnessServerMessage::TextDelta { text } => Some(WsEvent::TextDelta(text)),
+        HarnessServerMessage::ThinkingDelta { thinking } => Some(WsEvent::ThinkingDelta(thinking)),
+        HarnessServerMessage::ToolUseStart { id: _, name } => {
+            *current_tool_name = Some(name.clone());
+            Some(WsEvent::ToolStart {
+                tool_name: name,
+                args: serde_json::Value::Null,
+            })
+        }
+        HarnessServerMessage::ToolResult {
+            name,
+            result,
+            is_error,
+        } => Some(WsEvent::ToolComplete {
+            tool_name: name,
+            result,
+            is_error,
+        }),
+        HarnessServerMessage::AssistantMessageEnd {
+            stop_reason,
+            usage,
+            ..
+        } => Some(WsEvent::TurnComplete(TurnCompleteInfo {
+            steps: 0,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            model: if usage.model.is_empty() {
+                None
+            } else {
+                Some(usage.model)
+            },
+            stop_reason: Some(stop_reason),
+        })),
+        HarnessServerMessage::Error {
+            code, message, ..
+        } => Some(WsEvent::Error {
+            message,
+            code: Some(code),
+        }),
+    }
+}
+
+/// Convert a legacy `ServerMessage` to a `WsEvent`.
+fn legacy_message_to_event(
+    msg: ServerMessage,
+    current_tool_name: &mut Option<String>,
+) -> Option<WsEvent> {
+    match msg {
+        ServerMessage::TurnStart {
+            request_id: _,
+            agent_id,
+        } => {
+            tracing::debug!(agent_id = %agent_id, "Turn started");
+            Some(WsEvent::TurnStart)
+        }
+        ServerMessage::StepStart {
+            request_id: _,
+            agent_id,
+            step,
+        } => {
+            tracing::debug!(agent_id = %agent_id, step = step, "Step started");
+            Some(WsEvent::StepStart { step })
+        }
+        ServerMessage::TextDelta {
+            request_id: _,
+            agent_id: _,
+            text,
+        } => Some(WsEvent::TextDelta(text)),
+        ServerMessage::ThinkingDelta {
+            request_id: _,
+            agent_id: _,
+            thinking,
+        } => Some(WsEvent::ThinkingDelta(thinking)),
+        ServerMessage::ToolStart {
+            request_id: _,
+            agent_id: _,
+            tool_id,
+            tool_name,
+            args,
+        } => {
+            tracing::debug!(tool = %tool_name, tool_id = %tool_id, "Tool execution started");
+            *current_tool_name = Some(tool_name.clone());
+            Some(WsEvent::ToolStart { tool_name, args })
+        }
+        ServerMessage::ToolComplete {
+            request_id: _,
+            agent_id: _,
+            tool_id,
+            result,
+            is_error,
+        } => {
+            tracing::debug!(tool_id = %tool_id, is_error = is_error, "Tool execution completed");
+            let tool_name = current_tool_name.take().unwrap_or_default();
+            Some(WsEvent::ToolComplete {
+                tool_name,
+                result,
+                is_error,
+            })
+        }
+        ServerMessage::TurnComplete {
+            request_id: _,
+            agent_id,
+            steps,
+            input_tokens,
+            output_tokens,
+        } => {
+            tracing::debug!(agent_id = %agent_id, steps = steps, "Turn complete");
+            Some(WsEvent::TurnComplete(TurnCompleteInfo {
+                steps,
+                input_tokens: u64::from(input_tokens),
+                output_tokens: u64::from(output_tokens),
+                model: None,
+                stop_reason: None,
+            }))
+        }
+        ServerMessage::Cancelled {
+            request_id,
+            agent_id: _,
+        } => Some(WsEvent::Cancelled { request_id }),
+        ServerMessage::Error {
+            request_id: _,
+            agent_id: _,
+            error,
+            code,
+        } => Some(WsEvent::Error {
+            message: error,
+            code,
+        }),
+    }
 }
 
 /// Extract host from URL.
@@ -346,44 +485,13 @@ fn base64_encode(data: &[u8]) -> String {
 
 /// Convert a ServerMessage to a WsEvent (for testing).
 ///
-/// This function mirrors the conversion logic in ws_reader.
+/// Delegates to the production `legacy_message_to_event` function.
 #[cfg(test)]
 fn server_message_to_event(
     msg: ServerMessage,
     current_tool_name: &mut Option<String>,
 ) -> Option<WsEvent> {
-    match msg {
-        ServerMessage::TurnStart { .. } => Some(WsEvent::TurnStart),
-        ServerMessage::StepStart { step, .. } => Some(WsEvent::StepStart { step }),
-        ServerMessage::TextDelta { text, .. } => Some(WsEvent::TextDelta(text)),
-        ServerMessage::ThinkingDelta { thinking, .. } => Some(WsEvent::ThinkingDelta(thinking)),
-        ServerMessage::ToolStart { tool_name, args, .. } => {
-            *current_tool_name = Some(tool_name.clone());
-            Some(WsEvent::ToolStart { tool_name, args })
-        }
-        ServerMessage::ToolComplete { result, is_error, .. } => {
-            let tool_name = current_tool_name.take().unwrap_or_default();
-            Some(WsEvent::ToolComplete {
-                tool_name,
-                result,
-                is_error,
-            })
-        }
-        ServerMessage::TurnComplete {
-            steps,
-            input_tokens,
-            output_tokens,
-            ..
-        } => Some(WsEvent::TurnComplete(TurnCompleteInfo {
-            steps,
-            input_tokens,
-            output_tokens,
-        })),
-        ServerMessage::Cancelled { request_id, .. } => {
-            Some(WsEvent::Cancelled { request_id })
-        }
-        ServerMessage::Error { error, code, .. } => Some(WsEvent::Error { message: error, code }),
-    }
+    legacy_message_to_event(msg, current_tool_name)
 }
 
 // =============================================================================
@@ -401,15 +509,27 @@ mod tests {
 
     #[test]
     fn extract_host_from_ws_url() {
-        assert_eq!(extract_host("ws://localhost:8080/stream"), Some("localhost:8080"));
-        assert_eq!(extract_host("ws://192.168.1.1:3000/api/ws"), Some("192.168.1.1:3000"));
+        assert_eq!(
+            extract_host("ws://localhost:8080/stream"),
+            Some("localhost:8080")
+        );
+        assert_eq!(
+            extract_host("ws://192.168.1.1:3000/api/ws"),
+            Some("192.168.1.1:3000")
+        );
         assert_eq!(extract_host("ws://example.com"), Some("example.com"));
     }
 
     #[test]
     fn extract_host_from_wss_url() {
-        assert_eq!(extract_host("wss://secure.example.com/stream"), Some("secure.example.com"));
-        assert_eq!(extract_host("wss://api.example.com:443/ws"), Some("api.example.com:443"));
+        assert_eq!(
+            extract_host("wss://secure.example.com/stream"),
+            Some("secure.example.com")
+        );
+        assert_eq!(
+            extract_host("wss://api.example.com:443/ws"),
+            Some("api.example.com:443")
+        );
     }
 
     #[test]
@@ -432,7 +552,9 @@ mod tests {
     fn generate_ws_key_is_valid_base64() {
         let key = generate_ws_key();
         assert!(key.len() >= 20);
-        assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+        assert!(key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
     }
 
     // =========================================================================
@@ -498,7 +620,11 @@ mod tests {
         let mut tool_name_state = Some("read_file".to_string());
         let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
         match event {
-            WsEvent::ToolComplete { tool_name, result, is_error } => {
+            WsEvent::ToolComplete {
+                tool_name,
+                result,
+                is_error,
+            } => {
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(result, "file contents");
                 assert!(!is_error);
@@ -521,8 +647,10 @@ mod tests {
         match event {
             WsEvent::TurnComplete(info) => {
                 assert_eq!(info.steps, 3);
-                assert_eq!(info.input_tokens, 1500);
-                assert_eq!(info.output_tokens, 800);
+                assert_eq!(info.input_tokens, 1500u64);
+                assert_eq!(info.output_tokens, 800u64);
+                assert_eq!(info.model, None);
+                assert_eq!(info.stop_reason, None);
             }
             _ => panic!("Expected TurnComplete event"),
         }
@@ -674,7 +802,11 @@ mod tests {
         for msg in messages {
             if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
                 match event {
-                    WsEvent::ToolComplete { tool_name, is_error, .. } => {
+                    WsEvent::ToolComplete {
+                        tool_name,
+                        is_error,
+                        ..
+                    } => {
                         tool_names.push(tool_name);
                         tool_succeeded = !is_error;
                     }
@@ -685,5 +817,235 @@ mod tests {
 
         assert_eq!(tool_names, vec!["read_file"]);
         assert!(tool_succeeded);
+    }
+
+    // =========================================================================
+    // Harness Protocol Conversion Tests
+    // =========================================================================
+
+    #[test]
+    fn harness_session_ready_to_event() {
+        let msg = HarnessServerMessage::SessionReady {
+            session_id: "sess-1".to_string(),
+            tools: vec![HarnessToolInfo {
+                name: "fs_read".to_string(),
+                description: "Read a file".to_string(),
+            }],
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::SessionReady { session_id, tools } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "fs_read");
+            }
+            _ => panic!("Expected SessionReady event"),
+        }
+    }
+
+    #[test]
+    fn harness_assistant_message_start_to_event() {
+        let msg = HarnessServerMessage::AssistantMessageStart {
+            message_id: "msg-1".to_string(),
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        assert!(matches!(event, WsEvent::TurnStart));
+    }
+
+    #[test]
+    fn harness_text_delta_to_event() {
+        let msg = HarnessServerMessage::TextDelta {
+            text: "hello".to_string(),
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::TextDelta(text) => assert_eq!(text, "hello"),
+            _ => panic!("Expected TextDelta event"),
+        }
+    }
+
+    #[test]
+    fn harness_thinking_delta_to_event() {
+        let msg = HarnessServerMessage::ThinkingDelta {
+            thinking: "reasoning...".to_string(),
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::ThinkingDelta(thinking) => assert_eq!(thinking, "reasoning..."),
+            _ => panic!("Expected ThinkingDelta event"),
+        }
+    }
+
+    #[test]
+    fn harness_tool_use_start_to_event() {
+        let msg = HarnessServerMessage::ToolUseStart {
+            id: "tool-1".to_string(),
+            name: "fs_read".to_string(),
+        };
+        let mut tool_name_state = None;
+        let event = harness_message_to_event(msg, &mut tool_name_state).unwrap();
+        match event {
+            WsEvent::ToolStart { tool_name, args } => {
+                assert_eq!(tool_name, "fs_read");
+                assert_eq!(args, serde_json::Value::Null);
+            }
+            _ => panic!("Expected ToolStart event"),
+        }
+        assert_eq!(tool_name_state, Some("fs_read".to_string()));
+    }
+
+    #[test]
+    fn harness_tool_result_to_event() {
+        let msg = HarnessServerMessage::ToolResult {
+            name: "fs_read".to_string(),
+            result: "file contents".to_string(),
+            is_error: false,
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::ToolComplete {
+                tool_name,
+                result,
+                is_error,
+            } => {
+                assert_eq!(tool_name, "fs_read");
+                assert_eq!(result, "file contents");
+                assert!(!is_error);
+            }
+            _ => panic!("Expected ToolComplete event"),
+        }
+    }
+
+    #[test]
+    fn harness_assistant_message_end_to_event() {
+        use crate::types::{HarnessFilesChanged, HarnessUsage};
+
+        let msg = HarnessServerMessage::AssistantMessageEnd {
+            message_id: "msg-1".to_string(),
+            stop_reason: "end_turn".to_string(),
+            usage: HarnessUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                cumulative_input_tokens: 400,
+                cumulative_output_tokens: 200,
+                context_utilization: 0.5,
+                model: "claude-opus-4-6-20250514".to_string(),
+                provider: String::new(),
+            },
+            files_changed: HarnessFilesChanged::default(),
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::TurnComplete(info) => {
+                assert_eq!(info.steps, 0);
+                assert_eq!(info.input_tokens, 200u64);
+                assert_eq!(info.output_tokens, 100u64);
+                assert_eq!(info.model, Some("claude-opus-4-6-20250514".to_string()));
+                assert_eq!(info.stop_reason, Some("end_turn".to_string()));
+            }
+            _ => panic!("Expected TurnComplete event"),
+        }
+    }
+
+    #[test]
+    fn harness_assistant_message_end_empty_model() {
+        use crate::types::{HarnessFilesChanged, HarnessUsage};
+
+        let msg = HarnessServerMessage::AssistantMessageEnd {
+            message_id: "msg-1".to_string(),
+            stop_reason: "end_turn".to_string(),
+            usage: HarnessUsage {
+                input_tokens: 50,
+                output_tokens: 25,
+                model: String::new(),
+                ..HarnessUsage::default()
+            },
+            files_changed: HarnessFilesChanged::default(),
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::TurnComplete(info) => {
+                assert_eq!(info.model, None);
+            }
+            _ => panic!("Expected TurnComplete event"),
+        }
+    }
+
+    #[test]
+    fn harness_error_to_event() {
+        let msg = HarnessServerMessage::Error {
+            code: "rate_limit".to_string(),
+            message: "Too many requests".to_string(),
+            recoverable: true,
+        };
+        let mut tool_name = None;
+        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        match event {
+            WsEvent::Error { message, code } => {
+                assert_eq!(message, "Too many requests");
+                assert_eq!(code, Some("rate_limit".to_string()));
+            }
+            _ => panic!("Expected Error event"),
+        }
+    }
+
+    #[test]
+    fn harness_full_flow_simulation() {
+        use crate::types::{HarnessFilesChanged, HarnessUsage};
+
+        let messages: Vec<HarnessServerMessage> = vec![
+            HarnessServerMessage::SessionReady {
+                session_id: "sess-1".to_string(),
+                tools: vec![],
+            },
+            HarnessServerMessage::AssistantMessageStart {
+                message_id: "msg-1".to_string(),
+            },
+            HarnessServerMessage::TextDelta {
+                text: "Hello".to_string(),
+            },
+            HarnessServerMessage::TextDelta {
+                text: ", world!".to_string(),
+            },
+            HarnessServerMessage::AssistantMessageEnd {
+                message_id: "msg-1".to_string(),
+                stop_reason: "end_turn".to_string(),
+                usage: HarnessUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..HarnessUsage::default()
+                },
+                files_changed: HarnessFilesChanged::default(),
+            },
+        ];
+
+        let mut tool_name_state = None;
+        let mut text_buffer = String::new();
+        let mut session_ready = false;
+        let mut turn_info = None;
+
+        for msg in messages {
+            if let Some(event) = harness_message_to_event(msg, &mut tool_name_state) {
+                match event {
+                    WsEvent::SessionReady { .. } => session_ready = true,
+                    WsEvent::TextDelta(text) => text_buffer.push_str(&text),
+                    WsEvent::TurnComplete(info) => turn_info = Some(info),
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(session_ready);
+        assert_eq!(text_buffer, "Hello, world!");
+        let info = turn_info.unwrap();
+        assert_eq!(info.input_tokens, 10u64);
+        assert_eq!(info.output_tokens, 3u64);
     }
 }

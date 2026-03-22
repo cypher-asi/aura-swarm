@@ -34,19 +34,24 @@ impl ToolResult {
     fn parse(json: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(json).ok()?;
         let obj = v.as_object()?;
-        
+
         let tool = obj.get("tool")?.as_str()?.to_string();
         let ok = obj.get("ok")?.as_bool()?;
         let stdout_b64 = obj.get("stdout")?.as_str().unwrap_or("");
         let stderr_b64 = obj.get("stderr")?.as_str().unwrap_or("");
-        
+
         // Decode base64
         let stdout = decode_base64(stdout_b64);
         let stderr = decode_base64(stderr_b64);
-        
-        Some(Self { tool, ok, stdout, stderr })
+
+        Some(Self {
+            tool,
+            ok,
+            stdout,
+            stderr,
+        })
     }
-    
+
     /// Format the result for display.
     fn format(&self) -> String {
         if !self.ok {
@@ -58,7 +63,7 @@ impl ToolResult {
             };
             return format!("Error: {error_msg}");
         }
-        
+
         // Format based on tool type
         match self.tool.as_str() {
             "fs.ls" | "fs_ls" => self.format_ls(),
@@ -68,7 +73,7 @@ impl ToolResult {
             _ => self.format_generic(),
         }
     }
-    
+
     fn format_ls(&self) -> String {
         if self.stdout.trim().is_empty() {
             "(empty directory)".to_string()
@@ -79,7 +84,12 @@ impl ToolResult {
                 "(empty directory)".to_string()
             } else {
                 let count = entries.len();
-                let preview: String = entries.iter().take(10).map(|e| format!("  {e}")).collect::<Vec<_>>().join("\n");
+                let preview: String = entries
+                    .iter()
+                    .take(10)
+                    .map(|e| format!("  {e}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if count > 10 {
                     format!("{preview}\n  ... and {} more", count - 10)
                 } else {
@@ -88,7 +98,7 @@ impl ToolResult {
             }
         }
     }
-    
+
     fn format_read(&self) -> String {
         if self.stdout.is_empty() {
             "(empty file)".to_string()
@@ -97,14 +107,19 @@ impl ToolResult {
             let content = self.stdout.trim();
             let lines: Vec<&str> = content.lines().collect();
             if lines.len() > 20 {
-                let preview: String = lines.iter().take(20).cloned().collect::<Vec<_>>().join("\n");
+                let preview: String = lines
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!("{preview}\n... ({} more lines)", lines.len() - 20)
             } else {
                 content.to_string()
             }
         }
     }
-    
+
     fn format_write(&self) -> String {
         // stdout usually contains "Wrote N bytes to filename"
         if self.stdout.is_empty() {
@@ -113,14 +128,14 @@ impl ToolResult {
             self.stdout.trim().to_string()
         }
     }
-    
+
     fn format_cmd(&self) -> String {
         let mut output = String::new();
-        
+
         if !self.stdout.is_empty() {
             output.push_str(self.stdout.trim());
         }
-        
+
         if !self.stderr.is_empty() {
             if !output.is_empty() {
                 output.push_str("\n\n");
@@ -128,7 +143,7 @@ impl ToolResult {
             output.push_str("stderr:\n");
             output.push_str(self.stderr.trim());
         }
-        
+
         if output.is_empty() {
             "(no output)".to_string()
         } else {
@@ -140,7 +155,7 @@ impl ToolResult {
             }
         }
     }
-    
+
     fn format_generic(&self) -> String {
         if !self.stdout.is_empty() {
             let content = self.stdout.trim();
@@ -160,7 +175,7 @@ fn decode_base64(input: &str) -> String {
     if input.is_empty() {
         return String::new();
     }
-    
+
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .ok()
@@ -186,12 +201,11 @@ fn format_tool_result(result: &str) -> String {
 /// Always returns something meaningful - at minimum the tool name.
 fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     let obj = args.as_object();
-    
+
     // Helper to get a string field from args
-    let get_str = |field: &str| -> Option<&str> {
-        obj.and_then(|o| o.get(field)).and_then(|v| v.as_str())
-    };
-    
+    let get_str =
+        |field: &str| -> Option<&str> { obj.and_then(|o| o.get(field)).and_then(|v| v.as_str()) };
+
     // Extract common argument patterns for cleaner display
     let formatted = match tool_name {
         "fs.ls" | "fs_ls" => {
@@ -202,9 +216,9 @@ fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
             let path = get_str("path").unwrap_or(".");
             format!("stat {path}")
         }
-        "fs.read" | "fs_read" => {
-            get_str("path").map(|p| format!("read {p}")).unwrap_or_default()
-        }
+        "fs.read" | "fs_read" => get_str("path")
+            .map(|p| format!("read {p}"))
+            .unwrap_or_default(),
         "fs.write" | "fs_write" => {
             let path = get_str("path");
             let content = get_str("content").unwrap_or("");
@@ -217,34 +231,43 @@ fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
                 None => String::new(),
             }
         }
-        "fs.mkdir" | "fs_mkdir" => {
-            get_str("path").map(|p| format!("mkdir {p}")).unwrap_or_default()
-        }
-        "fs.rm" | "fs_rm" => {
-            get_str("path").map(|p| format!("rm {p}")).unwrap_or_default()
-        }
+        "fs.mkdir" | "fs_mkdir" => get_str("path")
+            .map(|p| format!("mkdir {p}"))
+            .unwrap_or_default(),
+        "fs.rm" | "fs_rm" => get_str("path")
+            .map(|p| format!("rm {p}"))
+            .unwrap_or_default(),
         "search_code" | "code_search" | "grep" => {
             let query = get_str("query")
                 .or_else(|| get_str("pattern"))
                 .or_else(|| get_str("search"))
                 .unwrap_or("?");
-            let path = get_str("path").or_else(|| get_str("directory")).unwrap_or(".");
+            let path = get_str("path")
+                .or_else(|| get_str("directory"))
+                .unwrap_or(".");
             format!("search \"{query}\" in {path}")
         }
         "find_files" | "glob" | "find" => {
-            let pattern = get_str("pattern").or_else(|| get_str("glob")).unwrap_or("*");
-            let path = get_str("path").or_else(|| get_str("directory")).unwrap_or(".");
+            let pattern = get_str("pattern")
+                .or_else(|| get_str("glob"))
+                .unwrap_or("*");
+            let path = get_str("path")
+                .or_else(|| get_str("directory"))
+                .unwrap_or(".");
             format!("find {pattern} in {path}")
         }
-        name if name.eq_ignore_ascii_case("cmd.run") || name.eq_ignore_ascii_case("cmd_run") 
-            || name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("shell") 
-            || name.eq_ignore_ascii_case("exec") => {
+        name if name.eq_ignore_ascii_case("cmd.run")
+            || name.eq_ignore_ascii_case("cmd_run")
+            || name.eq_ignore_ascii_case("bash")
+            || name.eq_ignore_ascii_case("shell")
+            || name.eq_ignore_ascii_case("exec") =>
+        {
             // Try common field names for the command
             let cmd = get_str("command")
                 .or_else(|| get_str("cmd"))
                 .or_else(|| get_str("input"))
                 .or_else(|| get_str("script"));
-            
+
             match cmd {
                 Some(c) if c.len() > 80 => format!("$ {}...", &c[..80]),
                 Some(c) => format!("$ {c}"),
@@ -253,17 +276,17 @@ fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
         }
         _ => String::new(),
     };
-    
+
     // If we got a good formatted string, use it
     if !formatted.is_empty() {
         return formatted;
     }
-    
+
     // Fallback: show tool name with compact args
     if args.is_null() {
         return tool_name.to_string();
     }
-    
+
     let compact = serde_json::to_string(args).unwrap_or_default();
     if compact == "{}" || compact.is_empty() || compact == "null" {
         tool_name.to_string()
@@ -273,7 +296,6 @@ fn format_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
         format!("{tool_name} {compact}")
     }
 }
-
 
 /// Input mode for special operations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -381,18 +403,15 @@ impl App {
             saved_chat_input: None,
         }
     }
-    
+
     /// Enter a dialog mode, saving the current chat input.
     pub fn enter_dialog_mode(&mut self, mode: InputMode) {
         // Save current input state
-        self.saved_chat_input = Some((
-            std::mem::take(&mut self.input),
-            self.cursor_position,
-        ));
+        self.saved_chat_input = Some((std::mem::take(&mut self.input), self.cursor_position));
         self.cursor_position = 0;
         self.input_mode = mode;
     }
-    
+
     /// Exit dialog mode, restoring the saved chat input.
     pub fn exit_dialog_mode(&mut self) {
         self.input_mode = InputMode::Normal;
@@ -420,8 +439,7 @@ impl App {
     /// Get the currently selected agent.
     #[must_use]
     pub fn selected_agent(&self) -> Option<&Agent> {
-        self.selected_agent
-            .and_then(|i| self.agents.get(i))
+        self.selected_agent.and_then(|i| self.agents.get(i))
     }
 
     /// Get the gateway URL for display.
@@ -455,25 +473,30 @@ impl App {
         if let Some(agent) = self.selected_agent() {
             let agent_id = agent.agent_id.clone();
             if !self.messages.is_empty() {
-                self.message_cache.insert(agent_id, std::mem::take(&mut self.messages));
+                self.message_cache
+                    .insert(agent_id, std::mem::take(&mut self.messages));
             }
         }
     }
-    
+
     /// Load messages from cache for the given agent.
     fn load_messages_from_cache(&mut self, agent_id: &str) {
-        self.messages = self.message_cache.get(agent_id).cloned().unwrap_or_default();
+        self.messages = self
+            .message_cache
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default();
         self.chat_scroll = 0;
     }
-    
+
     /// Switch to viewing a different agent's chat.
     fn switch_agent_view(&mut self, new_index: usize) {
         // Save current agent's messages
         self.save_messages_to_cache();
-        
+
         // Update selection
         self.selected_agent = Some(new_index);
-        
+
         // Load new agent's messages from cache
         if let Some(agent) = self.agents.get(new_index) {
             self.load_messages_from_cache(&agent.agent_id.clone());
@@ -491,7 +514,7 @@ impl App {
             Some(i) => i - 1,
             None => 0,
         };
-        
+
         self.switch_agent_view(new_index);
     }
 
@@ -506,7 +529,7 @@ impl App {
             Some(i) => i + 1,
             None => 0,
         };
-        
+
         self.switch_agent_view(new_index);
     }
 
@@ -523,7 +546,6 @@ impl App {
     pub fn scroll_chat_down(&mut self, amount: usize) {
         self.chat_scroll = self.chat_scroll.saturating_sub(amount);
     }
-
 
     // =========================================================================
     // Input Handling
@@ -615,7 +637,11 @@ impl App {
         self.refresh_agents().await?;
 
         // Select the newly created agent
-        if let Some(i) = self.agents.iter().position(|a| a.agent_id == agent.agent_id) {
+        if let Some(i) = self
+            .agents
+            .iter()
+            .position(|a| a.agent_id == agent.agent_id)
+        {
             self.selected_agent = Some(i);
         }
 
@@ -694,17 +720,17 @@ impl App {
     // =========================================================================
 
     /// Ensure the selected agent is ready (running/idle), waking or starting it if necessary.
-    /// 
+    ///
     /// This method will:
     /// - Do nothing if agent is already Running or Idle
     /// - Wake the agent if Hibernating
     /// - Start the agent if Stopped
     /// - Wait for the agent to reach Running/Idle state
-    /// 
+    ///
     /// Returns Ok(true) if action was taken (wake/start), Ok(false) if already ready.
     pub async fn ensure_agent_ready(&mut self) -> Result<bool, String> {
         let agent = self.selected_agent().ok_or("No agent selected")?;
-        
+
         match agent.status {
             AgentState::Running | AgentState::Idle => {
                 // Already ready
@@ -713,8 +739,10 @@ impl App {
             AgentState::Hibernating => {
                 // Wake the agent
                 self.set_status("Waking agent...");
-                self.wake_selected_agent().await.map_err(|e| e.to_string())?;
-                
+                self.wake_selected_agent()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 // Wait for agent to be ready
                 self.wait_for_agent_ready().await?;
                 Ok(true)
@@ -722,8 +750,10 @@ impl App {
             AgentState::Stopped => {
                 // Start the agent
                 self.set_status("Starting agent...");
-                self.start_selected_agent().await.map_err(|e| e.to_string())?;
-                
+                self.start_selected_agent()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 // Wait for agent to be ready
                 self.wait_for_agent_ready().await?;
                 Ok(true)
@@ -737,37 +767,42 @@ impl App {
             AgentState::Error => {
                 // Try to restart the agent
                 self.set_status("Restarting failed agent...");
-                self.start_selected_agent().await.map_err(|e| e.to_string())?;
-                
+                self.start_selected_agent()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 // Wait for agent to be ready
                 self.wait_for_agent_ready().await?;
                 Ok(true)
             }
         }
     }
-    
+
     /// Wait for the selected agent to reach Running or Idle state.
-    /// 
+    ///
     /// Polls every 500ms, up to 60 seconds.
     async fn wait_for_agent_ready(&mut self) -> Result<(), String> {
         use std::time::{Duration, Instant};
-        
+
         let timeout = Duration::from_secs(60);
         let poll_interval = Duration::from_millis(500);
         let start = Instant::now();
-        
+
         loop {
             // Refresh agent list to get current state
             self.refresh_agents().await.map_err(|e| e.to_string())?;
-            
+
             let agent = self.selected_agent().ok_or("Agent no longer exists")?;
-            
+
             match agent.status {
                 AgentState::Running | AgentState::Idle => {
                     return Ok(());
                 }
                 AgentState::Error => {
-                    let error = agent.error_message.clone().unwrap_or_else(|| "Unknown error".to_string());
+                    let error = agent
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string());
                     return Err(format!("Agent failed: {error}"));
                 }
                 AgentState::Provisioning | AgentState::Stopping => {
@@ -780,11 +815,11 @@ impl App {
                     return Err(format!("Agent in unexpected state: {:?}", agent.status));
                 }
             }
-            
+
             if start.elapsed() > timeout {
                 return Err("Timeout waiting for agent to be ready".to_string());
             }
-            
+
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -795,10 +830,7 @@ impl App {
 
         // Check agent is in a runnable state
         if !matches!(agent.status, AgentState::Running | AgentState::Idle) {
-            return Err(format!(
-                "Agent is not running (status: {:?})",
-                agent.status
-            ));
+            return Err(format!("Agent is not running (status: {:?})", agent.status));
         }
 
         let agent_id = agent.agent_id.clone();
@@ -821,7 +853,7 @@ impl App {
         self.ws_sender = Some(sender);
         self.current_session_id = Some(session_id);
         self.connected_agent_id = Some(agent_id.clone());
-        
+
         // Load cached messages for this agent (preserves history)
         self.load_messages_from_cache(&agent_id);
         self.ws_connected = true;
@@ -830,15 +862,15 @@ impl App {
 
         Ok(receiver)
     }
-    
+
     /// Ensure agent is ready, then connect to it.
-    /// 
+    ///
     /// This is the preferred method for connecting - it will automatically
     /// wake/start agents that are hibernating/stopped.
     pub async fn ensure_ready_and_connect(&mut self) -> Result<mpsc::Receiver<WsEvent>, String> {
         // First ensure agent is ready (wake/start if needed)
         self.ensure_agent_ready().await?;
-        
+
         // Now connect
         self.connect_to_agent().await
     }
@@ -848,10 +880,11 @@ impl App {
         // Save messages to cache before disconnecting
         if let Some(agent_id) = self.connected_agent_id.take() {
             if !self.messages.is_empty() {
-                self.message_cache.insert(agent_id, std::mem::take(&mut self.messages));
+                self.message_cache
+                    .insert(agent_id, std::mem::take(&mut self.messages));
             }
         }
-        
+
         if let Some(session_id) = self.current_session_id.take() {
             let _ = self.client.close_session(&session_id).await;
         }
@@ -898,6 +931,13 @@ impl App {
                 self.set_status("WebSocket connected");
                 true
             }
+            WsEvent::SessionReady { session_id, tools } => {
+                self.ws_connected = true;
+                let tool_count = tools.len();
+                self.current_session_id = Some(session_id);
+                self.set_status(format!("Session ready ({tool_count} tools available)"));
+                true
+            }
             WsEvent::TurnStart => {
                 self.is_streaming = true;
                 self.streaming_text_buffer.clear();
@@ -923,16 +963,17 @@ impl App {
             WsEvent::ThinkingDelta(thinking) => {
                 // Show thinking content in the chat with dimmed styling
                 // Add thinking block header if this is the start of thinking
-                if !self.streaming_text_buffer.ends_with("*thinking...*\n") 
-                    && !self.streaming_text_buffer.contains("💭") 
+                if !self.streaming_text_buffer.ends_with("*thinking...*\n")
+                    && !self.streaming_text_buffer.contains("💭")
                 {
                     self.streaming_text_buffer.push_str("\n💭 *thinking...*\n");
                 }
-                
+
                 // Append thinking content (dimmed in markdown via italics)
-                self.streaming_text_buffer.push_str(&format!("*{thinking}*"));
+                self.streaming_text_buffer
+                    .push_str(&format!("*{thinking}*"));
                 self.update_streaming_message_live();
-                
+
                 // Show truncated thinking in status bar
                 let preview = if thinking.len() > 60 {
                     format!("{}...", &thinking[..60])
@@ -944,12 +985,12 @@ impl App {
             }
             WsEvent::ToolStart { tool_name, args } => {
                 // End any thinking block before showing tool
-                if self.streaming_text_buffer.contains("💭") 
-                    && !self.streaming_text_buffer.ends_with("\n\n") 
+                if self.streaming_text_buffer.contains("💭")
+                    && !self.streaming_text_buffer.ends_with("\n\n")
                 {
                     self.streaming_text_buffer.push_str("\n\n");
                 }
-                
+
                 // Format tool call as a compact bullet point (no newline yet - result will follow)
                 let args_display = format_tool_args(&tool_name, &args);
                 let display = if args_display.is_empty() {
@@ -957,11 +998,11 @@ impl App {
                 } else {
                     format!("`{args_display}`")
                 };
-                
+
                 // Add the tool display without newline - result will complete the line
                 self.streaming_text_buffer.push_str(&display);
                 self.update_streaming_message_live();
-                
+
                 // Show detailed status
                 let status_detail = if args_display.is_empty() {
                     tool_name.clone()
@@ -973,27 +1014,38 @@ impl App {
                 self.set_status(format!("Running: {status_detail}"));
                 true
             }
-            WsEvent::ToolComplete { tool_name, result, is_error } => {
+            WsEvent::ToolComplete {
+                tool_name,
+                result,
+                is_error,
+            } => {
                 // Update status
                 let status = if is_error { "Error" } else { "Done" };
                 self.set_status(format!("{tool_name}: {status}"));
-                
+
                 // Parse and format the result compactly
                 let display_result = format_tool_result(&result);
-                
+
                 // Format result inline with tool, or on next lines if multi-line
                 let formatted_result = if display_result.lines().count() > 1 {
                     // Multi-line: show in code block on next line
                     format!("\n```\n{display_result}\n```\n")
-                } else if display_result.is_empty() || display_result == "OK" || display_result == "ok" {
+                } else if display_result.is_empty()
+                    || display_result == "OK"
+                    || display_result == "ok"
+                {
                     // Simple success, just add checkmark and newline
-                    if is_error { " x\n".to_string() } else { " +\n".to_string() }
+                    if is_error {
+                        " x\n".to_string()
+                    } else {
+                        " +\n".to_string()
+                    }
                 } else {
                     // Single line result - show inline
                     let marker = if is_error { " x " } else { " + " };
                     format!("{marker}{display_result}\n")
                 };
-                
+
                 self.streaming_text_buffer.push_str(&formatted_result);
                 self.update_streaming_message_live();
                 true
