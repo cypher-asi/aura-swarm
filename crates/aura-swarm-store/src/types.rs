@@ -163,6 +163,9 @@ pub struct Session {
     pub identity_id: IdentityId,
     /// Current session status.
     pub status: SessionStatus,
+    /// Per-session configuration for the harness runtime.
+    #[serde(default)]
+    pub config: SessionConfig,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// When the session was closed (if closed).
@@ -178,6 +181,54 @@ pub enum SessionStatus {
     Active = 1,
     /// Session has been closed.
     Closed = 2,
+}
+
+/// Per-session configuration for the harness runtime.
+///
+/// Stored alongside the session record so the gateway can construct
+/// a `session_init` message when proxying the WebSocket connection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// System prompt override for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Model identifier override (e.g., "claude-opus-4-6-20250514").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Maximum tokens per model response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Maximum agentic steps per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Workspace configuration for file operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceConfig>,
+    /// External tool definitions registered for this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_tools: Vec<ExternalToolDef>,
+}
+
+/// Workspace configuration for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Git repository URL to clone into the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo_url: Option<String>,
+    /// Git branch to check out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+/// External tool definition for session registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalToolDef {
+    /// Tool name.
+    pub name: String,
+    /// Tool description.
+    pub description: String,
+    /// JSON Schema for the tool's input.
+    pub input_schema: serde_json::Value,
 }
 
 impl SessionStatus {

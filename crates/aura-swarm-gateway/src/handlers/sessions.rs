@@ -9,10 +9,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use aura_swarm_auth::JwtValidator;
-use aura_swarm_control::{ControlPlane, Session, SessionStatus};
+use aura_swarm_control::{ControlPlane, Session, SessionConfig, SessionStatus};
 use aura_swarm_core::{AgentId, SessionId};
 
 use crate::auth::AuthUser;
@@ -72,6 +72,18 @@ pub struct ListSessionsResponse {
 }
 
 // =============================================================================
+// Request Types
+// =============================================================================
+
+/// Request body for creating a session.
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateSessionRequest {
+    /// Per-session configuration for the harness runtime.
+    #[serde(default)]
+    pub config: SessionConfig,
+}
+
+// =============================================================================
 // Handlers
 // =============================================================================
 
@@ -87,16 +99,18 @@ pub async fn create_session<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
+    body: Option<Json<CreateSessionRequest>>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let config = body.map_or_else(SessionConfig::default, |b| b.0.config);
 
     let session = state
         .control
-        .create_session(&user.user_id, &agent_id)
+        .create_session(&user.identity_id, &agent_id, config)
         .await?;
 
     let response = CreateSessionResponse {
@@ -127,7 +141,7 @@ where
 
     let session = state
         .control
-        .get_session(&user.user_id, &session_id)
+        .get_session(&user.identity_id, &session_id)
         .await?;
 
     Ok(Json(SessionResponse::from(session)))
@@ -151,7 +165,7 @@ where
 
     let sessions = state
         .control
-        .list_sessions(&user.user_id, &agent_id)
+        .list_sessions(&user.identity_id, &agent_id)
         .await?;
 
     let response = ListSessionsResponse {
@@ -179,7 +193,7 @@ where
 
     state
         .control
-        .close_session(&user.user_id, &session_id)
+        .close_session(&user.identity_id, &session_id)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

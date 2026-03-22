@@ -41,7 +41,8 @@ pub mod types;
 pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
 pub use types::{
-    Agent, AgentSpec, AgentState, EngineType, IsolationLevel, Session, SessionStatus, User,
+    Agent, AgentSpec, AgentState, EngineType, ExternalToolDef, IsolationLevel, Session,
+    SessionConfig, SessionStatus, User, WorkspaceConfig,
 };
 
 use aura_swarm_core::{AgentId, IdentityId, SessionId};

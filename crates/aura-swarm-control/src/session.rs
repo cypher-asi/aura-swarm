@@ -4,8 +4,8 @@
 //! retrieval, and closing of sessions. Sessions are the primary way users
 //! interact with their agents.
 
-use aura_swarm_core::{AgentId, SessionId, UserId};
-use aura_swarm_store::{Agent, AgentState, Session, SessionStatus, Store};
+use aura_swarm_core::{AgentId, IdentityId, SessionId};
+use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, SessionStatus, Store};
 use chrono::Utc;
 
 use crate::error::{ControlError, Result};
@@ -20,21 +20,22 @@ use crate::lifecycle;
 ///
 /// Returns an error if:
 /// - The agent is not found
-/// - The user is not the owner
+/// - The identity is not the owner
 /// - The agent is not in a state that can accept sessions
 pub fn create_session<S: Store>(
     store: &S,
-    user_id: &UserId,
+    identity_id: &IdentityId,
     agent_id: &AgentId,
+    config: SessionConfig,
 ) -> Result<(Session, Option<AgentState>)> {
     let agent = store
         .get_agent(agent_id)?
         .ok_or(ControlError::AgentNotFound(*agent_id))?;
 
     // Verify ownership
-    if agent.user_id != *user_id {
+    if agent.identity_id != *identity_id {
         return Err(ControlError::NotOwner {
-            user_id: *user_id,
+            identity_id: *identity_id,
             agent_id: *agent_id,
         });
     }
@@ -51,8 +52,9 @@ pub fn create_session<S: Store>(
     let session = Session {
         session_id: SessionId::generate(),
         agent_id: *agent_id,
-        user_id: *user_id,
+        identity_id: *identity_id,
         status: SessionStatus::Active,
+        config,
         created_at: Utc::now(),
         closed_at: None,
     };
@@ -87,19 +89,19 @@ fn determine_state_for_session(agent: &Agent) -> Result<Option<AgentState>> {
 ///
 /// Returns an error if:
 /// - The session is not found
-/// - The user is not the owner
+/// - The identity is not the owner
 pub fn get_session<S: Store>(
     store: &S,
-    user_id: &UserId,
+    identity_id: &IdentityId,
     session_id: &SessionId,
 ) -> Result<Session> {
     let session = store
         .get_session(session_id)?
         .ok_or(ControlError::SessionNotFound(*session_id))?;
 
-    if session.user_id != *user_id {
+    if session.identity_id != *identity_id {
         return Err(ControlError::NotOwner {
-            user_id: *user_id,
+            identity_id: *identity_id,
             agent_id: session.agent_id,
         });
     }
@@ -116,13 +118,13 @@ pub fn get_session<S: Store>(
 ///
 /// Returns an error if:
 /// - The session is not found
-/// - The user is not the owner
+/// - The identity is not the owner
 pub fn close_session<S: Store>(
     store: &S,
-    user_id: &UserId,
+    identity_id: &IdentityId,
     session_id: &SessionId,
 ) -> Result<bool> {
-    let session = get_session(store, user_id, session_id)?;
+    let session = get_session(store, identity_id, session_id)?;
 
     if session.status == SessionStatus::Closed {
         return Ok(false); // Already closed
@@ -154,19 +156,19 @@ pub fn close_session<S: Store>(
 ///
 /// Returns an error if:
 /// - The agent is not found
-/// - The user is not the owner
+/// - The identity is not the owner
 pub fn list_sessions<S: Store>(
     store: &S,
-    user_id: &UserId,
+    identity_id: &IdentityId,
     agent_id: &AgentId,
 ) -> Result<Vec<Session>> {
     let agent = store
         .get_agent(agent_id)?
         .ok_or(ControlError::AgentNotFound(*agent_id))?;
 
-    if agent.user_id != *user_id {
+    if agent.identity_id != *identity_id {
         return Err(ControlError::NotOwner {
-            user_id: *user_id,
+            identity_id: *identity_id,
             agent_id: *agent_id,
         });
     }
@@ -186,16 +188,16 @@ pub(crate) fn count_active_sessions<S: Store>(store: &S, agent_id: &AgentId) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_swarm_store::{AgentSpec, RocksStore};
+    use aura_swarm_store::{AgentSpec, RocksStore, SessionConfig};
     use tempfile::TempDir;
 
-    fn setup() -> (RocksStore, TempDir, UserId, Agent) {
+    fn setup() -> (RocksStore, TempDir, IdentityId, Agent) {
         let dir = TempDir::new().unwrap();
         let store = RocksStore::open(dir.path()).unwrap();
-        let user_id = UserId::from_bytes([1u8; 32]);
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
         let agent = Agent {
-            agent_id: AgentId::generate_deterministic(&user_id, "test-agent", 42),
-            user_id,
+            agent_id: AgentId::generate_deterministic(&identity_id, "test-agent", 42),
+            identity_id,
             name: "test-agent".to_string(),
             status: AgentState::Running,
             spec: AgentSpec::default(),
@@ -205,30 +207,34 @@ mod tests {
             error_message: None,
         };
         store.put_agent(&agent).unwrap();
-        (store, dir, user_id, agent)
+        (store, dir, identity_id, agent)
     }
 
     #[test]
     fn create_session_running_agent() {
-        let (store, _dir, user_id, agent) = setup();
+        let (store, _dir, identity_id, agent) = setup();
 
-        let (session, state_change) = create_session(&store, &user_id, &agent.agent_id).unwrap();
+        let (session, state_change) =
+            create_session(&store, &identity_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
 
         assert_eq!(session.agent_id, agent.agent_id);
-        assert_eq!(session.user_id, user_id);
+        assert_eq!(session.identity_id, identity_id);
         assert_eq!(session.status, SessionStatus::Active);
         assert!(state_change.is_none()); // No state change needed
     }
 
     #[test]
     fn create_session_idle_agent() {
-        let (store, _dir, user_id, mut agent) = setup();
+        let (store, _dir, identity_id, mut agent) = setup();
 
         // Set agent to Idle
         agent.status = AgentState::Idle;
         store.put_agent(&agent).unwrap();
 
-        let (session, state_change) = create_session(&store, &user_id, &agent.agent_id).unwrap();
+        let (session, state_change) =
+            create_session(&store, &identity_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
 
         assert_eq!(session.status, SessionStatus::Active);
         assert_eq!(state_change, Some(AgentState::Running));
@@ -240,13 +246,15 @@ mod tests {
 
     #[test]
     fn create_session_hibernating_agent() {
-        let (store, _dir, user_id, mut agent) = setup();
+        let (store, _dir, identity_id, mut agent) = setup();
 
         // Set agent to Hibernating
         agent.status = AgentState::Hibernating;
         store.put_agent(&agent).unwrap();
 
-        let (session, state_change) = create_session(&store, &user_id, &agent.agent_id).unwrap();
+        let (session, state_change) =
+            create_session(&store, &identity_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
 
         assert_eq!(session.status, SessionStatus::Active);
         assert_eq!(state_change, Some(AgentState::Running));
@@ -254,36 +262,40 @@ mod tests {
 
     #[test]
     fn create_session_not_owner() {
-        let (store, _dir, _user_id, agent) = setup();
-        let other_user = UserId::from_bytes([99u8; 32]);
+        let (store, _dir, _identity_id, agent) = setup();
+        let other_identity = IdentityId::from_uuid(uuid::Uuid::new_v4());
 
-        let result = create_session(&store, &other_user, &agent.agent_id);
+        let result =
+            create_session(&store, &other_identity, &agent.agent_id, SessionConfig::default());
 
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
     }
 
     #[test]
     fn create_session_not_runnable() {
-        let (store, _dir, user_id, mut agent) = setup();
+        let (store, _dir, identity_id, mut agent) = setup();
 
         // Set agent to Error state
         agent.status = AgentState::Error;
         store.put_agent(&agent).unwrap();
 
-        let result = create_session(&store, &user_id, &agent.agent_id);
+        let result =
+            create_session(&store, &identity_id, &agent.agent_id, SessionConfig::default());
 
         assert!(matches!(result, Err(ControlError::AgentNotRunnable(_))));
     }
 
     #[test]
     fn close_session_transitions_to_idle() {
-        let (store, _dir, user_id, agent) = setup();
+        let (store, _dir, identity_id, agent) = setup();
 
         // Create a session
-        let (session, _) = create_session(&store, &user_id, &agent.agent_id).unwrap();
+        let (session, _) =
+            create_session(&store, &identity_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
 
         // Close it
-        let closed = close_session(&store, &user_id, &session.session_id).unwrap();
+        let closed = close_session(&store, &identity_id, &session.session_id).unwrap();
         assert!(closed);
 
         // Verify session is closed
@@ -297,10 +309,10 @@ mod tests {
 
     #[test]
     fn list_sessions_verifies_ownership() {
-        let (store, _dir, _user_id, agent) = setup();
-        let other_user = UserId::from_bytes([99u8; 32]);
+        let (store, _dir, _identity_id, agent) = setup();
+        let other_identity = IdentityId::from_uuid(uuid::Uuid::new_v4());
 
-        let result = list_sessions(&store, &other_user, &agent.agent_id);
+        let result = list_sessions(&store, &other_identity, &agent.agent_id);
 
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
     }

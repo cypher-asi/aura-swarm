@@ -34,7 +34,7 @@
 //! use std::sync::Arc;
 //! use aura_swarm_control::{ControlPlane, ControlPlaneService, CreateAgentRequest};
 //! use aura_swarm_store::RocksStore;
-//! use aura_swarm_core::UserId;
+//! use aura_swarm_core::IdentityId;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Initialize store
@@ -44,9 +44,9 @@
 //! let control = ControlPlaneService::with_defaults(store);
 //!
 //! // Create an agent
-//! let user_id = UserId::from_bytes([0u8; 32]);
+//! let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
 //! let request = CreateAgentRequest::new("my-agent");
-//! let agent = control.create_agent(&user_id, request).await?;
+//! let agent = control.create_agent(&identity_id, request).await?;
 //!
 //! println!("Created agent: {}", agent.agent_id);
 //! # Ok(())
@@ -72,6 +72,7 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 
+pub mod billing;
 pub mod error;
 pub mod lifecycle;
 pub mod scheduler_client;
@@ -79,11 +80,14 @@ pub mod service;
 pub mod session;
 pub mod types;
 
+pub use billing::{BillingCheckError, BillingChecker, BillingConfig};
 pub use error::{ControlError, Result};
-pub use scheduler_client::{HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient};
+pub use scheduler_client::{
+    HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient,
+};
 pub use service::{ControlPlane, ControlPlaneService};
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 
 // Re-export commonly used types from dependencies for convenience
-pub use aura_swarm_core::{AgentId, SessionId, UserId};
-pub use aura_swarm_store::{Agent, AgentSpec, AgentState, Session, SessionStatus};
+pub use aura_swarm_core::{AgentId, IdentityId, SessionId};
+pub use aura_swarm_store::{Agent, AgentSpec, AgentState, Session, SessionConfig, SessionStatus};

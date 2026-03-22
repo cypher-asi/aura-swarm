@@ -6,10 +6,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_swarm_core::{AgentId, SessionId, UserId};
-use aura_swarm_store::{Agent, AgentState, Session, Store};
+use aura_swarm_core::{AgentId, IdentityId, SessionId};
+use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, Store};
 use chrono::Utc;
 
+use crate::billing::BillingChecker;
 use crate::error::{ControlError, Result};
 use crate::lifecycle;
 use crate::scheduler_client::SchedulerClient;
@@ -26,23 +27,27 @@ pub trait ControlPlane: Send + Sync {
     // Agent CRUD Operations
     // =========================================================================
 
-    /// Create a new agent for the given user.
+    /// Create a new agent for the given identity.
     ///
     /// # Errors
     ///
-    /// Returns `ControlError::QuotaExceeded` if the user has reached their limit.
-    async fn create_agent(&self, user_id: &UserId, request: CreateAgentRequest) -> Result<Agent>;
+    /// Returns `ControlError::QuotaExceeded` if the identity has reached their limit.
+    async fn create_agent(
+        &self,
+        identity_id: &IdentityId,
+        request: CreateAgentRequest,
+    ) -> Result<Agent>;
 
     /// Get an agent by ID, verifying ownership.
     ///
     /// # Errors
     ///
     /// Returns `ControlError::AgentNotFound` if the agent doesn't exist.
-    /// Returns `ControlError::NotOwner` if the user doesn't own the agent.
-    async fn get_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    /// Returns `ControlError::NotOwner` if the identity doesn't own the agent.
+    async fn get_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
-    /// List all agents for a user.
-    async fn list_agents(&self, user_id: &UserId) -> Result<Vec<Agent>>;
+    /// List all agents for an identity.
+    async fn list_agents(&self, identity_id: &IdentityId) -> Result<Vec<Agent>>;
 
     /// Delete an agent.
     ///
@@ -51,26 +56,26 @@ pub trait ControlPlane: Send + Sync {
     /// # Errors
     ///
     /// Returns `ControlError::InvalidState` if the agent is not stopped.
-    async fn delete_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<()>;
+    async fn delete_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<()>;
 
     // =========================================================================
     // Lifecycle Operations
     // =========================================================================
 
     /// Start an agent (transition from Stopped to Provisioning).
-    async fn start_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    async fn start_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
     /// Stop an agent gracefully.
-    async fn stop_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    async fn stop_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
     /// Restart an agent (stop then start).
-    async fn restart_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    async fn restart_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
     /// Hibernate an agent (save state, terminate pod).
-    async fn hibernate_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    async fn hibernate_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
     /// Wake a hibernating agent.
-    async fn wake_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
+    async fn wake_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent>;
 
     // =========================================================================
     // Session Operations
@@ -79,16 +84,25 @@ pub trait ControlPlane: Send + Sync {
     /// Create a new session for an agent.
     ///
     /// If the agent is hibernating, it will be automatically woken.
-    async fn create_session(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Session>;
+    async fn create_session(
+        &self,
+        identity_id: &IdentityId,
+        agent_id: &AgentId,
+        config: SessionConfig,
+    ) -> Result<Session>;
 
     /// Get a session by ID.
-    async fn get_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<Session>;
+    async fn get_session(&self, identity_id: &IdentityId, session_id: &SessionId) -> Result<Session>;
 
     /// Close a session.
-    async fn close_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<()>;
+    async fn close_session(&self, identity_id: &IdentityId, session_id: &SessionId) -> Result<()>;
 
     /// List all sessions for an agent.
-    async fn list_sessions(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Vec<Session>>;
+    async fn list_sessions(
+        &self,
+        identity_id: &IdentityId,
+        agent_id: &AgentId,
+    ) -> Result<Vec<Session>>;
 
     // =========================================================================
     // Operational
@@ -129,12 +143,16 @@ pub trait ControlPlane: Send + Sync {
 
 /// The main control plane service implementation.
 ///
-/// The service can optionally integrate with a scheduler for managing agent pods.
-/// If no scheduler is configured, lifecycle operations only update the local store.
-pub struct ControlPlaneService<S: Store, SC: SchedulerClient = crate::scheduler_client::NoopSchedulerClient> {
+/// The service can optionally integrate with a scheduler for managing agent pods
+/// and a billing checker for credit balance verification.
+pub struct ControlPlaneService<
+    S: Store,
+    SC: SchedulerClient = crate::scheduler_client::NoopSchedulerClient,
+> {
     store: Arc<S>,
     config: ControlConfig,
     scheduler: Option<Arc<SC>>,
+    billing: Option<Arc<BillingChecker>>,
 }
 
 impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClient> {
@@ -145,6 +163,7 @@ impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClie
             store,
             config,
             scheduler: None,
+            billing: None,
         }
     }
 
@@ -163,12 +182,11 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
             store,
             config,
             scheduler: Some(scheduler),
+            billing: None,
         }
     }
 
     /// Create a new control plane service with optional scheduler integration.
-    ///
-    /// Use this when the scheduler may or may not be configured at runtime.
     #[must_use]
     pub fn with_optional_scheduler(
         store: Arc<S>,
@@ -179,7 +197,29 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
             store,
             config,
             scheduler,
+            billing: None,
         }
+    }
+
+    /// Create a control plane service with all optional integrations.
+    #[must_use]
+    pub fn with_integrations(
+        store: Arc<S>,
+        config: ControlConfig,
+        scheduler: Option<Arc<SC>>,
+        billing: Option<Arc<BillingChecker>>,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            scheduler,
+            billing,
+        }
+    }
+
+    /// Set the billing checker after construction.
+    pub fn set_billing(&mut self, billing: Arc<BillingChecker>) {
+        self.billing = Some(billing);
     }
 
     /// Get a reference to the store.
@@ -200,11 +240,33 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
         self.scheduler.is_some()
     }
 
-    /// Verify that the user owns the given agent.
-    fn verify_ownership(user_id: &UserId, agent: &Agent) -> Result<()> {
-        if agent.user_id != *user_id {
+    /// Check if billing is configured.
+    #[must_use]
+    pub fn has_billing(&self) -> bool {
+        self.billing.is_some()
+    }
+
+    /// Check billing credits for agent creation.
+    async fn check_agent_credits(&self, identity_id: &IdentityId) -> Result<()> {
+        if let Some(billing) = &self.billing {
+            billing.check_agent_credits(&identity_id.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// Check billing credits for session creation.
+    async fn check_session_credits(&self, identity_id: &IdentityId) -> Result<()> {
+        if let Some(billing) = &self.billing {
+            billing.check_session_credits(&identity_id.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// Verify that the identity owns the given agent.
+    fn verify_ownership(identity_id: &IdentityId, agent: &Agent) -> Result<()> {
+        if agent.identity_id != *identity_id {
             return Err(ControlError::NotOwner {
-                user_id: *user_id,
+                identity_id: *identity_id,
                 agent_id: agent.agent_id,
             });
         }
@@ -212,13 +274,13 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
     }
 
     /// Get an agent and verify ownership.
-    fn get_and_verify(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
+    fn get_and_verify(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
         let agent = self
             .store
             .get_agent(agent_id)?
             .ok_or(ControlError::AgentNotFound(*agent_id))?;
 
-        Self::verify_ownership(user_id, &agent)?;
+        Self::verify_ownership(identity_id, &agent)?;
         Ok(agent)
     }
 
@@ -235,7 +297,7 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
     async fn schedule_agent_pod(&self, agent: &Agent) -> Result<()> {
         if let Some(scheduler) = &self.scheduler {
             scheduler
-                .schedule_agent(&agent.agent_id, &agent.user_id.to_hex(), &agent.spec)
+                .schedule_agent(&agent.agent_id, &agent.identity_id.to_string(), &agent.spec)
                 .await?;
             tracing::info!(
                 agent_id = %agent.agent_id,
@@ -269,28 +331,37 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
 }
 
 #[async_trait]
-impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for ControlPlaneService<S, SC> {
+impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
+    for ControlPlaneService<S, SC>
+{
     // =========================================================================
     // Agent CRUD Operations
     // =========================================================================
 
-    async fn create_agent(&self, user_id: &UserId, request: CreateAgentRequest) -> Result<Agent> {
+    async fn create_agent(
+        &self,
+        identity_id: &IdentityId,
+        request: CreateAgentRequest,
+    ) -> Result<Agent> {
+        // Check billing credits first
+        self.check_agent_credits(identity_id).await?;
+
         // Check quota
-        let count = self.store.count_agents_by_user(user_id)?;
+        let count = self.store.count_agents_by_identity(identity_id)?;
         if count >= self.config.max_agents_per_user {
             return Err(ControlError::QuotaExceeded {
-                user_id: *user_id,
+                identity_id: *identity_id,
                 limit: self.config.max_agents_per_user,
             });
         }
 
         let now = Utc::now();
         let spec = request.spec.unwrap_or_default();
-        let agent_id = AgentId::generate(user_id, &request.name);
+        let agent_id = AgentId::generate(identity_id, &request.name);
 
         let agent = Agent {
             agent_id,
-            user_id: *user_id,
+            identity_id: *identity_id,
             name: request.name,
             status: AgentState::Provisioning,
             spec,
@@ -311,18 +382,14 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
             );
             // Update status to Error with the error message
             self.store
-                .update_agent_error(
-                    &agent.agent_id,
-                    AgentState::Error,
-                    Some(e.to_string()),
-                )
+                .update_agent_error(&agent.agent_id, AgentState::Error, Some(e.to_string()))
                 .ok();
             return Err(e);
         }
 
         tracing::info!(
             agent_id = %agent.agent_id,
-            user_id = %user_id,
+            identity_id = %identity_id,
             name = %agent.name,
             "Created agent"
         );
@@ -330,16 +397,16 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(agent)
     }
 
-    async fn get_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        self.get_and_verify(user_id, agent_id)
+    async fn get_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
+        self.get_and_verify(identity_id, agent_id)
     }
 
-    async fn list_agents(&self, user_id: &UserId) -> Result<Vec<Agent>> {
-        Ok(self.store.list_agents_by_user(user_id)?)
+    async fn list_agents(&self, identity_id: &IdentityId) -> Result<Vec<Agent>> {
+        Ok(self.store.list_agents_by_identity(identity_id)?)
     }
 
-    async fn delete_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<()> {
-        let agent = self.get_and_verify(user_id, agent_id)?;
+    async fn delete_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<()> {
+        let agent = self.get_and_verify(identity_id, agent_id)?;
 
         // Can only delete stopped or error agents
         if !lifecycle::is_terminal(agent.status) {
@@ -360,7 +427,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
 
         tracing::info!(
             agent_id = %agent_id,
-            user_id = %user_id,
+            identity_id = %identity_id,
             "Deleted agent"
         );
 
@@ -371,8 +438,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
     // Lifecycle Operations
     // =========================================================================
 
-    async fn start_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+    async fn start_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
+        let mut agent = self.get_and_verify(identity_id, agent_id)?;
 
         // Can only start from Stopped state
         self.transition_state(&mut agent, AgentState::Provisioning)?;
@@ -395,8 +462,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(agent)
     }
 
-    async fn stop_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+    async fn stop_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
+        let mut agent = self.get_and_verify(identity_id, agent_id)?;
 
         // Close all active sessions
         let sessions = self.store.list_sessions_by_agent(agent_id)?;
@@ -427,9 +494,9 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(agent)
     }
 
-    async fn restart_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
+    async fn restart_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
         // Stop the agent (this will terminate the pod)
-        let mut agent = self.stop_agent(user_id, agent_id).await?;
+        let mut agent = self.stop_agent(identity_id, agent_id).await?;
 
         // Transition to Stopped state
         self.transition_state(&mut agent, AgentState::Stopped)?;
@@ -455,8 +522,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(agent)
     }
 
-    async fn hibernate_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+    async fn hibernate_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
+        let mut agent = self.get_and_verify(identity_id, agent_id)?;
 
         // Close all active sessions
         let sessions = self.store.list_sessions_by_agent(agent_id)?;
@@ -486,8 +553,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(agent)
     }
 
-    async fn wake_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+    async fn wake_agent(&self, identity_id: &IdentityId, agent_id: &AgentId) -> Result<Agent> {
+        let mut agent = self.get_and_verify(identity_id, agent_id)?;
 
         if !lifecycle::can_wake(agent.status) {
             return Err(ControlError::InvalidState {
@@ -523,8 +590,17 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
     // Session Operations
     // =========================================================================
 
-    async fn create_session(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Session> {
-        let (session, state_change) = session::create_session(&*self.store, user_id, agent_id)?;
+    async fn create_session(
+        &self,
+        identity_id: &IdentityId,
+        agent_id: &AgentId,
+        config: SessionConfig,
+    ) -> Result<Session> {
+        // Check billing credits first
+        self.check_session_credits(identity_id).await?;
+
+        let (session, state_change) =
+            session::create_session(&*self.store, identity_id, agent_id, config)?;
 
         tracing::info!(
             session_id = %session.session_id,
@@ -536,12 +612,12 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(session)
     }
 
-    async fn get_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<Session> {
-        session::get_session(&*self.store, user_id, session_id)
+    async fn get_session(&self, identity_id: &IdentityId, session_id: &SessionId) -> Result<Session> {
+        session::get_session(&*self.store, identity_id, session_id)
     }
 
-    async fn close_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<()> {
-        let closed = session::close_session(&*self.store, user_id, session_id)?;
+    async fn close_session(&self, identity_id: &IdentityId, session_id: &SessionId) -> Result<()> {
+        let closed = session::close_session(&*self.store, identity_id, session_id)?;
 
         if closed {
             tracing::info!(session_id = %session_id, "Closed session");
@@ -550,8 +626,12 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane for Control
         Ok(())
     }
 
-    async fn list_sessions(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Vec<Session>> {
-        session::list_sessions(&*self.store, user_id, agent_id)
+    async fn list_sessions(
+        &self,
+        identity_id: &IdentityId,
+        agent_id: &AgentId,
+    ) -> Result<Vec<Session>> {
+        session::list_sessions(&*self.store, identity_id, agent_id)
     }
 
     // =========================================================================
@@ -633,7 +713,7 @@ mod tests {
     fn setup() -> (
         ControlPlaneService<RocksStore, NoopSchedulerClient>,
         TempDir,
-        UserId,
+        IdentityId,
     ) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(RocksStore::open(dir.path()).unwrap());
@@ -642,35 +722,35 @@ mod tests {
             ..Default::default()
         };
         let service = ControlPlaneService::new(store, config);
-        let user_id = UserId::from_bytes([1u8; 32]);
-        (service, dir, user_id)
+        let identity_id = IdentityId::from_uuid(uuid::Uuid::new_v4());
+        (service, dir, identity_id)
     }
 
     #[tokio::test]
     async fn create_agent_success() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
 
         assert_eq!(agent.name, "test-agent");
-        assert_eq!(agent.user_id, user_id);
+        assert_eq!(agent.identity_id, identity_id);
         assert_eq!(agent.status, AgentState::Provisioning);
     }
 
     #[tokio::test]
     async fn create_agent_quota_exceeded() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         // Create max agents
         for i in 0..3 {
             let request = CreateAgentRequest::new(format!("agent-{i}"));
-            service.create_agent(&user_id, request).await.unwrap();
+            service.create_agent(&identity_id, request).await.unwrap();
         }
 
         // Try to create one more
         let request = CreateAgentRequest::new("agent-overflow");
-        let result = service.create_agent(&user_id, request).await;
+        let result = service.create_agent(&identity_id, request).await;
 
         assert!(matches!(
             result,
@@ -680,23 +760,23 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_not_owner() {
-        let (service, _dir, user_id) = setup();
-        let other_user = UserId::from_bytes([99u8; 32]);
+        let (service, _dir, identity_id) = setup();
+        let other_identity = IdentityId::from_uuid(uuid::Uuid::new_v4());
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
 
-        let result = service.get_agent(&other_user, &agent.agent_id).await;
+        let result = service.get_agent(&other_identity, &agent.agent_id).await;
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
     }
 
     #[tokio::test]
     async fn agent_lifecycle() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         // Create agent (starts in Provisioning)
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
         assert_eq!(agent.status, AgentState::Provisioning);
 
         // Simulate provisioning complete (normally done by scheduler)
@@ -707,13 +787,16 @@ mod tests {
 
         // Hibernate
         let agent = service
-            .hibernate_agent(&user_id, &agent.agent_id)
+            .hibernate_agent(&identity_id, &agent.agent_id)
             .await
             .unwrap();
         assert_eq!(agent.status, AgentState::Hibernating);
 
         // Wake (goes through Provisioning for scheduler)
-        let agent = service.wake_agent(&user_id, &agent.agent_id).await.unwrap();
+        let agent = service
+            .wake_agent(&identity_id, &agent.agent_id)
+            .await
+            .unwrap();
         assert_eq!(agent.status, AgentState::Provisioning);
 
         // Simulate provisioning complete
@@ -723,7 +806,10 @@ mod tests {
             .unwrap();
 
         // Stop
-        let agent = service.stop_agent(&user_id, &agent.agent_id).await.unwrap();
+        let agent = service
+            .stop_agent(&identity_id, &agent.agent_id)
+            .await
+            .unwrap();
         assert_eq!(agent.status, AgentState::Stopping);
 
         // Simulate stop complete
@@ -734,7 +820,7 @@ mod tests {
 
         // Delete
         service
-            .delete_agent(&user_id, &agent.agent_id)
+            .delete_agent(&identity_id, &agent.agent_id)
             .await
             .unwrap();
         assert!(service.store.get_agent(&agent.agent_id).unwrap().is_none());
@@ -742,10 +828,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_requires_stopped() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
 
         // Simulate running
         service
@@ -754,17 +840,17 @@ mod tests {
             .unwrap();
 
         // Try to delete while running
-        let result = service.delete_agent(&user_id, &agent.agent_id).await;
+        let result = service.delete_agent(&identity_id, &agent.agent_id).await;
         assert!(matches!(result, Err(ControlError::InvalidState { .. })));
     }
 
     #[tokio::test]
     async fn session_lifecycle() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         // Create and start agent
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -772,42 +858,49 @@ mod tests {
 
         // Create session
         let session = service
-            .create_session(&user_id, &agent.agent_id)
+            .create_session(
+                &identity_id,
+                &agent.agent_id,
+                aura_swarm_store::SessionConfig::default(),
+            )
             .await
             .unwrap();
         assert_eq!(session.status, aura_swarm_store::SessionStatus::Active);
 
         // Get session
         let retrieved = service
-            .get_session(&user_id, &session.session_id)
+            .get_session(&identity_id, &session.session_id)
             .await
             .unwrap();
         assert_eq!(retrieved.session_id, session.session_id);
 
         // List sessions
         let sessions = service
-            .list_sessions(&user_id, &agent.agent_id)
+            .list_sessions(&identity_id, &agent.agent_id)
             .await
             .unwrap();
         assert_eq!(sessions.len(), 1);
 
         // Close session
         service
-            .close_session(&user_id, &session.session_id)
+            .close_session(&identity_id, &session.session_id)
             .await
             .unwrap();
 
         // Agent should transition to Idle
-        let agent = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        let agent = service
+            .get_agent(&identity_id, &agent.agent_id)
+            .await
+            .unwrap();
         assert_eq!(agent.status, AgentState::Idle);
     }
 
     #[tokio::test]
     async fn heartbeat_updates_timestamp() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
 
         assert!(agent.last_heartbeat_at.is_none());
 
@@ -819,10 +912,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_endpoint_active() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -837,10 +930,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_endpoint_stopped() {
-        let (service, _dir, user_id) = setup();
+        let (service, _dir, identity_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let agent = service.create_agent(&identity_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Stopped)
