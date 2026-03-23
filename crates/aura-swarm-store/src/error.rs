@@ -20,3 +20,26 @@ pub enum StoreError {
     #[error("serialization error: {0}")]
     Serialization(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_not_found() {
+        let err = StoreError::NotFound;
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn display_database_error() {
+        let err = StoreError::Database("corruption".into());
+        assert!(err.to_string().contains("corruption"));
+    }
+
+    #[test]
+    fn display_serialization_error() {
+        let err = StoreError::Serialization("bad cbor".into());
+        assert!(err.to_string().contains("bad cbor"));
+    }
+}

@@ -632,4 +632,68 @@ mod tests {
         let other_id = UserId::from_uuid(uuid::Uuid::new_v4());
         assert!(store.get_user(&other_id).unwrap().is_none());
     }
+
+    #[test]
+    fn delete_agent_not_found() {
+        let (store, _dir) = create_test_store();
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "ghost", 1);
+
+        let result = store.delete_agent(&agent_id);
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn update_agent_status_not_found() {
+        let (store, _dir) = create_test_store();
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "ghost", 2);
+
+        let result = store.update_agent_status(&agent_id, AgentState::Idle);
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn delete_session_not_found() {
+        let (store, _dir) = create_test_store();
+        let session_id = SessionId::generate();
+
+        let result = store.delete_session(&session_id);
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn list_all_agents_multiple_users() {
+        let (store, _dir) = create_test_store();
+        let user1 = UserId::from_uuid(uuid::Uuid::new_v4());
+        let user2 = UserId::from_uuid(uuid::Uuid::new_v4());
+
+        let a1 = create_test_agent(&user1, "agent-u1");
+        let a2 = create_test_agent(&user2, "agent-u2");
+        store.put_agent(&a1).unwrap();
+        store.put_agent(&a2).unwrap();
+
+        let all = store.list_all_agents().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn update_agent_error_with_message() {
+        let (store, _dir) = create_test_store();
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent = create_test_agent(&user_id, "err-agent");
+        store.put_agent(&agent).unwrap();
+
+        store
+            .update_agent_error(
+                &agent.agent_id,
+                AgentState::Error,
+                Some("pod crash".to_string()),
+            )
+            .unwrap();
+
+        let updated = store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(updated.status, AgentState::Error);
+        assert_eq!(updated.error_message, Some("pod crash".to_string()));
+    }
 }

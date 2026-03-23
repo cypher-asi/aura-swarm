@@ -223,3 +223,91 @@ pub struct User {
     /// Last login timestamp.
     pub last_login_at: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_state_as_u8_roundtrip() {
+        let variants = [
+            AgentState::Provisioning,
+            AgentState::Running,
+            AgentState::Idle,
+            AgentState::Hibernating,
+            AgentState::Stopping,
+            AgentState::Stopped,
+            AgentState::Error,
+        ];
+        for state in variants {
+            let roundtripped = AgentState::from_u8(state.as_u8());
+            assert_eq!(roundtripped, Some(state));
+        }
+    }
+
+    #[test]
+    fn agent_state_from_invalid_u8() {
+        assert_eq!(AgentState::from_u8(0), None);
+        assert_eq!(AgentState::from_u8(255), None);
+    }
+
+    #[test]
+    fn session_status_serde_roundtrip() {
+        for status in [SessionStatus::Active, SessionStatus::Closed] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: SessionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn isolation_level_runtime_class() {
+        assert_eq!(IsolationLevel::Container.runtime_class(), None);
+        assert_eq!(IsolationLevel::MicroVM.runtime_class(), Some("kata-fc"));
+    }
+
+    #[test]
+    fn agent_spec_default() {
+        let spec = AgentSpec::default();
+        assert_eq!(spec.cpu_millicores, 500);
+        assert_eq!(spec.memory_mb, 512);
+        assert_eq!(spec.runtime_version, "latest");
+        assert!(spec.isolation.is_none());
+    }
+
+    #[test]
+    fn agent_serde_json_roundtrip() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate(&user_id, "roundtrip-test");
+        let now = chrono::Utc::now();
+
+        let agent = Agent {
+            agent_id,
+            user_id,
+            name: "my-agent".to_string(),
+            status: AgentState::Running,
+            spec: AgentSpec {
+                cpu_millicores: 1000,
+                memory_mb: 2048,
+                runtime_version: "v2".to_string(),
+                isolation: Some(IsolationLevel::MicroVM),
+            },
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: Some(now),
+            error_message: Some("test error".to_string()),
+        };
+
+        let json = serde_json::to_string(&agent).unwrap();
+        let parsed: Agent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.agent_id, agent.agent_id);
+        assert_eq!(parsed.user_id, agent.user_id);
+        assert_eq!(parsed.name, "my-agent");
+        assert_eq!(parsed.status, AgentState::Running);
+        assert_eq!(parsed.spec.cpu_millicores, 1000);
+        assert_eq!(parsed.spec.memory_mb, 2048);
+        assert_eq!(parsed.spec.runtime_version, "v2");
+        assert_eq!(parsed.error_message, Some("test error".to_string()));
+    }
+}

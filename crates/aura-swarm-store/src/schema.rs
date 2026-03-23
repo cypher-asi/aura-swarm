@@ -35,3 +35,24 @@ pub fn all_column_families() -> Vec<&'static str> {
         cf::USERS,
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_column_families_complete() {
+        let cfs = all_column_families();
+        assert_eq!(
+            cfs,
+            vec![
+                cf::AGENTS,
+                cf::AGENTS_BY_STATUS,
+                cf::AGENTS_BY_USER,
+                cf::SESSIONS,
+                cf::SESSIONS_BY_AGENT,
+                cf::USERS,
+            ]
+        );
+    }
+}
