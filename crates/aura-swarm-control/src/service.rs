@@ -959,4 +959,193 @@ mod tests {
             .unwrap();
         assert!(endpoint.is_none());
     }
+
+    #[tokio::test]
+    async fn get_agent_not_found() {
+        let (service, _dir, user_id) = setup();
+        let fake_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+
+        let result = service.get_agent(&user_id, &fake_id).await;
+        assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn list_agents_empty() {
+        let (service, _dir, user_id) = setup();
+
+        let agents = service.list_agents(&user_id).await.unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_multiple() {
+        let (service, _dir, user_id) = setup();
+
+        for i in 0..3 {
+            let request = CreateAgentRequest::new(format!("agent-{i}"));
+            service.create_agent(&user_id, request).await.unwrap();
+        }
+
+        let agents = service.list_agents(&user_id).await.unwrap();
+        assert_eq!(agents.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn start_agent_from_stopped() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Stopped)
+            .unwrap();
+
+        let agent = service
+            .start_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(agent.status, AgentState::Provisioning);
+    }
+
+    #[tokio::test]
+    async fn start_agent_invalid_state_from_running() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let result = service.start_agent(&user_id, &agent.agent_id).await;
+        assert!(matches!(result, Err(ControlError::InvalidState { .. })));
+    }
+
+    #[tokio::test]
+    async fn stop_agent_from_running() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let agent = service
+            .stop_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(agent.status, AgentState::Stopping);
+    }
+
+    #[tokio::test]
+    async fn restart_agent_from_running() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let agent = service
+            .restart_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(agent.status, AgentState::Provisioning);
+    }
+
+    #[tokio::test]
+    async fn hibernate_agent_invalid_state() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        assert_eq!(agent.status, AgentState::Provisioning);
+
+        let result = service.hibernate_agent(&user_id, &agent.agent_id).await;
+        assert!(matches!(result, Err(ControlError::InvalidState { .. })));
+    }
+
+    #[tokio::test]
+    async fn wake_agent_invalid_state() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let result = service.wake_agent(&user_id, &agent.agent_id).await;
+        assert!(matches!(result, Err(ControlError::InvalidState { .. })));
+    }
+
+    #[tokio::test]
+    async fn update_status_internal_success() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+
+        let updated = service
+            .get_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(updated.status, AgentState::Running);
+    }
+
+    #[tokio::test]
+    async fn update_status_internal_not_found() {
+        let (service, _dir, _user_id) = setup();
+        let fake_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+
+        let result = service
+            .update_agent_status_internal(&fake_id, AgentState::Running, None)
+            .await;
+        assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn update_status_internal_with_error_message() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Error,
+                Some("pod crashed".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let updated = service
+            .get_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(updated.status, AgentState::Error);
+        assert_eq!(updated.error_message.as_deref(), Some("pod crashed"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_missing_agent() {
+        let (service, _dir, _user_id) = setup();
+        let fake_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+
+        let result = service.process_heartbeat(&fake_id).await;
+        assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
 }

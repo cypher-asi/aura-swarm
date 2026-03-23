@@ -316,4 +316,76 @@ mod tests {
 
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
     }
+
+    #[test]
+    fn create_session_stopped_agent() {
+        let (store, _dir, user_id, mut agent) = setup();
+
+        agent.status = AgentState::Stopped;
+        store.put_agent(&agent).unwrap();
+
+        let (session, state_change) =
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
+
+        assert_eq!(session.status, SessionStatus::Active);
+        assert_eq!(state_change, Some(AgentState::Provisioning));
+
+        let updated_agent = store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(updated_agent.status, AgentState::Provisioning);
+    }
+
+    #[test]
+    fn get_session_not_found() {
+        let (store, _dir, user_id, _agent) = setup();
+        let fake_session_id = SessionId::generate();
+
+        let result = get_session(&store, &user_id, &fake_session_id);
+        assert!(matches!(result, Err(ControlError::SessionNotFound(_))));
+    }
+
+    #[test]
+    fn get_session_wrong_owner() {
+        let (store, _dir, user_id, agent) = setup();
+        let other_user = UserId::from_uuid(uuid::Uuid::new_v4());
+
+        let (session, _) =
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
+
+        let result = get_session(&store, &other_user, &session.session_id);
+        assert!(matches!(result, Err(ControlError::NotOwner { .. })));
+    }
+
+    #[test]
+    fn close_session_already_closed() {
+        let (store, _dir, user_id, agent) = setup();
+
+        let (session, _) =
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
+
+        let closed = close_session(&store, &user_id, &session.session_id).unwrap();
+        assert!(closed);
+
+        let closed_again = close_session(&store, &user_id, &session.session_id).unwrap();
+        assert!(!closed_again);
+    }
+
+    #[test]
+    fn close_session_multiple_active() {
+        let (store, _dir, user_id, agent) = setup();
+
+        let (session1, _) =
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
+        let (_session2, _) =
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
+                .unwrap();
+
+        close_session(&store, &user_id, &session1.session_id).unwrap();
+
+        let updated_agent = store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(updated_agent.status, AgentState::Running);
+    }
 }

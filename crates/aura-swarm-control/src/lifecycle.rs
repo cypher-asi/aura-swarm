@@ -235,4 +235,30 @@ mod tests {
         assert!(transitions.contains(&AgentState::Error));
         assert!(!transitions.contains(&AgentState::Provisioning));
     }
+
+    #[test]
+    fn valid_transitions_from_all_states() {
+        use AgentState::*;
+        use std::collections::HashSet;
+
+        let cases: Vec<(AgentState, Vec<AgentState>)> = vec![
+            (Provisioning, vec![Running, Error]),
+            (Running, vec![Idle, Hibernating, Stopping, Error]),
+            (Idle, vec![Running, Hibernating, Stopping, Error]),
+            (Hibernating, vec![Running, Provisioning, Stopping, Error]),
+            (Stopping, vec![Stopped, Error]),
+            (Stopped, vec![Provisioning]),
+            (Error, vec![Stopped, Provisioning]),
+        ];
+
+        for (state, expected) in cases {
+            let actual: HashSet<AgentState> =
+                valid_transitions_from(state).into_iter().collect();
+            let expected: HashSet<AgentState> = expected.into_iter().collect();
+            assert_eq!(
+                actual, expected,
+                "Mismatch for transitions from {state:?}"
+            );
+        }
+    }
 }

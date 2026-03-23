@@ -168,4 +168,119 @@ mod tests {
             409
         );
     }
+
+    #[test]
+    fn all_error_variants_status_codes() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
+        let session_id = SessionId::generate();
+
+        let cases: Vec<(ControlError, u16)> = vec![
+            (ControlError::AgentNotFound(agent_id), 404),
+            (ControlError::SessionNotFound(session_id), 404),
+            (
+                ControlError::QuotaExceeded {
+                    user_id,
+                    limit: 10,
+                },
+                429,
+            ),
+            (
+                ControlError::NotOwner {
+                    user_id,
+                    agent_id,
+                },
+                403,
+            ),
+            (
+                ControlError::InvalidState {
+                    agent_id,
+                    from: AgentState::Running,
+                    to: AgentState::Provisioning,
+                },
+                409,
+            ),
+            (ControlError::AgentNotRunnable(agent_id), 409),
+            (ControlError::SessionAlreadyActive(agent_id), 409),
+            (
+                ControlError::InsufficientCredits {
+                    balance: 0,
+                    required: 100,
+                },
+                402,
+            ),
+            (ControlError::BillingAccountNotFound, 402),
+            (
+                ControlError::Store(aura_swarm_store::StoreError::Database(
+                    "test".to_string(),
+                )),
+                500,
+            ),
+            (
+                ControlError::Auth(aura_swarm_auth::AuthError::TokenExpired),
+                401,
+            ),
+            (ControlError::Internal("test".to_string()), 500),
+        ];
+
+        for (error, expected_code) in cases {
+            assert_eq!(
+                error.http_status_code(),
+                expected_code,
+                "Wrong status code for {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retriable_all_variants() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
+        let session_id = SessionId::generate();
+
+        let retriable = vec![
+            ControlError::Store(aura_swarm_store::StoreError::Database(
+                "test".to_string(),
+            )),
+            ControlError::Internal("test".to_string()),
+        ];
+        for error in &retriable {
+            assert!(
+                error.is_retriable(),
+                "{error} should be retriable"
+            );
+        }
+
+        let not_retriable = vec![
+            ControlError::AgentNotFound(agent_id),
+            ControlError::SessionNotFound(session_id),
+            ControlError::QuotaExceeded {
+                user_id,
+                limit: 10,
+            },
+            ControlError::NotOwner {
+                user_id,
+                agent_id,
+            },
+            ControlError::InvalidState {
+                agent_id,
+                from: AgentState::Running,
+                to: AgentState::Provisioning,
+            },
+            ControlError::AgentNotRunnable(agent_id),
+            ControlError::SessionAlreadyActive(agent_id),
+            ControlError::InsufficientCredits {
+                balance: 0,
+                required: 100,
+            },
+            ControlError::BillingAccountNotFound,
+            ControlError::Auth(aura_swarm_auth::AuthError::TokenExpired),
+        ];
+        for error in &not_retriable {
+            assert!(
+                !error.is_retriable(),
+                "{error} should NOT be retriable"
+            );
+        }
+    }
 }
