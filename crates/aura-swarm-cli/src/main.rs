@@ -245,7 +245,7 @@ async fn run_event_loop(
                 if app.input_mode == InputMode::Normal && !app.is_streaming {
                     if let Err(e) = app.refresh_agents().await {
                         app.refresh_error = Some(format!("Refresh failed: {}", e));
-                        tracing::warn!("Failed to refresh agents: {}", e);
+                        tracing::warn!(error = %e, "Failed to refresh agents");
                     } else {
                         app.refresh_error = None;
                     }
