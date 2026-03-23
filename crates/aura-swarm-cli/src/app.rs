@@ -499,7 +499,7 @@ impl App {
 
         // Load new agent's messages from cache
         if let Some(agent) = self.agents.get(new_index) {
-            self.load_messages_from_cache(&agent.agent_id.clone());
+            self.load_messages_from_cache(&agent.agent_id);
         }
     }
 
