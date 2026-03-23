@@ -410,4 +410,30 @@ mod tests {
         let result = UserId::from_str("not-a-uuid");
         assert!(matches!(result, Err(IdError::InvalidUuid)));
     }
+
+    #[test]
+    fn agent_id_from_invalid_hex_odd_length() {
+        let result = AgentId::from_hex("abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_id_from_invalid_hex_non_hex() {
+        let result = AgentId::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_id_from_invalid_string() {
+        let result = SessionId::from_str("not-a-uuid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn user_id_display_matches_parse() {
+        let id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let display = id.to_string();
+        let parsed = UserId::from_str(&display).unwrap();
+        assert_eq!(id, parsed);
+    }
 }

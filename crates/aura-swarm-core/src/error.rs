@@ -27,3 +27,24 @@ pub enum CoreError {
     #[error("internal error: {0}")]
     Internal(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::UserId;
+
+    #[test]
+    fn display_agent_not_found() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate(&user_id, "test");
+        let err = CoreError::AgentNotFound(agent_id);
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn display_session_not_found() {
+        let session_id = SessionId::generate();
+        let err = CoreError::SessionNotFound(session_id);
+        assert!(err.to_string().contains("not found"));
+    }
+}
