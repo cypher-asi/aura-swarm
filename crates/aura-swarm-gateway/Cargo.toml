@@ -46,10 +46,14 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 aura-swarm-store = { path = "../aura-swarm-store" }
+aura-swarm-auth = { path = "../aura-swarm-auth", features = ["test-utils"] }
+aura-swarm-control = { path = "../aura-swarm-control" }
+aura-swarm-core = { path = "../aura-swarm-core" }
 tokio = { workspace = true, features = ["test-util"] }
 axum-test = "15"
 reqwest = { workspace = true }
 uuid = { workspace = true }
+serde_json.workspace = true
 
 [lints]
 workspace = true
