@@ -1,8 +1,7 @@
 //! Control plane for aura-swarm agent lifecycle management.
 //!
 //! This crate provides the core business logic for managing agent lifecycles
-//! and sessions. It coordinates between the storage layer and (eventually)
-//! the scheduler.
+//! and sessions. It coordinates between the storage layer and the scheduler.
 //!
 //! # Architecture
 //!

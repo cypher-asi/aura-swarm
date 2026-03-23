@@ -5,6 +5,7 @@
 //! depend on these types to ensure protocol consistency.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 

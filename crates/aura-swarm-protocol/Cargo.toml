@@ -1,5 +1,6 @@
 [package]
 name = "aura-swarm-protocol"
+description = "Shared WebSocket protocol types for aura-swarm client/harness communication"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
