@@ -173,26 +173,26 @@ fn read_password_raw(stdout: &mut io::Stdout) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_token_flag_wins() {
-        let result = resolve_token(Some("my-token".to_string()));
+    #[tokio::test]
+    async fn resolve_token_flag_wins() {
+        let result = resolve_token(Some("my-token".to_string())).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "my-token");
     }
 
-    #[test]
-    fn resolve_token_flag_wins_over_stored() {
-        let result = resolve_token(Some("explicit-tok".to_string()));
+    #[tokio::test]
+    async fn resolve_token_flag_wins_over_stored() {
+        let result = resolve_token(Some("explicit-tok".to_string())).await;
         assert_eq!(result.unwrap(), "explicit-tok");
     }
 
-    #[test]
-    fn resolve_token_none_without_stored_fails() {
+    #[tokio::test]
+    async fn resolve_token_none_without_stored_fails() {
         // Without stored credentials, resolve_token(None) should error.
         // This test may pass or fail depending on whether credentials
         // are stored on the machine - we just check the flag path above.
         // For safety, only assert the error message format if it does fail.
-        if let Err(e) = resolve_token(None) {
+        if let Err(e) = resolve_token(None).await {
             let msg = e.to_string();
             assert!(
                 msg.contains("Not authenticated"),

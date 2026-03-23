@@ -42,7 +42,7 @@
 //!     jwks_refresh_seconds: 300,
 //! };
 //!
-//! let validator = JwksValidator::new(config);
+//! let validator = JwksValidator::new(config)?;
 //!
 //! // In a request handler:
 //! let token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...";

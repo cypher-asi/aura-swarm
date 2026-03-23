@@ -46,7 +46,7 @@
 //! // Initialize dependencies
 //! let store = Arc::new(RocksStore::open("/tmp/aura-swarm")?);
 //! let control = Arc::new(ControlPlaneService::with_defaults(store));
-//! let jwt_validator = Arc::new(JwksValidator::new(AuthConfig::default()));
+//! let jwt_validator = Arc::new(JwksValidator::new(AuthConfig::default())?);
 //!
 //! // Create gateway state
 //! let config = GatewayConfig::default();

@@ -33,18 +33,25 @@ pub enum InboundMessage {
 /// Payload for `session_init`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionInit {
+    /// Optional system prompt for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Optional model identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional maximum tokens per response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Optional maximum number of turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// Optional workspace path or root directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Optional authentication token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// External tools registered for this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_tools: Vec<ExternalToolDef>,
 }
@@ -52,8 +59,11 @@ pub struct SessionInit {
 /// External tool definition for session registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalToolDef {
+    /// Tool name used in protocol messages.
     pub name: String,
+    /// Human-readable description for the model.
     pub description: String,
+    /// JSON Schema describing the tool's input arguments.
     pub input_schema: serde_json::Value,
 }
 
@@ -69,25 +79,33 @@ pub enum OutboundMessage {
     SessionReady(SessionReady),
     /// Start of an assistant message (turn).
     AssistantMessageStart {
+        /// Identifier for this assistant message.
         message_id: String,
     },
     /// Incremental text content.
     TextDelta {
+        /// UTF-8 text chunk appended to the assistant reply.
         text: String,
     },
     /// Incremental thinking content.
     ThinkingDelta {
+        /// UTF-8 chunk of the model's reasoning stream.
         thinking: String,
     },
     /// A tool use has started.
     ToolUseStart {
+        /// Unique id for this tool invocation.
         id: String,
+        /// Registered name of the tool.
         name: String,
     },
     /// Result of a tool execution.
     ToolResult {
+        /// Name of the tool that produced this result.
         name: String,
+        /// Serialized tool output or error text.
         result: String,
+        /// True when `result` represents a tool failure.
         is_error: bool,
     },
     /// End of an assistant message (turn complete).
@@ -101,23 +119,31 @@ pub enum OutboundMessage {
 /// Payload for `session_ready`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionReady {
+    /// Server-assigned session identifier.
     pub session_id: String,
+    /// Built-in tools available in this session.
     pub tools: Vec<ToolInfo>,
 }
 
 /// Minimal tool info in the session_ready response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
+    /// Tool identifier.
     pub name: String,
+    /// Short description for the model.
     pub description: String,
 }
 
 /// Payload for `assistant_message_end`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessageEnd {
+    /// Identifier for this assistant message (turn).
     pub message_id: String,
+    /// Why generation stopped (e.g. `end_turn`).
     pub stop_reason: String,
+    /// Token usage for this turn.
     pub usage: SessionUsage,
+    /// Files created, modified, or deleted during this turn.
     #[serde(default)]
     pub files_changed: FilesChanged,
 }
@@ -125,16 +151,23 @@ pub struct AssistantMessageEnd {
 /// Token usage information.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionUsage {
+    /// Input tokens for this reporting period.
     pub input_tokens: u64,
+    /// Output tokens for this reporting period.
     pub output_tokens: u64,
+    /// Running total of input tokens for the session.
     #[serde(default)]
     pub cumulative_input_tokens: u64,
+    /// Running total of output tokens for the session.
     #[serde(default)]
     pub cumulative_output_tokens: u64,
+    /// Approximate fraction of the context window in use.
     #[serde(default)]
     pub context_utilization: f32,
+    /// Model that produced this usage.
     #[serde(default)]
     pub model: String,
+    /// API provider name (e.g. anthropic).
     #[serde(default)]
     pub provider: String,
 }
@@ -142,10 +175,13 @@ pub struct SessionUsage {
 /// Summary of file mutations during a turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FilesChanged {
+    /// Paths of files created during the turn.
     #[serde(default)]
     pub created: Vec<String>,
+    /// Paths of files modified during the turn.
     #[serde(default)]
     pub modified: Vec<String>,
+    /// Paths of files deleted during the turn.
     #[serde(default)]
     pub deleted: Vec<String>,
 }
@@ -153,8 +189,11 @@ pub struct FilesChanged {
 /// Error message payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorMsg {
+    /// Stable machine-readable error code.
     pub code: String,
+    /// Human-readable error message.
     pub message: String,
+    /// Whether the client may retry or continue the session.
     pub recoverable: bool,
 }
 
@@ -165,16 +204,22 @@ pub struct ErrorMsg {
 /// Tool callback request from harness to client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallbackRequest {
+    /// Correlates this request with the client's [`ToolCallbackResponse`].
     pub callback_id: String,
+    /// Name of the external tool to invoke.
     pub tool_name: String,
+    /// JSON arguments passed to the tool.
     pub input: serde_json::Value,
 }
 
 /// Tool callback response from client to harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallbackResponse {
+    /// Must match the `callback_id` from the corresponding request.
     pub callback_id: String,
+    /// Tool output text or serialized error detail.
     pub result: String,
+    /// When true, `result` describes a tool or execution error.
     pub is_error: bool,
 }
 
