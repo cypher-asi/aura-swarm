@@ -14,6 +14,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85.0"
 license = "MIT"
 authors = ["Aura Team"]
 
@@ -60,5 +61,5 @@ tempfile = "3"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
+all = "deny"
 pedantic = "warn"
