@@ -301,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize billing reporter if configured
     let billing_config = SchedulerBillingConfig::from_env();
     let billing_reporter = if billing_config.is_configured() {
-        let reporter = Arc::new(ComputeUsageReporter::new(billing_config.clone()));
+        let reporter = Arc::new(ComputeUsageReporter::new(billing_config.clone())?);
         tracing::info!(
             url = %billing_config.url,
             report_interval_seconds = billing_config.report_interval_seconds,

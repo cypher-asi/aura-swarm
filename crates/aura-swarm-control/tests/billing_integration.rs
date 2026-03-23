@@ -81,7 +81,7 @@ fn billing_config_is_configured() {
 #[tokio::test]
 async fn billing_checker_disabled_allows_all() {
     let config = BillingConfig::default(); // No API key = disabled
-    let checker = BillingChecker::new(config);
+    let checker = BillingChecker::new(config).unwrap();
 
     assert!(!checker.is_enabled());
 
@@ -167,7 +167,7 @@ mod live {
             fail_closed: true,
         };
 
-        let checker = BillingChecker::new(config);
+        let checker = BillingChecker::new(config).unwrap();
         assert!(checker.is_enabled());
 
         // Should succeed with sufficient balance
@@ -197,7 +197,7 @@ mod live {
             fail_closed: true,
         };
 
-        let checker = BillingChecker::new(config);
+        let checker = BillingChecker::new(config).unwrap();
 
         // Should fail for agent (requires 100)
         let result = checker.check_agent_credits(&user_uuid).await;
@@ -232,7 +232,7 @@ mod live {
             fail_closed: true,
         };
 
-        let billing = Arc::new(BillingChecker::new(billing_config));
+        let billing = Arc::new(BillingChecker::new(billing_config).unwrap());
         let (store, _temp_dir) = setup_store();
         let config = ControlConfig::default();
 
@@ -264,7 +264,7 @@ mod live {
             fail_closed: true,
         };
 
-        let billing = Arc::new(BillingChecker::new(billing_config));
+        let billing = Arc::new(BillingChecker::new(billing_config).unwrap());
         let (store, _temp_dir) = setup_store();
         let config = ControlConfig::default();
 
@@ -300,7 +300,7 @@ mod live {
             fail_closed: true,
         };
 
-        let billing = Arc::new(BillingChecker::new(billing_config));
+        let billing = Arc::new(BillingChecker::new(billing_config).unwrap());
         let (store, _temp_dir) = setup_store();
         let config = ControlConfig::default();
 

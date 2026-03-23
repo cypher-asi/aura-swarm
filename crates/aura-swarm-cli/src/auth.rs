@@ -91,7 +91,7 @@ pub async fn login_interactive(zos_url: &str) -> anyhow::Result<String> {
         ..AuthConfig::default()
     };
 
-    let client = ZosClient::new(config);
+    let client = ZosClient::new(config)?;
 
     // Prompt email
     print!("Email: ");

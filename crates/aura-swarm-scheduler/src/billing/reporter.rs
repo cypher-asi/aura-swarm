@@ -44,23 +44,29 @@ struct PodTrackingInfo {
 
 impl ComputeUsageReporter {
     /// Create a new compute usage reporter.
-    #[must_use]
-    pub fn new(config: SchedulerBillingConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReportError::Client` if the billing client cannot be created.
+    pub fn new(config: SchedulerBillingConfig) -> Result<Self, ReportError> {
         let options = ClientOptions::with_service_name("aura-scheduler");
         let client = ZBillingClient::with_options(&config.url, &config.api_key, options)
-            .expect("failed to create billing client");
+            .map_err(|e| ReportError::Client(format!("failed to create billing client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             pod_tracking: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     /// Create a reporter wrapped in an Arc.
-    #[must_use]
-    pub fn new_shared(config: SchedulerBillingConfig) -> Arc<Self> {
-        Arc::new(Self::new(config))
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReportError::Client` if the billing client cannot be created.
+    pub fn new_shared(config: SchedulerBillingConfig) -> Result<Arc<Self>, ReportError> {
+        Ok(Arc::new(Self::new(config)?))
     }
 
     /// Check if billing is enabled and configured.
@@ -214,7 +220,7 @@ mod tests {
     #[test]
     fn register_and_unregister_pod() {
         let config = SchedulerBillingConfig::default();
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         reporter.register_pod("agent-1", "user-1", 500, 512);
         assert_eq!(reporter.tracked_pod_count(), 1);
@@ -227,7 +233,7 @@ mod tests {
     fn report_interval() {
         let mut config = SchedulerBillingConfig::default();
         config.report_interval_seconds = 60;
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         assert_eq!(reporter.report_interval(), Duration::from_secs(60));
     }
@@ -235,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_reporter_report_returns_zero() {
         let config = SchedulerBillingConfig::default();
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
         assert!(!reporter.is_enabled());
 
         let count = reporter.report_all_usage().await;
@@ -245,7 +251,7 @@ mod tests {
     #[test]
     fn register_duplicate_pod() {
         let config = SchedulerBillingConfig::default();
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         reporter.register_pod("agent-1", "user-1", 500, 512);
         reporter.register_pod("agent-1", "user-1", 1000, 1024);
@@ -255,7 +261,7 @@ mod tests {
     #[test]
     fn unregister_nonexistent() {
         let config = SchedulerBillingConfig::default();
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         reporter.unregister_pod("never-registered");
         assert_eq!(reporter.tracked_pod_count(), 0);

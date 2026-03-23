@@ -296,7 +296,7 @@ fn extract_host(url: &str) -> Option<&str> {
 fn generate_ws_key() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is always after UNIX_EPOCH")
         .as_nanos();
     base64_encode(&nanos.to_le_bytes()[..16])
 }

@@ -61,10 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(path = %data_dir, "Opening RocksDB store");
     let store = Arc::new(RocksStore::open(&data_dir)?);
 
-    let scheduler_client = scheduler_url.map(|url| {
-        tracing::info!(scheduler_url = %url, "Scheduler integration enabled");
-        Arc::new(HttpSchedulerClient::new(url))
-    });
+    let scheduler_client = match scheduler_url {
+        Some(url) => {
+            tracing::info!(scheduler_url = %url, "Scheduler integration enabled");
+            Some(Arc::new(HttpSchedulerClient::new(url)?))
+        }
+        None => None,
+    };
 
     if scheduler_client.is_none() {
         tracing::warn!("No SCHEDULER_URL set - running without scheduler integration");
@@ -75,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let billing_config = ControlBillingConfig::from_env();
         if billing_config.is_configured() {
             tracing::info!(url = %billing_config.url, "Control plane billing checker enabled");
-            Some(Arc::new(BillingChecker::new(billing_config)))
+            Some(Arc::new(BillingChecker::new(billing_config)?))
         } else {
             tracing::info!("Control plane billing checker not configured (no Z_BILLING_API_KEY)");
             None
@@ -109,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             audience: auth_audience,
             jwks_refresh_seconds: 300,
         };
-        Arc::new(JwksValidator::new(auth_config))
+        Arc::new(JwksValidator::new(auth_config)?)
     };
     tracing::info!("JWT validator initialized");
 

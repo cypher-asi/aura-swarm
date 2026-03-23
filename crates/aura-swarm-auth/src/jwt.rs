@@ -85,10 +85,13 @@ pub struct JwksValidator {
 
 impl JwksValidator {
     /// Create a new JWKS-based validator.
-    #[must_use]
-    pub fn new(config: AuthConfig) -> Self {
-        let jwks = JwksProvider::new(config.clone());
-        Self { config, jwks }
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError::Internal` if the HTTP client cannot be created.
+    pub fn new(config: AuthConfig) -> Result<Self> {
+        let jwks = JwksProvider::new(config.clone())?;
+        Ok(Self { config, jwks })
     }
 
     /// Get a reference to the JWKS provider for manual operations.

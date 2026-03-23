@@ -50,14 +50,15 @@ impl GatewayClient {
     }
 
     /// Build headers for authenticated requests.
-    fn auth_headers(&self) -> HeaderMap {
+    fn auth_headers(&self) -> Result<HeaderMap, ClientError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .map_err(|e| ClientError::Parse(format!("invalid authorization header: {e}")))?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers
+        Ok(headers)
     }
 
     /// Handle API error responses.
@@ -81,7 +82,7 @@ impl GatewayClient {
         let response = self
             .client
             .get(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -113,7 +114,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .json(&request)
             .send()
             .await?;
@@ -137,7 +138,7 @@ impl GatewayClient {
         let response = self
             .client
             .delete(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -155,7 +156,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -178,7 +179,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -201,7 +202,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -224,7 +225,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -247,7 +248,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -277,7 +278,7 @@ impl GatewayClient {
         let response = self
             .client
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -300,7 +301,7 @@ impl GatewayClient {
         let response = self
             .client
             .delete(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 

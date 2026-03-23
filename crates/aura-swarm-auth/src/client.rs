@@ -51,17 +51,16 @@ pub struct ZosClient {
 impl ZosClient {
     /// Create a new zOS client with the given configuration.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the HTTP client cannot be created (should never happen with default TLS).
-    #[must_use]
-    pub fn new(config: AuthConfig) -> Self {
+    /// Returns `AuthError::Internal` if the HTTP client cannot be created.
+    pub fn new(config: AuthConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to create HTTP client");
+            .map_err(|e| AuthError::Internal(format!("failed to create HTTP client: {e}")))?;
 
-        Self { config, client }
+        Ok(Self { config, client })
     }
 
     /// Authenticate with email and password.
@@ -175,6 +174,6 @@ mod tests {
     #[test]
     fn client_creation() {
         let config = AuthConfig::default();
-        let _client = ZosClient::new(config);
+        let _client = ZosClient::new(config).unwrap();
     }
 }

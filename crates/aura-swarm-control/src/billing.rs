@@ -83,18 +83,24 @@ pub struct BillingChecker {
 
 impl BillingChecker {
     /// Create a new billing checker from configuration.
-    #[must_use]
-    pub fn new(config: BillingConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `BillingCheckError::ServiceError` if the HTTP client cannot be created.
+    pub fn new(config: BillingConfig) -> Result<Self, BillingCheckError> {
         let options = ClientOptions::with_service_name("aura-control");
         let client = ZBillingClient::with_options(&config.url, &config.api_key, options)
-            .expect("failed to create billing client");
-        Self { client, config }
+            .map_err(|e| BillingCheckError::ServiceError(format!("failed to create billing client: {e}")))?;
+        Ok(Self { client, config })
     }
 
     /// Create a billing checker wrapped in an Arc.
-    #[must_use]
-    pub fn new_shared(config: BillingConfig) -> Arc<Self> {
-        Arc::new(Self::new(config))
+    ///
+    /// # Errors
+    ///
+    /// Returns `BillingCheckError::ServiceError` if the HTTP client cannot be created.
+    pub fn new_shared(config: BillingConfig) -> Result<Arc<Self>, BillingCheckError> {
+        Ok(Arc::new(Self::new(config)?))
     }
 
     /// Check if billing is enabled and configured.

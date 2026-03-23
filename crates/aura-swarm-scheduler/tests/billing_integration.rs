@@ -53,7 +53,7 @@ fn scheduler_billing_config_is_configured() {
 #[test]
 fn reporter_disabled_when_no_api_key() {
     let config = SchedulerBillingConfig::default();
-    let reporter = ComputeUsageReporter::new(config);
+    let reporter = ComputeUsageReporter::new(config).unwrap();
 
     assert!(!reporter.is_enabled());
 }
@@ -62,7 +62,7 @@ fn reporter_disabled_when_no_api_key() {
 fn reporter_enabled_with_api_key() {
     let mut config = SchedulerBillingConfig::default();
     config.api_key = "test-key".to_string();
-    let reporter = ComputeUsageReporter::new(config);
+    let reporter = ComputeUsageReporter::new(config).unwrap();
 
     assert!(reporter.is_enabled());
 }
@@ -70,7 +70,7 @@ fn reporter_enabled_with_api_key() {
 #[test]
 fn reporter_tracks_pods() {
     let config = SchedulerBillingConfig::default();
-    let reporter = ComputeUsageReporter::new(config);
+    let reporter = ComputeUsageReporter::new(config).unwrap();
 
     assert_eq!(reporter.tracked_pod_count(), 0);
 
@@ -91,7 +91,7 @@ fn reporter_tracks_pods() {
 fn reporter_report_interval() {
     let mut config = SchedulerBillingConfig::default();
     config.report_interval_seconds = 60;
-    let reporter = ComputeUsageReporter::new(config);
+    let reporter = ComputeUsageReporter::new(config).unwrap();
 
     assert_eq!(reporter.report_interval(), Duration::from_secs(60));
 }
@@ -99,7 +99,7 @@ fn reporter_report_interval() {
 #[tokio::test]
 async fn reporter_disabled_reports_zero() {
     let config = SchedulerBillingConfig::default(); // No API key
-    let reporter = ComputeUsageReporter::new(config);
+    let reporter = ComputeUsageReporter::new(config).unwrap();
 
     reporter.register_pod("agent-1", "user-1", 500, 512);
 
@@ -164,7 +164,7 @@ mod live {
             fail_closed: true,
         };
 
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         // Register pod
         reporter.register_pod(&agent_uuid, &user_uuid, 500, 512);
@@ -201,7 +201,7 @@ mod live {
             fail_closed: true,
         };
 
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         // Register multiple pods
         reporter.register_pod(&agent_uuid_1, &user_uuid_1, 500, 512);
@@ -234,7 +234,7 @@ mod live {
             fail_closed: true,
         };
 
-        let reporter = ComputeUsageReporter::new(config);
+        let reporter = ComputeUsageReporter::new(config).unwrap();
 
         // Simulate pod lifecycle
         // 1. Pod starts

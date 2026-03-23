@@ -70,21 +70,20 @@ pub struct JwksProvider {
 impl JwksProvider {
     /// Create a new JWKS provider with the given configuration.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the HTTP client cannot be created (should never happen with default TLS).
-    #[must_use]
-    pub fn new(config: AuthConfig) -> Self {
+    /// Returns `AuthError::Internal` if the HTTP client cannot be created.
+    pub fn new(config: AuthConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("failed to create HTTP client");
+            .map_err(|e| AuthError::Internal(format!("failed to create HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             config,
             client,
             cache: RwLock::new(CachedKeys::default()),
-        }
+        })
     }
 
     /// Get a decoding key by key ID, fetching from JWKS if necessary.

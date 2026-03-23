@@ -117,7 +117,7 @@ async fn cmd_login(zos_url: &str) -> anyhow::Result<()> {
         base_url: zos_url.to_owned(),
         ..AuthConfig::default()
     };
-    let client = aura_swarm_auth::ZosClient::new(config);
+    let client = aura_swarm_auth::ZosClient::new(config)?;
 
     match client.fetch_user_info(&token).await {
         Ok(info) => {
@@ -145,7 +145,7 @@ async fn cmd_whoami(zos_url: &str, token_flag: Option<String>) -> anyhow::Result
         base_url: zos_url.to_owned(),
         ..AuthConfig::default()
     };
-    let client = aura_swarm_auth::ZosClient::new(config);
+    let client = aura_swarm_auth::ZosClient::new(config)?;
     let info = client.fetch_user_info(&token).await?;
 
     let id = info.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");

@@ -84,21 +84,20 @@ impl HttpSchedulerClient {
     ///
     /// * `base_url` - The base URL of the scheduler service (e.g., `http://scheduler:8080`)
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the HTTP client cannot be created.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// Returns `ControlError::Internal` if the HTTP client cannot be created.
+    pub fn new(base_url: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| ControlError::Internal(format!("failed to create HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: base_url.into(),
-        }
+        })
     }
 
     /// Create a new scheduler client with a custom reqwest client.
@@ -341,7 +340,7 @@ mod tests {
 
     #[test]
     fn http_client_creation() {
-        let client = HttpSchedulerClient::new("http://localhost:8080");
+        let client = HttpSchedulerClient::new("http://localhost:8080").unwrap();
         assert_eq!(client.base_url(), "http://localhost:8080");
     }
 }

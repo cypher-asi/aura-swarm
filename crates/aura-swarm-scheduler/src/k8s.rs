@@ -132,23 +132,22 @@ impl K8sScheduler {
     ///
     /// This is useful for testing with mock clients.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the HTTP client cannot be created (should never happen with default TLS).
-    #[must_use]
-    pub fn with_client(client: Client, config: SchedulerConfig) -> Self {
+    /// Returns `SchedulerError::Config` if the HTTP client cannot be created.
+    pub fn with_client(client: Client, config: SchedulerConfig) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| SchedulerError::Config(format!("Failed to create HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             endpoint_cache: EndpointCache::new(),
             http_client,
             billing_reporter: None,
-        }
+        })
     }
 
     /// Set the billing reporter after construction.
