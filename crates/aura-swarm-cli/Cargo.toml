@@ -23,7 +23,7 @@ serde_json.workspace = true
 reqwest.workspace = true
 
 # WebSocket client
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite.workspace = true
 
 # TUI
 ratatui = "0.29"
@@ -47,10 +47,10 @@ chrono.workspace = true
 
 # Tracing
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber.workspace = true
 
 # Base64 decoding for tool results
-base64 = "0.22"
+base64.workspace = true
 
 # Protocol types (shared with gateway + harness)
 aura-swarm-protocol = { path = "../aura-swarm-protocol" }

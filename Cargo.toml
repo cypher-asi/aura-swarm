@@ -50,8 +50,16 @@ async-trait = "0.1"
 base64 = "0.22"
 parking_lot = "0.12"
 
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["timeout"] }
+
 # Tracing
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
 # Testing
 wiremock = "0.6"

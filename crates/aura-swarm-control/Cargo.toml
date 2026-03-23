@@ -30,15 +30,13 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 
 # HTTP server (for binary)
-axum = "0.7"
-tower-http = { version = "0.5", features = ["timeout"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum.workspace = true
+tower-http.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde_json = { workspace = true }
-blake3 = { workspace = true }
 uuid = { workspace = true }
 
 [lints]
