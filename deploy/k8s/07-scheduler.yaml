@@ -21,7 +21,7 @@ spec:
       serviceAccountName: aura-swarm-scheduler
       containers:
         - name: scheduler
-          image: 909208902094.dkr.ecr.us-east-2.amazonaws.com/aura-swarm-dev-scheduler:latest
+          image: ECR_REGISTRY/RESOURCE_PREFIX-scheduler:IMAGE_TAG
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -59,12 +59,6 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: GATEWAY_URL
-            # Deprecated - use GATEWAY_URL
-            - name: CONTROL_PLANE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: aura-swarm-config
-                  key: CONTROL_PLANE_URL
             - name: STATE_PVC_NAME
               valueFrom:
                 configMapKeyRef:

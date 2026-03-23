@@ -131,16 +131,23 @@ K8S_DIR="${SCRIPT_DIR}/k8s"
 
 echo "Updating Kubernetes manifests..."
 
-# Update storage class with EFS ID
-sed -i "s/EFS_FILESYSTEM_ID/${EFS_ID}/g" "${K8S_DIR}/01-storage-class.yaml" 2>/dev/null || true
+# Copy manifests to a temp directory so we never modify the tracked originals
+DEPLOY_TMP_DIR=$(mktemp -d)
+trap "rm -rf '${DEPLOY_TMP_DIR}'" EXIT
+cp "${K8S_DIR}"/*.yaml "${DEPLOY_TMP_DIR}/"
 
-# Update ConfigMap with aura-runtime image URL
+# Update storage class with EFS ID
+sed -i "s/EFS_FILESYSTEM_ID/${EFS_ID}/g" "${DEPLOY_TMP_DIR}/01-storage-class.yaml" 2>/dev/null || true
+
+# Update ConfigMap with image URLs
 RUNTIME_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
-sed -i "s|REPLACE_WITH_ECR_REGISTRY/${RESOURCE_PREFIX}-runtime:v0.1.0|${RUNTIME_IMAGE}|g" "${K8S_DIR}/03-secrets.yaml" 2>/dev/null || true
+HARNESS_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-harness:${IMAGE_TAG}"
+sed -i "s|REPLACE_WITH_ECR_REGISTRY/RESOURCE_PREFIX-runtime:v0.1.0|${RUNTIME_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
+sed -i "s|ECR_REGISTRY/RESOURCE_PREFIX-harness:IMAGE_TAG|${HARNESS_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
 
 # Inject secrets into the secrets manifest (use a temp file to avoid partial writes)
-SECRETS_YAML="${K8S_DIR}/03-secrets.yaml"
-SECRETS_YAML_TMP="${K8S_DIR}/03-secrets.yaml.tmp"
+SECRETS_YAML="${DEPLOY_TMP_DIR}/03-secrets.yaml"
+SECRETS_YAML_TMP="${DEPLOY_TMP_DIR}/03-secrets.yaml.tmp"
 
 cp "$SECRETS_YAML" "$SECRETS_YAML_TMP"
 sed -i "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY}|g" "$SECRETS_YAML_TMP"
@@ -150,7 +157,7 @@ sed -i "s|__Z_BILLING_API_KEY__|${Z_BILLING_API_KEY:-}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__DEFAULT_ISOLATION__|${DEFAULT_ISOLATION}|g" "$SECRETS_YAML_TMP"
 
 # Update deployments with ECR image URLs
-for manifest in "${K8S_DIR}"/05-*.yaml "${K8S_DIR}"/06-*.yaml "${K8S_DIR}"/07-*.yaml; do
+for manifest in "${DEPLOY_TMP_DIR}"/05-*.yaml "${DEPLOY_TMP_DIR}"/06-*.yaml "${DEPLOY_TMP_DIR}"/07-*.yaml; do
     if [[ -f "$manifest" ]]; then
         sed -i "s|ECR_REGISTRY|${ECR_REGISTRY}|g" "$manifest" 2>/dev/null || true
         sed -i "s|RESOURCE_PREFIX|${RESOURCE_PREFIX}|g" "$manifest" 2>/dev/null || true
@@ -229,7 +236,7 @@ MANIFESTS=(
 )
 
 for manifest in "${MANIFESTS[@]}"; do
-    manifest_path="${K8S_DIR}/${manifest}"
+    manifest_path="${DEPLOY_TMP_DIR}/${manifest}"
     
     # Use temp file for secrets (contains injected values)
     if [[ "$manifest" == "03-secrets.yaml" ]]; then
@@ -245,10 +252,8 @@ for manifest in "${MANIFESTS[@]}"; do
     fi
 done
 
-# Clean up temp secrets file (don't leave secrets on disk)
-if [[ -f "$SECRETS_YAML_TMP" ]]; then
-    rm -f "$SECRETS_YAML_TMP"
-fi
+# Clean up temp directory (don't leave secrets on disk)
+rm -rf "${DEPLOY_TMP_DIR}"
 
 echo ""
 

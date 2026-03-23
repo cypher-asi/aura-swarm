@@ -42,7 +42,7 @@ spec:
       serviceAccountName: aura-swarm-gateway
       containers:
         - name: gateway
-          image: 909208902094.dkr.ecr.us-east-2.amazonaws.com/aura-swarm-dev-gateway:latest
+          image: ECR_REGISTRY/RESOURCE_PREFIX-gateway:IMAGE_TAG
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
