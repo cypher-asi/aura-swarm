@@ -1177,7 +1177,7 @@ mod tests {
     }
 
     fn test_client() -> GatewayClient {
-        GatewayClient::new("http://test.local", "test-token")
+        GatewayClient::new("http://test.local", "test-token").unwrap()
     }
 
     // =========================================================================

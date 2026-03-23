@@ -4,11 +4,13 @@
 //! It provides internal APIs for agent and session management.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aura_swarm_control::ControlPlaneService;
 use aura_swarm_store::RocksStore;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
+use tower_http::timeout::TimeoutLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Application state shared across handlers.
@@ -48,6 +50,7 @@ fn create_router<S: aura_swarm_store::Store + 'static>(state: AppState<S>) -> Ro
     Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler::<S>))
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .with_state(state)
 }
 

@@ -3,7 +3,7 @@
 //! This module handles WebSocket connections to agents for real-time streaming chat
 //! using the aura-swarm-protocol types (unified for local harness and remote gateway).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aura_swarm_protocol::{InboundMessage, OutboundMessage, SessionInit};
 use futures::{SinkExt, StreamExt};
@@ -148,8 +148,9 @@ pub async fn connect(
         .body(())
         .map_err(|e| WsError::Connection(e.to_string()))?;
 
-    let (ws_stream, _) = connect_async(request)
+    let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(request))
         .await
+        .map_err(|_| WsError::Connection("connection timed out".to_string()))?
         .map_err(|e| WsError::Connection(e.to_string()))?;
 
     let (write, read) = ws_stream.split();

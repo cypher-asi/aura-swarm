@@ -22,6 +22,7 @@ z-billing-client = { git = "ssh://git@github.com/cypher-asi/z-billing.git" }
 
 # HTTP server (for binary)
 axum = "0.7"
+tower-http = { version = "0.5", features = ["timeout"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Kubernetes

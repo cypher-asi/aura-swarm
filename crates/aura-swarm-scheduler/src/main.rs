@@ -15,6 +15,7 @@
 //! - `GET /v1/agents/:agent_id/status` - Get pod status
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aura_swarm_core::AgentId;
 use aura_swarm_scheduler::{
@@ -30,6 +31,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tower_http::timeout::TimeoutLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Application state shared across handlers.
@@ -271,6 +273,7 @@ fn create_router(state: AppState) -> Router {
         .route("/v1/agents/:agent_id", delete(terminate_handler))
         .route("/v1/agents/:agent_id/status", get(status_handler))
         .route("/v1/agents/:agent_id/endpoint", get(endpoint_handler))
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .with_state(state)
 }
 

@@ -166,7 +166,7 @@ async fn cmd_whoami(zos_url: &str, token_flag: Option<String>) -> anyhow::Result
 
 async fn cmd_tui(args: Args) -> anyhow::Result<()> {
     let token = auth::resolve_token(args.token)?;
-    let client = GatewayClient::new(&args.gateway, &token);
+    let client = GatewayClient::new(&args.gateway, &token)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

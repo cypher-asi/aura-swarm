@@ -2,6 +2,8 @@
 //!
 //! This module provides a typed client for interacting with the aura-swarm-gateway.
 
+use std::time::Duration;
+
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 
@@ -41,12 +43,15 @@ impl GatewayClient {
     ///
     /// * `base_url` - Base URL of the gateway (e.g., "http://localhost:8080")
     /// * `token` - JWT token for authentication
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(Self {
+            client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-        }
+        })
     }
 
     /// Build headers for authenticated requests.
@@ -346,25 +351,25 @@ mod tests {
 
     #[test]
     fn new_trims_trailing_slash() {
-        let client = GatewayClient::new("http://example.com/", "tok");
+        let client = GatewayClient::new("http://example.com/", "tok").unwrap();
         assert_eq!(client.base_url(), "http://example.com");
     }
 
     #[test]
     fn new_preserves_clean_url() {
-        let client = GatewayClient::new("http://example.com", "tok");
+        let client = GatewayClient::new("http://example.com", "tok").unwrap();
         assert_eq!(client.base_url(), "http://example.com");
     }
 
     #[test]
     fn new_stores_token() {
-        let client = GatewayClient::new("http://example.com", "my-secret");
+        let client = GatewayClient::new("http://example.com", "my-secret").unwrap();
         assert_eq!(client.token(), "my-secret");
     }
 
     #[test]
     fn ws_url_http_to_ws() {
-        let client = GatewayClient::new("http://localhost:8080", "tok");
+        let client = GatewayClient::new("http://localhost:8080", "tok").unwrap();
         let url = client.ws_url("sess-1");
         assert!(url.starts_with("ws://"), "url: {url}");
         assert!(!url.contains("http://"), "url: {url}");
@@ -372,7 +377,7 @@ mod tests {
 
     #[test]
     fn ws_url_https_to_wss() {
-        let client = GatewayClient::new("https://gateway.example.com", "tok");
+        let client = GatewayClient::new("https://gateway.example.com", "tok").unwrap();
         let url = client.ws_url("sess-2");
         assert!(url.starts_with("wss://"), "url: {url}");
         assert!(!url.contains("https://"), "url: {url}");
@@ -380,14 +385,14 @@ mod tests {
 
     #[test]
     fn ws_url_includes_session_id() {
-        let client = GatewayClient::new("http://localhost:8080", "tok");
+        let client = GatewayClient::new("http://localhost:8080", "tok").unwrap();
         let url = client.ws_url("abc-123");
         assert_eq!(url, "ws://localhost:8080/v1/sessions/abc-123/ws");
     }
 
     #[test]
     fn ws_url_with_trailing_slash_base() {
-        let client = GatewayClient::new("https://api.example.com/", "tok");
+        let client = GatewayClient::new("https://api.example.com/", "tok").unwrap();
         let url = client.ws_url("s1");
         assert_eq!(url, "wss://api.example.com/v1/sessions/s1/ws");
     }
