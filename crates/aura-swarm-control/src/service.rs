@@ -17,6 +17,19 @@ use crate::scheduler_client::SchedulerClient;
 use crate::session;
 use crate::types::{ControlConfig, CreateAgentRequest};
 
+/// Run a blocking store operation off the async runtime.
+async fn blocking_store<S, F, T>(store: &Arc<S>, f: F) -> Result<T>
+where
+    S: Store + 'static,
+    F: FnOnce(&S) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || f(&*store))
+        .await
+        .map_err(|e| ControlError::Internal(format!("task join error: {e}")))?
+}
+
 /// Trait defining the control plane operations.
 ///
 /// This trait provides the complete API for managing agents and sessions.
@@ -174,7 +187,7 @@ impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClie
     }
 }
 
-impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
+impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
     /// Create a new control plane service with scheduler integration.
     #[must_use]
     pub fn with_scheduler(store: Arc<S>, config: ControlConfig, scheduler: Arc<SC>) -> Self {
@@ -262,35 +275,30 @@ impl<S: Store, SC: SchedulerClient> ControlPlaneService<S, SC> {
         Ok(())
     }
 
-    /// Verify that the user owns the given agent.
-    fn verify_ownership(user_id: &UserId, agent: &Agent) -> Result<()> {
-        if agent.user_id != *user_id {
-            return Err(ControlError::NotOwner {
-                user_id: *user_id,
-                agent_id: agent.agent_id,
-            });
-        }
-        Ok(())
-    }
-
     /// Get an agent and verify ownership.
-    fn get_and_verify(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let agent = self
-            .store
-            .get_agent(agent_id)?
-            .ok_or(ControlError::AgentNotFound(*agent_id))?;
-
-        Self::verify_ownership(user_id, &agent)?;
-        Ok(agent)
+    async fn get_and_verify(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
+        let uid = *user_id;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            let agent = s.get_agent(&aid)?.ok_or(ControlError::AgentNotFound(aid))?;
+            if agent.user_id != uid {
+                return Err(ControlError::NotOwner {
+                    user_id: uid,
+                    agent_id: agent.agent_id,
+                });
+            }
+            Ok(agent)
+        })
+        .await
     }
 
     /// Perform a validated state transition.
-    fn transition_state(&self, agent: &mut Agent, target: AgentState) -> Result<()> {
+    async fn transition_state(&self, agent: &mut Agent, target: AgentState) -> Result<()> {
         lifecycle::validate_transition(&agent.agent_id, agent.status, target)?;
         agent.status = target;
         agent.updated_at = Utc::now();
-        self.store.put_agent(agent)?;
-        Ok(())
+        let snapshot = agent.clone();
+        blocking_store(&self.store, move |s| Ok(s.put_agent(&snapshot)?)).await
     }
 
     /// Schedule an agent pod via the scheduler service.
@@ -343,49 +351,56 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         user_id: &UserId,
         request: CreateAgentRequest,
     ) -> Result<Agent> {
-        // Check billing credits first
         self.check_agent_credits(user_id).await?;
 
-        // Check quota
-        let count = self.store.count_agents_by_user(user_id)?;
-        if count >= self.config.max_agents_per_user {
-            return Err(ControlError::QuotaExceeded {
-                user_id: *user_id,
-                limit: self.config.max_agents_per_user,
-            });
-        }
+        let uid = *user_id;
+        let max = self.config.max_agents_per_user;
+        let agent = blocking_store(&self.store, move |s| {
+            let count = s.count_agents_by_user(&uid)?;
+            if count >= max {
+                return Err(ControlError::QuotaExceeded {
+                    user_id: uid,
+                    limit: max,
+                });
+            }
 
-        let now = Utc::now();
-        let spec = request.spec.unwrap_or_default();
-        let agent_id = request
-            .agent_id
-            .unwrap_or_else(|| AgentId::generate(user_id, &request.name));
+            let now = Utc::now();
+            let spec = request.spec.unwrap_or_default();
+            let agent_id = request
+                .agent_id
+                .unwrap_or_else(|| AgentId::generate(&uid, &request.name));
 
-        let agent = Agent {
-            agent_id,
-            user_id: *user_id,
-            name: request.name,
-            status: AgentState::Provisioning,
-            spec,
-            created_at: now,
-            updated_at: now,
-            last_heartbeat_at: None,
-            error_message: None,
-        };
+            let agent = Agent {
+                agent_id,
+                user_id: uid,
+                name: request.name,
+                status: AgentState::Provisioning,
+                spec,
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: None,
+                error_message: None,
+            };
 
-        self.store.put_agent(&agent)?;
+            s.put_agent(&agent)?;
+            Ok(agent)
+        })
+        .await?;
 
-        // Schedule the agent pod
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
                 agent_id = %agent.agent_id,
                 error = %e,
                 "Failed to schedule agent pod, marking as error"
             );
-            // Update status to Error with the error message
-            self.store
-                .update_agent_error(&agent.agent_id, AgentState::Error, Some(e.to_string()))
-                .ok();
+            let aid = agent.agent_id;
+            let err_msg = e.to_string();
+            blocking_store(&self.store, move |s| {
+                s.update_agent_error(&aid, AgentState::Error, Some(err_msg))
+                    .ok();
+                Ok(())
+            })
+            .await?;
             return Err(e);
         }
 
@@ -400,32 +415,35 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn get_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        self.get_and_verify(user_id, agent_id)
+        self.get_and_verify(user_id, agent_id).await
     }
 
     async fn list_agents(&self, user_id: &UserId) -> Result<Vec<Agent>> {
-        Ok(self.store.list_agents_by_user(user_id)?)
+        let uid = *user_id;
+        blocking_store(&self.store, move |s| Ok(s.list_agents_by_user(&uid)?)).await
     }
 
     async fn delete_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<()> {
-        let agent = self.get_and_verify(user_id, agent_id)?;
+        let agent = self.get_and_verify(user_id, agent_id).await?;
 
-        // Can only delete stopped or error agents
         if !lifecycle::is_terminal(agent.status) {
             return Err(ControlError::InvalidState {
                 agent_id: *agent_id,
                 from: agent.status,
-                to: AgentState::Stopped, // Indicate they need to stop first
+                to: AgentState::Stopped,
             });
         }
 
-        // Delete all sessions for this agent
-        let sessions = self.store.list_sessions_by_agent(agent_id)?;
-        for session in sessions {
-            self.store.delete_session(&session.session_id)?;
-        }
-
-        self.store.delete_agent(agent_id)?;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            let sessions = s.list_sessions_by_agent(&aid)?;
+            for session in sessions {
+                s.delete_session(&session.session_id)?;
+            }
+            s.delete_agent(&aid)?;
+            Ok(())
+        })
+        .await?;
 
         tracing::info!(
             agent_id = %agent_id,
@@ -441,21 +459,22 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     // =========================================================================
 
     async fn start_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+        let mut agent = self.get_and_verify(user_id, agent_id).await?;
 
-        // Can only start from Stopped state
-        self.transition_state(&mut agent, AgentState::Provisioning)?;
+        self.transition_state(&mut agent, AgentState::Provisioning).await?;
 
-        // Schedule the agent pod
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
                 "Failed to schedule agent pod on start"
             );
-            self.store
-                .update_agent_status(agent_id, AgentState::Error)
-                .ok();
+            let aid = *agent_id;
+            blocking_store(&self.store, move |s| {
+                s.update_agent_status(&aid, AgentState::Error).ok();
+                Ok(())
+            })
+            .await?;
             return Err(e);
         }
 
@@ -465,30 +484,31 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn stop_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+        let mut agent = self.get_and_verify(user_id, agent_id).await?;
 
-        // Close all active sessions
-        let sessions = self.store.list_sessions_by_agent(agent_id)?;
-        for session in sessions {
-            if session.status == aura_swarm_store::SessionStatus::Active {
-                self.store.update_session_status(
-                    &session.session_id,
-                    aura_swarm_store::SessionStatus::Closed,
-                )?;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            let sessions = s.list_sessions_by_agent(&aid)?;
+            for sess in sessions {
+                if sess.status == aura_swarm_store::SessionStatus::Active {
+                    s.update_session_status(
+                        &sess.session_id,
+                        aura_swarm_store::SessionStatus::Closed,
+                    )?;
+                }
             }
-        }
+            Ok(())
+        })
+        .await?;
 
-        // Transition to Stopping
-        self.transition_state(&mut agent, AgentState::Stopping)?;
+        self.transition_state(&mut agent, AgentState::Stopping).await?;
 
-        // Terminate the agent pod
         if let Err(e) = self.terminate_agent_pod(agent_id).await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
                 "Failed to terminate agent pod on stop"
             );
-            // Don't fail the stop operation, just log - the scheduler will clean up
         }
 
         tracing::info!(agent_id = %agent_id, "Stopping agent");
@@ -497,25 +517,23 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn restart_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        // Stop the agent (this will terminate the pod)
         let mut agent = self.stop_agent(user_id, agent_id).await?;
 
-        // Transition to Stopped state
-        self.transition_state(&mut agent, AgentState::Stopped)?;
+        self.transition_state(&mut agent, AgentState::Stopped).await?;
+        self.transition_state(&mut agent, AgentState::Provisioning).await?;
 
-        // Start again (this will schedule a new pod)
-        self.transition_state(&mut agent, AgentState::Provisioning)?;
-
-        // Schedule the new pod
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
                 "Failed to schedule agent pod on restart"
             );
-            self.store
-                .update_agent_status(agent_id, AgentState::Error)
-                .ok();
+            let aid = *agent_id;
+            blocking_store(&self.store, move |s| {
+                s.update_agent_status(&aid, AgentState::Error).ok();
+                Ok(())
+            })
+            .await?;
             return Err(e);
         }
 
@@ -525,29 +543,31 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn hibernate_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+        let mut agent = self.get_and_verify(user_id, agent_id).await?;
 
-        // Close all active sessions
-        let sessions = self.store.list_sessions_by_agent(agent_id)?;
-        for session in sessions {
-            if session.status == aura_swarm_store::SessionStatus::Active {
-                self.store.update_session_status(
-                    &session.session_id,
-                    aura_swarm_store::SessionStatus::Closed,
-                )?;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            let sessions = s.list_sessions_by_agent(&aid)?;
+            for sess in sessions {
+                if sess.status == aura_swarm_store::SessionStatus::Active {
+                    s.update_session_status(
+                        &sess.session_id,
+                        aura_swarm_store::SessionStatus::Closed,
+                    )?;
+                }
             }
-        }
+            Ok(())
+        })
+        .await?;
 
-        self.transition_state(&mut agent, AgentState::Hibernating)?;
+        self.transition_state(&mut agent, AgentState::Hibernating).await?;
 
-        // Terminate the agent pod (but keep state saved)
         if let Err(e) = self.terminate_agent_pod(agent_id).await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
                 "Failed to terminate agent pod on hibernate"
             );
-            // Don't fail the hibernate operation
         }
 
         tracing::info!(agent_id = %agent_id, "Hibernating agent");
@@ -556,7 +576,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn wake_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
-        let mut agent = self.get_and_verify(user_id, agent_id)?;
+        let mut agent = self.get_and_verify(user_id, agent_id).await?;
 
         if !lifecycle::can_wake(agent.status) {
             return Err(ControlError::InvalidState {
@@ -566,20 +586,20 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             });
         }
 
-        // For hibernating, go through Provisioning to trigger pod scheduling
-        // For stopped, also go through Provisioning
-        self.transition_state(&mut agent, AgentState::Provisioning)?;
+        self.transition_state(&mut agent, AgentState::Provisioning).await?;
 
-        // Schedule the agent pod
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
                 "Failed to schedule agent pod on wake"
             );
-            self.store
-                .update_agent_status(agent_id, AgentState::Error)
-                .ok();
+            let aid = *agent_id;
+            blocking_store(&self.store, move |s| {
+                s.update_agent_status(&aid, AgentState::Error).ok();
+                Ok(())
+            })
+            .await?;
             return Err(e);
         }
 
@@ -598,11 +618,15 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         agent_id: &AgentId,
         config: SessionConfig,
     ) -> Result<Session> {
-        // Check billing credits first
         self.check_session_credits(user_id).await?;
 
+        let uid = *user_id;
+        let aid = *agent_id;
         let (session, state_change) =
-            session::create_session(&*self.store, user_id, agent_id, config)?;
+            blocking_store(&self.store, move |s| {
+                session::create_session(s, &uid, &aid, config)
+            })
+            .await?;
 
         tracing::info!(
             session_id = %session.session_id,
@@ -615,11 +639,16 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn get_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<Session> {
-        session::get_session(&*self.store, user_id, session_id)
+        let uid = *user_id;
+        let sid = *session_id;
+        blocking_store(&self.store, move |s| session::get_session(s, &uid, &sid)).await
     }
 
     async fn close_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<()> {
-        let closed = session::close_session(&*self.store, user_id, session_id)?;
+        let uid = *user_id;
+        let sid = *session_id;
+        let closed =
+            blocking_store(&self.store, move |s| session::close_session(s, &uid, &sid)).await?;
 
         if closed {
             tracing::info!(session_id = %session_id, "Closed session");
@@ -633,7 +662,9 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         user_id: &UserId,
         agent_id: &AgentId,
     ) -> Result<Vec<Session>> {
-        session::list_sessions(&*self.store, user_id, agent_id)
+        let uid = *user_id;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| session::list_sessions(s, &uid, &aid)).await
     }
 
     // =========================================================================
@@ -641,14 +672,18 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     // =========================================================================
 
     async fn process_heartbeat(&self, agent_id: &AgentId) -> Result<()> {
-        let mut agent = self
-            .store
-            .get_agent(agent_id)?
-            .ok_or(ControlError::AgentNotFound(*agent_id))?;
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            let mut agent = s
+                .get_agent(&aid)?
+                .ok_or(ControlError::AgentNotFound(aid))?;
 
-        agent.last_heartbeat_at = Some(Utc::now());
-        agent.updated_at = Utc::now();
-        self.store.put_agent(&agent)?;
+            agent.last_heartbeat_at = Some(Utc::now());
+            agent.updated_at = Utc::now();
+            s.put_agent(&agent)?;
+            Ok(())
+        })
+        .await?;
 
         tracing::debug!(agent_id = %agent_id, "Processed heartbeat");
 
@@ -656,18 +691,17 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     }
 
     async fn resolve_agent_endpoint(&self, agent_id: &AgentId) -> Result<Option<String>> {
-        let agent = self
-            .store
-            .get_agent(agent_id)?
-            .ok_or(ControlError::AgentNotFound(*agent_id))?;
+        let aid = *agent_id;
+        let agent = blocking_store(&self.store, move |s| {
+            s.get_agent(&aid)?
+                .ok_or(ControlError::AgentNotFound(aid))
+        })
+        .await?;
 
-        // Only return endpoint for active agents
         if lifecycle::is_active(agent.status) {
-            // Query the scheduler for the pod's actual endpoint (IP:port)
             if let Some(scheduler) = &self.scheduler {
                 scheduler.get_pod_endpoint(agent_id).await
             } else {
-                // No scheduler configured, return mock endpoint for local dev
                 Ok(Some("localhost:8080".to_string()))
             }
         } else {
@@ -681,18 +715,21 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         status: AgentState,
         error_message: Option<String>,
     ) -> Result<()> {
-        // Verify agent exists
-        if self.store.get_agent(agent_id)?.is_none() {
-            return Err(ControlError::AgentNotFound(*agent_id));
-        }
+        let aid = *agent_id;
+        let err_msg = error_message.clone();
+        blocking_store(&self.store, move |s| {
+            if s.get_agent(&aid)?.is_none() {
+                return Err(ControlError::AgentNotFound(aid));
+            }
 
-        // Use update_agent_error if there's an error message, otherwise just update status
-        if error_message.is_some() || status == AgentState::Error {
-            self.store
-                .update_agent_error(agent_id, status, error_message.clone())?;
-        } else {
-            self.store.update_agent_status(agent_id, status)?;
-        }
+            if err_msg.is_some() || status == AgentState::Error {
+                s.update_agent_error(&aid, status, err_msg)?;
+            } else {
+                s.update_agent_status(&aid, status)?;
+            }
+            Ok(())
+        })
+        .await?;
 
         tracing::info!(
             agent_id = %agent_id,

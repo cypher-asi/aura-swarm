@@ -3,14 +3,12 @@
 //! Tokens are persisted as JSON at a platform-appropriate path so that
 //! `aswarm` can be invoked without `--token` after a successful login.
 
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use aura_swarm_auth::{AuthConfig, ZosClient};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal;
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 
 /// On-disk credential format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,12 +26,12 @@ pub fn credentials_path() -> Option<PathBuf> {
 }
 
 /// Persist an access token to disk.
-pub fn save_credentials(token: &str) -> anyhow::Result<()> {
+pub async fn save_credentials(token: &str) -> anyhow::Result<()> {
     let path = credentials_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).await?;
     }
 
     let creds = StoredCredentials {
@@ -41,43 +39,44 @@ pub fn save_credentials(token: &str) -> anyhow::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&creds)?;
-    fs::write(&path, json)?;
+    fs::write(&path, json).await?;
 
-    // Best-effort restrictive permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     }
 
     Ok(())
 }
 
 /// Load a previously stored access token, returning `None` if absent.
-pub fn load_credentials() -> Option<String> {
+pub async fn load_credentials() -> Option<String> {
     let path = credentials_path()?;
-    let data = fs::read_to_string(path).ok()?;
+    let data = fs::read_to_string(path).await.ok()?;
     let creds: StoredCredentials = serde_json::from_str(&data).ok()?;
     Some(creds.access_token)
 }
 
 /// Delete the stored credentials file.
-pub fn clear_credentials() -> anyhow::Result<()> {
+pub async fn clear_credentials() -> anyhow::Result<()> {
     if let Some(path) = credentials_path() {
-        if path.exists() {
-            fs::remove_file(&path)?;
+        match fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
 }
 
 /// Resolve the token to use: explicit flag > env (handled by clap) > stored credentials.
-pub fn resolve_token(flag_value: Option<String>) -> anyhow::Result<String> {
+pub async fn resolve_token(flag_value: Option<String>) -> anyhow::Result<String> {
     if let Some(token) = flag_value {
         return Ok(token);
     }
 
-    if let Some(token) = load_credentials() {
+    if let Some(token) = load_credentials().await {
         return Ok(token);
     }
 
@@ -93,17 +92,20 @@ pub async fn login_interactive(zos_url: &str) -> anyhow::Result<String> {
 
     let client = ZosClient::new(config)?;
 
-    // Prompt email
-    print!("Email: ");
-    io::stdout().flush()?;
-    let mut email = String::new();
-    io::stdin().read_line(&mut email)?;
-    let email = email.trim().to_owned();
+    let email = tokio::task::spawn_blocking(|| {
+        print!("Email: ");
+        io::stdout().flush()?;
+        let mut email = String::new();
+        io::stdin().read_line(&mut email)?;
+        Ok::<_, anyhow::Error>(email.trim().to_owned())
+    })
+    .await??;
+
     if email.is_empty() {
         anyhow::bail!("Email cannot be empty");
     }
 
-    let password = prompt_password("Password: ")?;
+    let password = tokio::task::spawn_blocking(|| prompt_password("Password: ")).await??;
     if password.is_empty() {
         anyhow::bail!("Password cannot be empty");
     }
@@ -115,7 +117,11 @@ pub async fn login_interactive(zos_url: &str) -> anyhow::Result<String> {
 /// Read a password from the terminal, printing `*` for each character.
 ///
 /// Handles typing, paste (rapid character events), backspace, and Esc to cancel.
+/// This function performs blocking I/O (crossterm raw mode + event reads) and
+/// should only be called from a blocking context (e.g. inside `spawn_blocking`).
 fn prompt_password(prompt: &str) -> anyhow::Result<String> {
+    use crossterm::terminal;
+
     let mut stdout = io::stdout();
     write!(stdout, "{prompt}")?;
     stdout.flush()?;
@@ -131,6 +137,8 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
 }
 
 fn read_password_raw(stdout: &mut io::Stdout) -> anyhow::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+
     let mut password = String::new();
 
     loop {

@@ -23,13 +23,14 @@ use std::time::Duration;
 use aura_swarm_auth::AuthConfig;
 use clap::{Parser, Subcommand};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -97,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Command::Login) => cmd_login(&args.zos_url).await,
-        Some(Command::Logout) => cmd_logout(),
+        Some(Command::Logout) => cmd_logout().await,
         Some(Command::Whoami) => cmd_whoami(&args.zos_url, args.token).await,
         None => cmd_tui(args).await,
     }
@@ -111,7 +112,7 @@ async fn cmd_login(zos_url: &str) -> anyhow::Result<()> {
     println!("Logging in to {zos_url} …");
 
     let token = auth::login_interactive(zos_url).await?;
-    auth::save_credentials(&token)?;
+    auth::save_credentials(&token).await?;
 
     let config = AuthConfig {
         base_url: zos_url.to_owned(),
@@ -132,14 +133,14 @@ async fn cmd_login(zos_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_logout() -> anyhow::Result<()> {
-    auth::clear_credentials()?;
+async fn cmd_logout() -> anyhow::Result<()> {
+    auth::clear_credentials().await?;
     println!("Logged out — credentials removed.");
     Ok(())
 }
 
 async fn cmd_whoami(zos_url: &str, token_flag: Option<String>) -> anyhow::Result<()> {
-    let token = auth::resolve_token(token_flag)?;
+    let token = auth::resolve_token(token_flag).await?;
 
     let config = AuthConfig {
         base_url: zos_url.to_owned(),
@@ -165,7 +166,7 @@ async fn cmd_whoami(zos_url: &str, token_flag: Option<String>) -> anyhow::Result
 // ---------------------------------------------------------------------------
 
 async fn cmd_tui(args: Args) -> anyhow::Result<()> {
-    let token = auth::resolve_token(args.token)?;
+    let token = auth::resolve_token(args.token).await?;
     let client = GatewayClient::new(&args.gateway, &token)?;
 
     enable_raw_mode()?;
@@ -206,6 +207,9 @@ async fn run_event_loop(
     // Refresh timer
     let mut refresh_interval = tokio::time::interval(REFRESH_INTERVAL);
 
+    // Async terminal event stream (replaces blocking poll+read)
+    let mut event_reader = EventStream::new();
+
     loop {
         // Tick animation frame
         app.tick_animation();
@@ -222,12 +226,16 @@ async fn run_event_loop(
 
         // Handle events
         tokio::select! {
-            // Terminal events - poll with short timeout
-            () = tokio::time::sleep(tick_rate) => {
-                while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                    if let Ok(evt) = event::read() {
+            // Terminal events via async EventStream
+            maybe_event = event_reader.next() => {
+                match maybe_event {
+                    Some(Ok(evt)) => {
                         handle_input(app, evt, &ws_tx).await?;
                     }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "Error reading terminal event");
+                    }
+                    None => break,
                 }
             }
 
@@ -235,7 +243,6 @@ async fn run_event_loop(
             Some(event) = ws_rx.recv() => {
                 let needs_redraw = app.handle_ws_event(event);
                 if needs_redraw {
-                    // Redraw immediately - this is what makes streaming feel real-time
                     terminal.draw(|f| ui::render(f, app))?;
                 }
             }
@@ -251,6 +258,9 @@ async fn run_event_loop(
                     }
                 }
             }
+
+            // Animation tick
+            () = tokio::time::sleep(tick_rate) => {}
         }
 
         if app.should_quit {
