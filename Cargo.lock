@@ -199,6 +199,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aura-swarm-auth",
+ "aura-swarm-protocol",
  "base64",
  "chrono",
  "clap",
@@ -265,7 +266,6 @@ dependencies = [
  "aura-swarm-store",
  "axum",
  "axum-test",
- "blake3",
  "chrono",
  "futures",
  "reqwest",
@@ -280,7 +280,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "z-billing-client",
 ]
 
 [[package]]
@@ -321,6 +320,7 @@ name = "aura-swarm-store"
 version = "0.1.0"
 dependencies = [
  "aura-swarm-core",
+ "aura-swarm-protocol",
  "chrono",
  "ciborium",
  "rocksdb",

@@ -3,6 +3,7 @@
 //! These types represent the persisted state of agents, sessions, and users.
 
 use aura_swarm_core::{AgentId, UserId, SessionId};
+pub use aura_swarm_protocol::ExternalToolDef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +44,6 @@ pub struct AgentSpec {
     /// If not specified, uses the scheduler's default.
     #[serde(default)]
     pub isolation: Option<IsolationLevel>,
-    /// Engine type for the agent runtime.
-    /// Defaults to Harness if not specified (backwards-compatible via serde default).
-    #[serde(default)]
-    pub engine_type: EngineType,
 }
 
 impl Default for AgentSpec {
@@ -55,25 +52,9 @@ impl Default for AgentSpec {
             cpu_millicores: 500,
             memory_mb: 512,
             runtime_version: "latest".to_string(),
-            isolation: None, // Uses scheduler default
-            engine_type: EngineType::default(),
+            isolation: None,
         }
     }
-}
-
-/// The reasoning engine type for an agent.
-///
-/// Determines which container image and runtime configuration
-/// the scheduler uses when provisioning the agent pod.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineType {
-    /// aura-harness reasoning engine with AgentLoop, streaming,
-    /// tool caching, blocking detection, and context compaction.
-    #[default]
-    Harness,
-    /// Previous aura-runtime image (basic WS forwarding).
-    Legacy,
 }
 
 /// Isolation level for agent execution.
@@ -218,17 +199,6 @@ pub struct WorkspaceConfig {
     /// Git branch to check out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
-}
-
-/// External tool definition for session registration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalToolDef {
-    /// Tool name.
-    pub name: String,
-    /// Tool description.
-    pub description: String,
-    /// JSON Schema for the tool's input.
-    pub input_schema: serde_json::Value,
 }
 
 impl SessionStatus {

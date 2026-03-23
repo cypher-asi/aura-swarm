@@ -52,6 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Base64 decoding for tool results
 base64 = "0.22"
 
+# Protocol types (shared with gateway + harness)
+aura-swarm-protocol = { path = "../aura-swarm-protocol" }
+
 # Auth (zOS login)
 aura-swarm-auth = { path = "../aura-swarm-auth" }
 dirs = "6"

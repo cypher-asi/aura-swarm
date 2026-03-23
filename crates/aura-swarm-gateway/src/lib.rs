@@ -5,7 +5,7 @@
 //!
 //! - JWT authentication with zOS integration
 //! - REST HTTP endpoints for agent management
-//! - WebSocket proxying to agent pods
+//! - WebSocket proxying to agent pods (transparent bidirectional proxy)
 //! - Rate limiting and request validation
 //!
 //! # Architecture
@@ -69,14 +69,12 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod auth;
-pub mod billing;
 pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod routes;
 pub mod state;
 
-pub use billing::{BillingAccountLayer, BillingConfig, BillingService};
 pub use config::GatewayConfig;
 pub use error::ApiError;
 pub use routes::create_router;

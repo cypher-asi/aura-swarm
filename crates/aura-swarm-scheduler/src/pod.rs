@@ -4,7 +4,7 @@
 //! for Aura agent pods with all necessary configuration.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, EngineType};
+use aura_swarm_store::AgentSpec;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
@@ -110,11 +110,6 @@ fn build_pod_spec(
     // runtime_class() returns None for standard containers (uses default runtime)
     let runtime_class_name = isolation.runtime_class().map(String::from);
 
-    let image = match spec.engine_type {
-        EngineType::Harness => &config.harness_image,
-        EngineType::Legacy => &config.image,
-    };
-
     PodSpec {
         runtime_class_name,
         containers: vec![build_container(
@@ -122,7 +117,7 @@ fn build_pod_spec(
             user_id_hex,
             spec,
             config,
-            image,
+            &config.image,
         )],
         volumes: Some(vec![build_state_volume(config)]),
         restart_policy: Some("Always".to_string()),
@@ -147,12 +142,7 @@ fn build_container(
             name: Some("http".to_string()),
             ..Default::default()
         }]),
-        env: Some(build_env_vars(
-            agent_id_hex,
-            user_id_hex,
-            spec.engine_type,
-            config,
-        )),
+        env: Some(build_env_vars(agent_id_hex, user_id_hex, config)),
         resources: Some(build_resources(spec)),
         volume_mounts: Some(vec![build_state_mount(agent_id_hex)]),
         readiness_probe: Some(build_readiness_probe()),
@@ -167,11 +157,9 @@ const LLM_SECRETS_NAME: &str = "aura-swarm-secrets";
 fn build_env_vars(
     agent_id_hex: &str,
     user_id_hex: &str,
-    engine_type: EngineType,
     config: &SchedulerConfig,
 ) -> Vec<EnvVar> {
-    let mut vars = vec![
-        // Agent identity
+    vec![
         EnvVar {
             name: "AGENT_ID".to_string(),
             value: Some(agent_id_hex.to_string()),
@@ -182,7 +170,6 @@ fn build_env_vars(
             value: Some(user_id_hex.to_string()),
             ..Default::default()
         },
-        // Runtime configuration
         EnvVar {
             name: "STATE_DIR".to_string(),
             value: Some("/state".to_string()),
@@ -198,37 +185,29 @@ fn build_env_vars(
             value: Some(config.control_plane_url.clone()),
             ..Default::default()
         },
-        // LLM API keys (injected from Kubernetes secret)
         build_secret_env_var("ANTHROPIC_API_KEY", LLM_SECRETS_NAME, "ANTHROPIC_API_KEY"),
         build_secret_env_var("OPENAI_API_KEY", LLM_SECRETS_NAME, "OPENAI_API_KEY"),
-    ];
-
-    if engine_type == EngineType::Harness {
-        vars.extend([
-            EnvVar {
-                name: "AURA_DATA_DIR".to_string(),
-                value: Some("/state".to_string()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "AURA_LLM_ROUTING".to_string(),
-                value: Some("direct".to_string()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "ENABLE_FS_TOOLS".to_string(),
-                value: Some("true".to_string()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "ENABLE_CMD_TOOLS".to_string(),
-                value: Some("true".to_string()),
-                ..Default::default()
-            },
-        ]);
-    }
-
-    vars
+        EnvVar {
+            name: "AURA_DATA_DIR".to_string(),
+            value: Some("/state".to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_LLM_ROUTING".to_string(),
+            value: Some("direct".to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "ENABLE_FS_TOOLS".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "ENABLE_CMD_TOOLS".to_string(),
+            value: Some("true".to_string()),
+            ..Default::default()
+        },
+    ]
 }
 
 /// Build an environment variable that references a Kubernetes secret.
@@ -329,7 +308,7 @@ fn build_security_context() -> PodSecurityContext {
 mod tests {
     use super::*;
     use aura_swarm_core::UserId;
-    use aura_swarm_store::{EngineType, IsolationLevel};
+    use aura_swarm_store::IsolationLevel;
 
     fn test_agent_id() -> AgentId {
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
@@ -342,7 +321,6 @@ mod tests {
             memory_mb: 512,
             runtime_version: "latest".to_string(),
             isolation: None,
-            engine_type: EngineType::default(),
         }
     }
 
@@ -410,7 +388,6 @@ mod tests {
             memory_mb: 2048,
             runtime_version: "v1.0".to_string(),
             isolation: None,
-            engine_type: EngineType::default(),
         };
         let config = SchedulerConfig::default();
 

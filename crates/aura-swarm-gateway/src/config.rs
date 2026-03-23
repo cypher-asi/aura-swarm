@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::billing::BillingConfig;
-
 /// Configuration for the gateway service.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
@@ -34,10 +32,6 @@ pub struct GatewayConfig {
     /// Request timeout in seconds.
     #[serde(default = "GatewayConfig::default_request_timeout")]
     pub request_timeout_seconds: u64,
-
-    /// Billing configuration for z-billing integration.
-    #[serde(default)]
-    pub billing: BillingConfig,
 }
 
 impl GatewayConfig {
@@ -83,7 +77,6 @@ impl Default for GatewayConfig {
             websocket_timeout_seconds: Self::default_ws_timeout(),
             max_body_bytes: Self::default_max_body(),
             request_timeout_seconds: Self::default_request_timeout(),
-            billing: BillingConfig::default(),
         }
     }
 }
@@ -115,9 +108,6 @@ impl GatewayConfig {
                 config.max_body_bytes = n;
             }
         }
-
-        // Load billing config from environment
-        config.billing = BillingConfig::from_env();
 
         config
     }

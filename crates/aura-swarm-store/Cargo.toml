@@ -8,6 +8,7 @@ description = "RocksDB storage layer for aura-swarm"
 
 [dependencies]
 aura-swarm-core = { path = "../aura-swarm-core" }
+aura-swarm-protocol = { path = "../aura-swarm-protocol" }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

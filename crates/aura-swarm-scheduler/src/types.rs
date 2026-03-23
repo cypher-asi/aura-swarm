@@ -98,10 +98,8 @@ pub struct SchedulerConfig {
     /// Default isolation level for agents that don't specify one.
     /// Determines whether pods run as containers or microVMs.
     pub default_isolation: IsolationLevel,
-    /// Container image for the Aura runtime.
-    pub image: String,
     /// Container image for the aura-harness reasoning engine.
-    pub harness_image: String,
+    pub image: String,
     /// Internal URL of the control plane service (deprecated, use `gateway_url`).
     pub control_plane_url: String,
     /// Internal URL of the gateway service for status callbacks.
@@ -126,8 +124,7 @@ impl Default for SchedulerConfig {
         Self {
             namespace: "swarm-agents".to_string(),
             default_isolation: IsolationLevel::MicroVM,
-            image: "ghcr.io/cypher-asi/aura-runtime:latest".to_string(),
-            harness_image: "ghcr.io/cypher-asi/aura-harness:latest".to_string(),
+            image: "ghcr.io/cypher-asi/aura-harness:latest".to_string(),
             control_plane_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
             gateway_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
             state_pvc_name: "swarm-agent-state".to_string(),
@@ -154,8 +151,7 @@ impl SchedulerConfig {
     ///
     /// Supported environment variables:
     /// - `SCHEDULER_NAMESPACE`: Kubernetes namespace for agent pods
-    /// - `AURA_RUNTIME_IMAGE`: Container image for the Aura runtime
-    /// - `AURA_HARNESS_IMAGE`: Container image for the aura-harness reasoning engine
+    /// - `AURA_IMAGE`: Container image for the aura-harness reasoning engine
     /// - `CONTROL_PLANE_URL`: Internal URL of the control plane service (deprecated)
     /// - `GATEWAY_URL`: Internal URL of the gateway service for status callbacks
     /// - `STATE_PVC_NAME`: PVC name for agent state storage
@@ -171,11 +167,8 @@ impl SchedulerConfig {
         if let Ok(val) = std::env::var("SCHEDULER_NAMESPACE") {
             config.namespace = val;
         }
-        if let Ok(val) = std::env::var("AURA_RUNTIME_IMAGE") {
+        if let Ok(val) = std::env::var("AURA_IMAGE") {
             config.image = val;
-        }
-        if let Ok(val) = std::env::var("AURA_HARNESS_IMAGE") {
-            config.harness_image = val;
         }
         if let Ok(val) = std::env::var("CONTROL_PLANE_URL") {
             config.control_plane_url.clone_from(&val);

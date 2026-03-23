@@ -1,21 +1,18 @@
 //! WebSocket client for agent chat with streaming support.
 //!
 //! This module handles WebSocket connections to agents for real-time streaming chat
-//! using the Aura runtime protocol.
-//!
-//! Endpoint: WS /stream
+//! using the aura-swarm-protocol types (unified for local harness and remote gateway).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aura_swarm_protocol::{InboundMessage, OutboundMessage, SessionInit};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::types::{
-    ClientMessage, HarnessServerMessage, HarnessToolInfo, ServerMessage, TurnCompleteInfo,
-};
+use crate::types::{ToolInfo, TurnCompleteInfo};
 
 /// Error type for WebSocket operations.
 #[derive(Debug, thiserror::Error)]
@@ -40,42 +37,23 @@ pub struct WsSender {
 }
 
 impl WsSender {
-    /// Send a prompt to the agent.
+    /// Send a `session_init` message to the harness.
     ///
-    /// Returns the request ID for tracking the response.
-    pub async fn send_prompt(
-        &self,
-        prompt: &str,
-        agent_id: Option<&str>,
-        workspace: Option<&str>,
-    ) -> Result<String, WsError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        let request_id = format!("req-{now_ms}");
-
-        let msg = ClientMessage::Prompt {
-            request_id: request_id.clone(),
-            prompt: prompt.to_string(),
-            agent_id: agent_id.map(String::from),
-            workspace: workspace.map(String::from),
-        };
-
+    /// Must be sent immediately after connecting (both local and remote).
+    #[allow(dead_code)]
+    pub async fn send_session_init(&self, init: SessionInit) -> Result<(), WsError> {
+        let msg = InboundMessage::SessionInit(init);
         let json = serde_json::to_string(&msg)?;
         self.tx
             .send(json)
             .await
-            .map_err(|e| WsError::Send(e.to_string()))?;
-
-        Ok(request_id)
+            .map_err(|e| WsError::Send(e.to_string()))
     }
 
-    /// Send a cancel request to stop an in-progress response.
-    pub async fn cancel(&self, request_id: &str) -> Result<(), WsError> {
-        let msg = ClientMessage::Cancel {
-            request_id: request_id.to_string(),
+    /// Send a user message to the agent.
+    pub async fn send_prompt(&self, content: &str) -> Result<(), WsError> {
+        let msg = InboundMessage::UserMessage {
+            content: content.to_string(),
         };
         let json = serde_json::to_string(&msg)?;
         self.tx
@@ -84,6 +62,15 @@ impl WsSender {
             .map_err(|e| WsError::Send(e.to_string()))
     }
 
+    /// Send a cancel request to stop the current turn.
+    pub async fn cancel(&self) -> Result<(), WsError> {
+        let msg = InboundMessage::Cancel;
+        let json = serde_json::to_string(&msg)?;
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| WsError::Send(e.to_string()))
+    }
 }
 
 /// Events from the WebSocket connection.
@@ -96,15 +83,10 @@ pub enum WsEvent {
         /// Session ID assigned by the harness.
         session_id: String,
         /// Tools available in the session.
-        tools: Vec<HarnessToolInfo>,
+        tools: Vec<ToolInfo>,
     },
     /// A new turn has started.
     TurnStart,
-    /// A new step within the turn has started.
-    StepStart {
-        /// Step number (1-indexed).
-        step: u32,
-    },
     /// Text content delta (stream incrementally).
     TextDelta(String),
     /// Thinking content delta.
@@ -127,11 +109,6 @@ pub enum WsEvent {
     },
     /// Turn completed.
     TurnComplete(TurnCompleteInfo),
-    /// Request was cancelled.
-    Cancelled {
-        /// ID of the cancelled request.
-        request_id: String,
-    },
     /// External tool callback requested by the harness.
     ToolCallbackRequest {
         /// Callback ID for matching the response.
@@ -157,7 +134,6 @@ pub async fn connect(
     url: &str,
     token: &str,
 ) -> Result<(WsSender, mpsc::Receiver<WsEvent>), WsError> {
-    // Build request with auth header
     let request = Request::builder()
         .uri(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -175,16 +151,10 @@ pub async fn connect(
 
     let (write, read) = ws_stream.split();
 
-    // Channel for outgoing messages
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(32);
-
-    // Channel for incoming events
     let (event_tx, event_rx) = mpsc::channel::<WsEvent>(32);
 
-    // Spawn the writer task
     tokio::spawn(ws_writer(write, outgoing_rx));
-
-    // Spawn the reader task
     tokio::spawn(ws_reader(read, event_tx));
 
     Ok((WsSender { tx: outgoing_tx }, event_rx))
@@ -209,7 +179,7 @@ async fn ws_writer(
 
 /// Task that reads incoming messages and sends events.
 ///
-/// Parses the Aura runtime protocol messages and converts them to `WsEvent` variants.
+/// Parses protocol `OutboundMessage` types and converts them to `WsEvent` variants.
 async fn ws_reader(
     mut read: futures::stream::SplitStream<
         tokio_tungstenite::WebSocketStream<
@@ -218,25 +188,16 @@ async fn ws_reader(
     >,
     tx: mpsc::Sender<WsEvent>,
 ) {
-    // Track current tool name for ToolComplete events
     let mut current_tool_name: Option<String> = None;
 
-    // Send connected event
     let _ = tx.send(WsEvent::Connected).await;
 
     while let Some(result) = read.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                // Try harness protocol first, then legacy
-                if let Ok(harness_msg) = serde_json::from_str::<HarnessServerMessage>(&text) {
+                if let Ok(msg) = serde_json::from_str::<OutboundMessage>(&text) {
                     if let Some(event) =
-                        harness_message_to_event(harness_msg, &mut current_tool_name)
-                    {
-                        let _ = tx.send(event).await;
-                    }
-                } else if let Ok(legacy_msg) = serde_json::from_str::<ServerMessage>(&text) {
-                    if let Some(event) =
-                        legacy_message_to_event(legacy_msg, &mut current_tool_name)
+                        outbound_message_to_event(msg, &mut current_tool_name)
                     {
                         let _ = tx.send(event).await;
                     }
@@ -244,7 +205,7 @@ async fn ws_reader(
                     tracing::debug!(text = %text, "Failed to parse server message");
                     let _ = tx
                         .send(WsEvent::Error {
-                            message: format!("Protocol error: unrecognized message"),
+                            message: "Protocol error: unrecognized message".to_string(),
                             code: Some("parse_error".to_string()),
                         })
                         .await;
@@ -254,7 +215,6 @@ async fn ws_reader(
                 let _ = tx.send(WsEvent::Disconnected).await;
                 break;
             }
-            // Ignore control frames and binary messages
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_) | Message::Binary(_)) => {}
             Err(e) => {
                 let _ = tx
@@ -271,26 +231,27 @@ async fn ws_reader(
     let _ = tx.send(WsEvent::Disconnected).await;
 }
 
-/// Convert a `HarnessServerMessage` to a `WsEvent`.
-fn harness_message_to_event(
-    msg: HarnessServerMessage,
+/// Convert an `OutboundMessage` from the protocol crate to a `WsEvent`.
+fn outbound_message_to_event(
+    msg: OutboundMessage,
     current_tool_name: &mut Option<String>,
 ) -> Option<WsEvent> {
     match msg {
-        HarnessServerMessage::SessionReady { session_id, tools } => {
-            Some(WsEvent::SessionReady { session_id, tools })
-        }
-        HarnessServerMessage::AssistantMessageStart { .. } => Some(WsEvent::TurnStart),
-        HarnessServerMessage::TextDelta { text } => Some(WsEvent::TextDelta(text)),
-        HarnessServerMessage::ThinkingDelta { thinking } => Some(WsEvent::ThinkingDelta(thinking)),
-        HarnessServerMessage::ToolUseStart { id: _, name } => {
+        OutboundMessage::SessionReady(ready) => Some(WsEvent::SessionReady {
+            session_id: ready.session_id,
+            tools: ready.tools,
+        }),
+        OutboundMessage::AssistantMessageStart { .. } => Some(WsEvent::TurnStart),
+        OutboundMessage::TextDelta { text } => Some(WsEvent::TextDelta(text)),
+        OutboundMessage::ThinkingDelta { thinking } => Some(WsEvent::ThinkingDelta(thinking)),
+        OutboundMessage::ToolUseStart { id: _, name } => {
             *current_tool_name = Some(name.clone());
             Some(WsEvent::ToolStart {
                 tool_name: name,
                 args: serde_json::Value::Null,
             })
         }
-        HarnessServerMessage::ToolResult {
+        OutboundMessage::ToolResult {
             name,
             result,
             is_error,
@@ -299,119 +260,26 @@ fn harness_message_to_event(
             result,
             is_error,
         }),
-        HarnessServerMessage::AssistantMessageEnd {
-            stop_reason,
-            usage,
-            ..
-        } => Some(WsEvent::TurnComplete(TurnCompleteInfo {
-            steps: 0,
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            model: if usage.model.is_empty() {
-                None
-            } else {
-                Some(usage.model)
+        OutboundMessage::AssistantMessageEnd(end) => Some(WsEvent::TurnComplete(
+            TurnCompleteInfo {
+                steps: 0,
+                input_tokens: end.usage.input_tokens,
+                output_tokens: end.usage.output_tokens,
+                model: if end.usage.model.is_empty() {
+                    None
+                } else {
+                    Some(end.usage.model)
+                },
+                stop_reason: Some(end.stop_reason),
             },
-            stop_reason: Some(stop_reason),
-        })),
-        HarnessServerMessage::Error {
-            code, message, ..
-        } => Some(WsEvent::Error {
-            message,
-            code: Some(code),
+        )),
+        OutboundMessage::Error(err) => Some(WsEvent::Error {
+            message: err.message,
+            code: Some(err.code),
         }),
-        HarnessServerMessage::ToolCallbackRequest(req) => Some(WsEvent::ToolCallbackRequest {
+        OutboundMessage::ToolCallbackRequest(req) => Some(WsEvent::ToolCallbackRequest {
             callback_id: req.callback_id,
             tool_name: req.tool_name,
-        }),
-    }
-}
-
-/// Convert a legacy `ServerMessage` to a `WsEvent`.
-fn legacy_message_to_event(
-    msg: ServerMessage,
-    current_tool_name: &mut Option<String>,
-) -> Option<WsEvent> {
-    match msg {
-        ServerMessage::TurnStart {
-            request_id: _,
-            agent_id,
-        } => {
-            tracing::debug!(agent_id = %agent_id, "Turn started");
-            Some(WsEvent::TurnStart)
-        }
-        ServerMessage::StepStart {
-            request_id: _,
-            agent_id,
-            step,
-        } => {
-            tracing::debug!(agent_id = %agent_id, step = step, "Step started");
-            Some(WsEvent::StepStart { step })
-        }
-        ServerMessage::TextDelta {
-            request_id: _,
-            agent_id: _,
-            text,
-        } => Some(WsEvent::TextDelta(text)),
-        ServerMessage::ThinkingDelta {
-            request_id: _,
-            agent_id: _,
-            thinking,
-        } => Some(WsEvent::ThinkingDelta(thinking)),
-        ServerMessage::ToolStart {
-            request_id: _,
-            agent_id: _,
-            tool_id,
-            tool_name,
-            args,
-        } => {
-            tracing::debug!(tool = %tool_name, tool_id = %tool_id, "Tool execution started");
-            *current_tool_name = Some(tool_name.clone());
-            Some(WsEvent::ToolStart { tool_name, args })
-        }
-        ServerMessage::ToolComplete {
-            request_id: _,
-            agent_id: _,
-            tool_id,
-            result,
-            is_error,
-        } => {
-            tracing::debug!(tool_id = %tool_id, is_error = is_error, "Tool execution completed");
-            let tool_name = current_tool_name.take().unwrap_or_default();
-            Some(WsEvent::ToolComplete {
-                tool_name,
-                result,
-                is_error,
-            })
-        }
-        ServerMessage::TurnComplete {
-            request_id: _,
-            agent_id,
-            steps,
-            input_tokens,
-            output_tokens,
-        } => {
-            tracing::debug!(agent_id = %agent_id, steps = steps, "Turn complete");
-            Some(WsEvent::TurnComplete(TurnCompleteInfo {
-                steps,
-                input_tokens: u64::from(input_tokens),
-                output_tokens: u64::from(output_tokens),
-                model: None,
-                stop_reason: None,
-            }))
-        }
-        ServerMessage::Cancelled {
-            request_id,
-            agent_id: _,
-        } => Some(WsEvent::Cancelled { request_id }),
-        ServerMessage::Error {
-            request_id: _,
-            agent_id: _,
-            error,
-            code,
-        } => Some(WsEvent::Error {
-            message: error,
-            code,
         }),
     }
 }
@@ -426,7 +294,6 @@ fn extract_host(url: &str) -> Option<&str> {
 
 /// Generate a random WebSocket key.
 fn generate_ws_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -462,29 +329,17 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
-/// Convert a ServerMessage to a WsEvent (for testing).
-///
-/// Delegates to the production `legacy_message_to_event` function.
-#[cfg(test)]
-fn server_message_to_event(
-    msg: ServerMessage,
-    current_tool_name: &mut Option<String>,
-) -> Option<WsEvent> {
-    legacy_message_to_event(msg, current_tool_name)
-}
-
 // =============================================================================
-// Tests (Aura Runtime Protocol)
+// Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    // =========================================================================
-    // Helper Function Tests
-    // =========================================================================
+    use aura_swarm_protocol::{
+        AssistantMessageEnd, ErrorMsg, FilesChanged, SessionReady, SessionUsage,
+        ToolCallbackRequest,
+    };
 
     #[test]
     fn extract_host_from_ws_url() {
@@ -537,282 +392,20 @@ mod tests {
     }
 
     // =========================================================================
-    // ServerMessage to WsEvent Conversion Tests
+    // OutboundMessage -> WsEvent conversion tests
     // =========================================================================
 
     #[test]
-    fn convert_turn_start_to_event() {
-        let msg = ServerMessage::TurnStart {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-        };
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-        assert!(matches!(event, WsEvent::TurnStart));
-    }
-
-    #[test]
-    fn convert_text_delta_to_event() {
-        let msg = ServerMessage::TextDelta {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            text: "Hello, world!".to_string(),
-        };
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-        match event {
-            WsEvent::TextDelta(text) => assert_eq!(text, "Hello, world!"),
-            _ => panic!("Expected TextDelta event"),
-        }
-    }
-
-    #[test]
-    fn convert_tool_start_to_event() {
-        let msg = ServerMessage::ToolStart {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "t1".to_string(),
-            tool_name: "read_file".to_string(),
-            args: json!({"path": "/etc/passwd"}),
-        };
-        let mut tool_name_state = None;
-        let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-        match event {
-            WsEvent::ToolStart { tool_name, args } => {
-                assert_eq!(tool_name, "read_file");
-                assert_eq!(args["path"], "/etc/passwd");
-            }
-            _ => panic!("Expected ToolStart event"),
-        }
-        assert_eq!(tool_name_state, Some("read_file".to_string()));
-    }
-
-    #[test]
-    fn convert_tool_complete_to_event() {
-        let msg = ServerMessage::ToolComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            tool_id: "t1".to_string(),
-            result: "file contents".to_string(),
-            is_error: false,
-        };
-        let mut tool_name_state = Some("read_file".to_string());
-        let event = server_message_to_event(msg, &mut tool_name_state).unwrap();
-        match event {
-            WsEvent::ToolComplete {
-                tool_name,
-                result,
-                is_error,
-            } => {
-                assert_eq!(tool_name, "read_file");
-                assert_eq!(result, "file contents");
-                assert!(!is_error);
-            }
-            _ => panic!("Expected ToolComplete event"),
-        }
-    }
-
-    #[test]
-    fn convert_turn_complete_to_event() {
-        let msg = ServerMessage::TurnComplete {
-            request_id: "req-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            steps: 3,
-            input_tokens: 1500,
-            output_tokens: 800,
-        };
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-        match event {
-            WsEvent::TurnComplete(info) => {
-                assert_eq!(info.steps, 3);
-                assert_eq!(info.input_tokens, 1500u64);
-                assert_eq!(info.output_tokens, 800u64);
-                assert_eq!(info.model, None);
-                assert_eq!(info.stop_reason, None);
-            }
-            _ => panic!("Expected TurnComplete event"),
-        }
-    }
-
-    #[test]
-    fn convert_error_to_event() {
-        let msg = ServerMessage::Error {
-            request_id: "req-1".to_string(),
-            agent_id: Some("agent-1".to_string()),
-            error: "Something went wrong".to_string(),
-            code: Some("TURN_ERROR".to_string()),
-        };
-        let mut tool_name = None;
-        let event = server_message_to_event(msg, &mut tool_name).unwrap();
-        match event {
-            WsEvent::Error { message, code } => {
-                assert_eq!(message, "Something went wrong");
-                assert_eq!(code, Some("TURN_ERROR".to_string()));
-            }
-            _ => panic!("Expected Error event"),
-        }
-    }
-
-    // =========================================================================
-    // ClientMessage Serialization Tests
-    // =========================================================================
-
-    #[test]
-    fn prompt_message_serializes_correctly() {
-        let msg = ClientMessage::Prompt {
-            request_id: "req-test".to_string(),
-            prompt: "Hello, agent!".to_string(),
-            agent_id: Some("agent-123".to_string()),
-            workspace: None,
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "prompt");
-        assert_eq!(parsed["request_id"], "req-test");
-        assert_eq!(parsed["prompt"], "Hello, agent!");
-    }
-
-    #[test]
-    fn cancel_message_serializes_correctly() {
-        let msg = ClientMessage::Cancel {
-            request_id: "req-to-cancel".to_string(),
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "cancel");
-        assert_eq!(parsed["request_id"], "req-to-cancel");
-    }
-
-    // =========================================================================
-    // Message Flow Simulation Tests
-    // =========================================================================
-
-    #[test]
-    fn simulate_simple_response_flow() {
-        let messages = vec![
-            ServerMessage::TurnStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: "Hello".to_string(),
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: ", world!".to_string(),
-            },
-            ServerMessage::TurnComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                steps: 1,
-                input_tokens: 10,
-                output_tokens: 3,
-            },
-        ];
-
-        let mut tool_name_state = None;
-        let mut text_buffer = String::new();
-        let mut turn_info = None;
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                match event {
-                    WsEvent::TextDelta(text) => text_buffer.push_str(&text),
-                    WsEvent::TurnComplete(info) => turn_info = Some(info),
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(text_buffer, "Hello, world!");
-        let info = turn_info.unwrap();
-        assert_eq!(info.steps, 1);
-        assert_eq!(info.input_tokens, 10);
-        assert_eq!(info.output_tokens, 3);
-    }
-
-    #[test]
-    fn simulate_tool_use_flow() {
-        let messages = vec![
-            ServerMessage::TurnStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-            },
-            ServerMessage::ToolStart {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t1".to_string(),
-                tool_name: "read_file".to_string(),
-                args: json!({"path": "README.md"}),
-            },
-            ServerMessage::ToolComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                tool_id: "t1".to_string(),
-                result: "# README\nProject docs".to_string(),
-                is_error: false,
-            },
-            ServerMessage::TextDelta {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                text: "I found the file.".to_string(),
-            },
-            ServerMessage::TurnComplete {
-                request_id: "req-1".to_string(),
-                agent_id: "agent-1".to_string(),
-                steps: 1,
-                input_tokens: 100,
-                output_tokens: 20,
-            },
-        ];
-
-        let mut tool_name_state = None;
-        let mut tool_names = Vec::new();
-        let mut tool_succeeded = false;
-
-        for msg in messages {
-            if let Some(event) = server_message_to_event(msg, &mut tool_name_state) {
-                match event {
-                    WsEvent::ToolComplete {
-                        tool_name,
-                        is_error,
-                        ..
-                    } => {
-                        tool_names.push(tool_name);
-                        tool_succeeded = !is_error;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(tool_names, vec!["read_file"]);
-        assert!(tool_succeeded);
-    }
-
-    // =========================================================================
-    // Harness Protocol Conversion Tests
-    // =========================================================================
-
-    #[test]
-    fn harness_session_ready_to_event() {
-        let msg = HarnessServerMessage::SessionReady {
+    fn session_ready_to_event() {
+        let msg = OutboundMessage::SessionReady(SessionReady {
             session_id: "sess-1".to_string(),
-            tools: vec![HarnessToolInfo {
+            tools: vec![ToolInfo {
                 name: "fs_read".to_string(),
                 description: "Read a file".to_string(),
             }],
-        };
+        });
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::SessionReady { session_id, tools } => {
                 assert_eq!(session_id, "sess-1");
@@ -824,22 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn harness_assistant_message_start_to_event() {
-        let msg = HarnessServerMessage::AssistantMessageStart {
+    fn assistant_message_start_to_event() {
+        let msg = OutboundMessage::AssistantMessageStart {
             message_id: "msg-1".to_string(),
         };
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         assert!(matches!(event, WsEvent::TurnStart));
     }
 
     #[test]
-    fn harness_text_delta_to_event() {
-        let msg = HarnessServerMessage::TextDelta {
+    fn text_delta_to_event() {
+        let msg = OutboundMessage::TextDelta {
             text: "hello".to_string(),
         };
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::TextDelta(text) => assert_eq!(text, "hello"),
             _ => panic!("Expected TextDelta event"),
@@ -847,12 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn harness_thinking_delta_to_event() {
-        let msg = HarnessServerMessage::ThinkingDelta {
+    fn thinking_delta_to_event() {
+        let msg = OutboundMessage::ThinkingDelta {
             thinking: "reasoning...".to_string(),
         };
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::ThinkingDelta(thinking) => assert_eq!(thinking, "reasoning..."),
             _ => panic!("Expected ThinkingDelta event"),
@@ -860,13 +453,13 @@ mod tests {
     }
 
     #[test]
-    fn harness_tool_use_start_to_event() {
-        let msg = HarnessServerMessage::ToolUseStart {
+    fn tool_use_start_to_event() {
+        let msg = OutboundMessage::ToolUseStart {
             id: "tool-1".to_string(),
             name: "fs_read".to_string(),
         };
         let mut tool_name_state = None;
-        let event = harness_message_to_event(msg, &mut tool_name_state).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name_state).unwrap();
         match event {
             WsEvent::ToolStart { tool_name, args } => {
                 assert_eq!(tool_name, "fs_read");
@@ -878,14 +471,14 @@ mod tests {
     }
 
     #[test]
-    fn harness_tool_result_to_event() {
-        let msg = HarnessServerMessage::ToolResult {
+    fn tool_result_to_event() {
+        let msg = OutboundMessage::ToolResult {
             name: "fs_read".to_string(),
             result: "file contents".to_string(),
             is_error: false,
         };
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::ToolComplete {
                 tool_name,
@@ -901,13 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn harness_assistant_message_end_to_event() {
-        use crate::types::{HarnessFilesChanged, HarnessUsage};
-
-        let msg = HarnessServerMessage::AssistantMessageEnd {
+    fn assistant_message_end_to_event() {
+        let msg = OutboundMessage::AssistantMessageEnd(AssistantMessageEnd {
             message_id: "msg-1".to_string(),
             stop_reason: "end_turn".to_string(),
-            usage: HarnessUsage {
+            usage: SessionUsage {
                 input_tokens: 200,
                 output_tokens: 100,
                 cumulative_input_tokens: 400,
@@ -916,10 +507,10 @@ mod tests {
                 model: "claude-opus-4-6-20250514".to_string(),
                 provider: String::new(),
             },
-            files_changed: HarnessFilesChanged::default(),
-        };
+            files_changed: FilesChanged::default(),
+        });
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::TurnComplete(info) => {
                 assert_eq!(info.steps, 0);
@@ -933,22 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn harness_assistant_message_end_empty_model() {
-        use crate::types::{HarnessFilesChanged, HarnessUsage};
-
-        let msg = HarnessServerMessage::AssistantMessageEnd {
+    fn assistant_message_end_empty_model() {
+        let msg = OutboundMessage::AssistantMessageEnd(AssistantMessageEnd {
             message_id: "msg-1".to_string(),
             stop_reason: "end_turn".to_string(),
-            usage: HarnessUsage {
+            usage: SessionUsage {
                 input_tokens: 50,
                 output_tokens: 25,
                 model: String::new(),
-                ..HarnessUsage::default()
+                ..SessionUsage::default()
             },
-            files_changed: HarnessFilesChanged::default(),
-        };
+            files_changed: FilesChanged::default(),
+        });
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::TurnComplete(info) => {
                 assert_eq!(info.model, None);
@@ -958,14 +547,14 @@ mod tests {
     }
 
     #[test]
-    fn harness_error_to_event() {
-        let msg = HarnessServerMessage::Error {
+    fn error_to_event() {
+        let msg = OutboundMessage::Error(ErrorMsg {
             code: "rate_limit".to_string(),
             message: "Too many requests".to_string(),
             recoverable: true,
-        };
+        });
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::Error { message, code } => {
                 assert_eq!(message, "Too many requests");
@@ -976,16 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn harness_tool_callback_request_to_event() {
-        use crate::types::ToolCallbackRequest;
-
-        let msg = HarnessServerMessage::ToolCallbackRequest(ToolCallbackRequest {
+    fn tool_callback_request_to_event() {
+        let msg = OutboundMessage::ToolCallbackRequest(ToolCallbackRequest {
             callback_id: "cb-42".to_string(),
             tool_name: "get_task_context".to_string(),
             input: serde_json::json!({"task_id": "t-1"}),
         });
         let mut tool_name = None;
-        let event = harness_message_to_event(msg, &mut tool_name).unwrap();
+        let event = outbound_message_to_event(msg, &mut tool_name).unwrap();
         match event {
             WsEvent::ToolCallbackRequest {
                 callback_id,
@@ -999,33 +586,31 @@ mod tests {
     }
 
     #[test]
-    fn harness_full_flow_simulation() {
-        use crate::types::{HarnessFilesChanged, HarnessUsage};
-
-        let messages: Vec<HarnessServerMessage> = vec![
-            HarnessServerMessage::SessionReady {
+    fn full_flow_simulation() {
+        let messages: Vec<OutboundMessage> = vec![
+            OutboundMessage::SessionReady(SessionReady {
                 session_id: "sess-1".to_string(),
                 tools: vec![],
-            },
-            HarnessServerMessage::AssistantMessageStart {
+            }),
+            OutboundMessage::AssistantMessageStart {
                 message_id: "msg-1".to_string(),
             },
-            HarnessServerMessage::TextDelta {
+            OutboundMessage::TextDelta {
                 text: "Hello".to_string(),
             },
-            HarnessServerMessage::TextDelta {
+            OutboundMessage::TextDelta {
                 text: ", world!".to_string(),
             },
-            HarnessServerMessage::AssistantMessageEnd {
+            OutboundMessage::AssistantMessageEnd(AssistantMessageEnd {
                 message_id: "msg-1".to_string(),
                 stop_reason: "end_turn".to_string(),
-                usage: HarnessUsage {
+                usage: SessionUsage {
                     input_tokens: 10,
                     output_tokens: 3,
-                    ..HarnessUsage::default()
+                    ..SessionUsage::default()
                 },
-                files_changed: HarnessFilesChanged::default(),
-            },
+                files_changed: FilesChanged::default(),
+            }),
         ];
 
         let mut tool_name_state = None;
@@ -1034,7 +619,7 @@ mod tests {
         let mut turn_info = None;
 
         for msg in messages {
-            if let Some(event) = harness_message_to_event(msg, &mut tool_name_state) {
+            if let Some(event) = outbound_message_to_event(msg, &mut tool_name_state) {
                 match event {
                     WsEvent::SessionReady { .. } => session_ready = true,
                     WsEvent::TextDelta(text) => text_buffer.push_str(&text),
@@ -1049,5 +634,42 @@ mod tests {
         let info = turn_info.unwrap();
         assert_eq!(info.input_tokens, 10u64);
         assert_eq!(info.output_tokens, 3u64);
+    }
+
+    // =========================================================================
+    // InboundMessage serialization tests
+    // =========================================================================
+
+    #[test]
+    fn user_message_serializes_correctly() {
+        let msg = InboundMessage::UserMessage {
+            content: "Hello, agent!".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "user_message");
+        assert_eq!(parsed["content"], "Hello, agent!");
+    }
+
+    #[test]
+    fn cancel_message_serializes_correctly() {
+        let msg = InboundMessage::Cancel;
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "cancel");
+    }
+
+    #[test]
+    fn session_init_serializes_correctly() {
+        let msg = InboundMessage::SessionInit(SessionInit {
+            model: Some("claude-opus-4-6-20250514".to_string()),
+            system_prompt: Some("You are helpful".to_string()),
+            ..SessionInit::default()
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "session_init");
+        assert_eq!(parsed["model"], "claude-opus-4-6-20250514");
+        assert_eq!(parsed["system_prompt"], "You are helpful");
     }
 }

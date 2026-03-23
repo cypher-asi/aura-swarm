@@ -899,22 +899,17 @@ impl App {
     /// Sends a prompt request and prepares the app for receiving streaming deltas.
     pub async fn send_message(&mut self, content: String) -> Result<(), String> {
         let sender = self.ws_sender.as_ref().ok_or("Not connected")?;
-        let agent = self.selected_agent().ok_or("No agent selected")?;
-        let agent_id = agent.agent_id.clone();
 
-        // Add user message to local display
         self.messages.push(ChatMessage::user(&content));
 
-        // Send prompt request (server handles tool execution)
-        let request_id = sender
-            .send_prompt(&content, Some(&agent_id), None)
+        sender
+            .send_prompt(&content)
             .await
             .map_err(|e| e.to_string())?;
 
-        // Prepare streaming state
-        self.current_request_id = Some(request_id);
+        self.current_request_id = Some(content.clone());
         self.streaming_text_buffer.clear();
-        self.streaming_message_idx = None; // Will be set on first delta
+        self.streaming_message_idx = None;
         self.is_streaming = true;
         self.chat_scroll = 0;
 
@@ -943,11 +938,6 @@ impl App {
                 self.streaming_text_buffer.clear();
                 self.streaming_message_idx = None;
                 self.set_status("Agent responding... (Esc to cancel)");
-                true
-            }
-            WsEvent::StepStart { step } => {
-                // Update status to show step progress
-                self.set_status(format!("Step {step}... (Esc to cancel)"));
                 true
             }
             WsEvent::TextDelta(text) => {
@@ -1072,17 +1062,6 @@ impl App {
                 self.set_error(format!("Error: {message} (code: {code:?})"));
                 true
             }
-            WsEvent::Cancelled { request_id } => {
-                self.is_streaming = false;
-                if self.current_request_id.as_deref() == Some(&request_id) {
-                    self.current_request_id = None;
-                }
-                // Keep partial response but mark as cancelled
-                self.finalize_streaming_message();
-                self.streaming_message_idx = None;
-                self.set_status("Cancelled");
-                true
-            }
             WsEvent::ToolCallbackRequest {
                 callback_id,
                 tool_name,
@@ -1159,10 +1138,11 @@ impl App {
     ///
     /// Returns `true` if a cancel was sent, `false` if not streaming.
     pub async fn cancel_streaming(&mut self) -> bool {
-        if let (Some(request_id), Some(sender)) =
-            (self.current_request_id.as_ref(), self.ws_sender.as_ref())
-        {
-            if let Err(e) = sender.cancel(request_id).await {
+        if let Some(sender) = self.ws_sender.as_ref() {
+            if !self.is_streaming {
+                return false;
+            }
+            if let Err(e) = sender.cancel().await {
                 self.set_error(format!("Failed to cancel: {e}"));
                 return false;
             }
