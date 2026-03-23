@@ -147,31 +147,7 @@ echo ""
 # - DaemonSet that installs Kata
 # For now, we create the RuntimeClass that will be used
 
-cat <<EOF | kubectl apply -f -
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-fc
-handler: kata-fc
-overhead:
-  podFixed:
-    memory: "160Mi"
-    cpu: "250m"
-scheduling:
-  nodeSelector:
-    katacontainers.io/kata-runtime: "true"
----
-# Alternative for dev/testing on standard instances
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-qemu
-handler: kata-qemu
-overhead:
-  podFixed:
-    memory: "160Mi"
-    cpu: "250m"
-EOF
+kubectl apply -f "${SCRIPT_DIR}/k8s/09-runtime-class.yaml"
 
 echo -e "${GREEN}✓${NC} RuntimeClasses created (kata-fc, kata-qemu)"
 echo ""

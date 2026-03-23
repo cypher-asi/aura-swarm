@@ -1,10 +1,20 @@
-# Aura Swarm CLI - Connect to AWS Gateway
+# Aura Swarm CLI - Connect to Gateway
 # Run with: .\run-cli.ps1
+#
+# Set these environment variables before running:
+#   $env:AURA_SWARM_GATEWAY = "http://your-gateway-url"
+#   $env:AURA_SWARM_TOKEN = "your-token"
 
-$env:AURA_SWARM_GATEWAY = "http://af4f4466da4d54ad699a4646259de90f-76d669ae8cf34823.elb.us-east-2.amazonaws.com"
-$env:AURA_SWARM_TOKEN = "test-token:550e8400-e29b-41d4-a716-446655440000"
+if (-not $env:AURA_SWARM_GATEWAY) {
+    Write-Host "Error: AURA_SWARM_GATEWAY not set. Export it before running." -ForegroundColor Red
+    Write-Host "Example: `$env:AURA_SWARM_GATEWAY = 'http://localhost:8080'" -ForegroundColor Gray
+    exit 1
+}
+
+if (-not $env:AURA_SWARM_TOKEN) {
+    Write-Host "Error: AURA_SWARM_TOKEN not set. Export it before running." -ForegroundColor Red
+    exit 1
+}
 
 Write-Host "Connecting to: $env:AURA_SWARM_GATEWAY" -ForegroundColor Cyan
-Write-Host "Using mock zOS token for user: 550e8400-e29b-41d4-a716-446655440000" -ForegroundColor Gray
-
 cargo run --release --bin aswarm
