@@ -105,6 +105,8 @@ pub mod billing;
 pub mod cache;
 pub mod error;
 pub mod k8s;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock_scheduler;
 pub mod pod;
 pub mod types;
 
@@ -114,4 +116,4 @@ pub use k8s::{K8sScheduler, Scheduler};
 pub use types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use k8s::mock::MockScheduler;
+pub use mock_scheduler::MockScheduler;
