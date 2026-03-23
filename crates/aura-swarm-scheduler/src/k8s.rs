@@ -1043,4 +1043,45 @@ mod tests {
         let pods = scheduler.list_pods().await.unwrap();
         assert_eq!(pods.len(), 2);
     }
+
+    #[tokio::test]
+    async fn mock_get_status_not_found() {
+        let scheduler = MockScheduler::new();
+        let agent_id = test_agent_id();
+
+        let result = scheduler.get_pod_status(&agent_id).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SchedulerError::PodNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_terminate_nonexistent() {
+        let scheduler = MockScheduler::new();
+        let agent_id = test_agent_id();
+
+        let result = scheduler.terminate_agent(&agent_id).await;
+        assert!(result.is_ok());
+        assert_eq!(scheduler.pod_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mock_get_endpoint_not_found() {
+        let scheduler = MockScheduler::new();
+        let agent_id = test_agent_id();
+
+        let result = scheduler.get_pod_endpoint(&agent_id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_check_health_not_found() {
+        let scheduler = MockScheduler::new();
+        let agent_id = test_agent_id();
+
+        let healthy = scheduler.check_agent_health(&agent_id).await.unwrap();
+        assert!(!healthy);
+    }
 }

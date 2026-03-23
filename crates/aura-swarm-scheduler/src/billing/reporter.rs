@@ -231,4 +231,33 @@ mod tests {
 
         assert_eq!(reporter.report_interval(), Duration::from_secs(60));
     }
+
+    #[tokio::test]
+    async fn disabled_reporter_report_returns_zero() {
+        let config = SchedulerBillingConfig::default();
+        let reporter = ComputeUsageReporter::new(config);
+        assert!(!reporter.is_enabled());
+
+        let count = reporter.report_all_usage().await;
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn register_duplicate_pod() {
+        let config = SchedulerBillingConfig::default();
+        let reporter = ComputeUsageReporter::new(config);
+
+        reporter.register_pod("agent-1", "user-1", 500, 512);
+        reporter.register_pod("agent-1", "user-1", 1000, 1024);
+        assert_eq!(reporter.tracked_pod_count(), 1);
+    }
+
+    #[test]
+    fn unregister_nonexistent() {
+        let config = SchedulerBillingConfig::default();
+        let reporter = ComputeUsageReporter::new(config);
+
+        reporter.unregister_pod("never-registered");
+        assert_eq!(reporter.tracked_pod_count(), 0);
+    }
 }

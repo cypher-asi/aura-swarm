@@ -64,3 +64,62 @@ impl SchedulerError {
 
 /// A specialized Result type for scheduler operations.
 pub type Result<T> = std::result::Result<T, SchedulerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_kube_api_error() -> SchedulerError {
+        let resp = kube::core::ErrorResponse {
+            status: "Failure".into(),
+            code: 500,
+            message: "internal error".into(),
+            reason: "InternalError".into(),
+        };
+        SchedulerError::KubeApi(kube::Error::Api(resp))
+    }
+
+    fn make_store_error() -> SchedulerError {
+        SchedulerError::Store(aura_swarm_store::StoreError::NotFound)
+    }
+
+    #[test]
+    fn all_error_variants_status_codes() {
+        assert_eq!(make_kube_api_error().http_status_code(), 503);
+        assert_eq!(SchedulerError::PodNotFound("x".into()).http_status_code(), 404);
+        assert_eq!(SchedulerError::PodCreationFailed("x".into()).http_status_code(), 500);
+        assert_eq!(SchedulerError::Timeout("x".into()).http_status_code(), 503);
+        assert_eq!(SchedulerError::InvalidAgentId("x".into()).http_status_code(), 400);
+        assert_eq!(SchedulerError::Config("x".into()).http_status_code(), 400);
+        assert_eq!(make_store_error().http_status_code(), 503);
+        assert_eq!(SchedulerError::HealthCheckFailed("x".into()).http_status_code(), 503);
+    }
+
+    #[test]
+    fn is_retriable_all_variants() {
+        assert!(make_kube_api_error().is_retriable());
+        assert!(!SchedulerError::PodNotFound("x".into()).is_retriable());
+        assert!(!SchedulerError::PodCreationFailed("x".into()).is_retriable());
+        assert!(SchedulerError::Timeout("x".into()).is_retriable());
+        assert!(!SchedulerError::InvalidAgentId("x".into()).is_retriable());
+        assert!(!SchedulerError::Config("x".into()).is_retriable());
+        assert!(!make_store_error().is_retriable());
+        assert!(SchedulerError::HealthCheckFailed("x".into()).is_retriable());
+    }
+
+    #[test]
+    fn display_messages() {
+        assert_eq!(
+            SchedulerError::PodNotFound("agent-abc".into()).to_string(),
+            "Pod not found: agent-abc"
+        );
+        assert_eq!(
+            SchedulerError::Config("bad config".into()).to_string(),
+            "Configuration error: bad config"
+        );
+        assert_eq!(
+            SchedulerError::Timeout("30s".into()).to_string(),
+            "Timeout waiting for pod: 30s"
+        );
+    }
+}

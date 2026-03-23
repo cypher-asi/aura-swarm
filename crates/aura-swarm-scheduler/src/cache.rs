@@ -138,4 +138,44 @@ mod tests {
 
         assert!(cache.is_empty());
     }
+
+    #[test]
+    fn agent_ids_returns_all_keys() {
+        let cache = EndpointCache::new();
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+
+        let a1 = AgentId::generate_deterministic(&user_id, "a1", 1);
+        let a2 = AgentId::generate_deterministic(&user_id, "a2", 2);
+        let a3 = AgentId::generate_deterministic(&user_id, "a3", 3);
+
+        cache.insert(a1, "10.0.0.1:8080".to_string());
+        cache.insert(a2, "10.0.0.2:8080".to_string());
+        cache.insert(a3, "10.0.0.3:8080".to_string());
+
+        let ids = cache.agent_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&a1));
+        assert!(ids.contains(&a2));
+        assert!(ids.contains(&a3));
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let cache = EndpointCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        let agent_id = test_agent_id();
+        cache.insert(agent_id, "10.0.0.1:8080".to_string());
+
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let cache = EndpointCache::new();
+        let agent_id = test_agent_id();
+        assert!(cache.get(&agent_id).is_none());
+    }
 }
