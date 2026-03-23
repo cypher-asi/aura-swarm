@@ -124,6 +124,9 @@ struct ScheduleRequest<'a> {
 }
 
 /// Error response from the scheduler.
+///
+/// `code` is part of the wire schema and must be deserialized even though
+/// only `error` is currently surfaced to callers.
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     error: String,

@@ -39,7 +39,8 @@ pub trait JwtValidator: Send + Sync {
 /// Raw claims from a JWT before validation.
 #[derive(Debug, Deserialize)]
 struct RawClaims {
-    /// Issuer (validated by jsonwebtoken)
+    /// Issuer — not read directly but must be present for serde
+    /// deserialization; validated by the `jsonwebtoken` crate.
     #[allow(dead_code)]
     iss: String,
     /// Subject (`user_id` as UUID string)
@@ -49,7 +50,8 @@ struct RawClaims {
     aud: Audience,
     /// Expiration timestamp
     exp: u64,
-    /// Issued at timestamp (validated by jsonwebtoken)
+    /// Issued-at — not read directly but must be present for serde
+    /// deserialization; validated by the `jsonwebtoken` crate.
     #[allow(dead_code)]
     iat: u64,
 }

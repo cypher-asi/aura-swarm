@@ -40,6 +40,9 @@ impl WsSender {
     /// Send a `session_init` message to the harness.
     ///
     /// Must be sent immediately after connecting (both local and remote).
+    /// Currently unused — session init is sent inline during connect — but
+    /// retained as the canonical API for callers that manage the lifecycle
+    /// in two steps (connect then init).
     #[allow(dead_code)]
     pub async fn send_session_init(&self, init: SessionInit) -> Result<(), WsError> {
         let msg = InboundMessage::SessionInit(init);
