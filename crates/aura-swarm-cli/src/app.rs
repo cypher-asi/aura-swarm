@@ -1156,3 +1156,387 @@ impl App {
 
 /// Refresh interval for agent list.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    fn b64(s: &str) -> String {
+        STANDARD.encode(s)
+    }
+
+    fn make_tool_json(tool: &str, ok: bool, stdout: &str, stderr: &str) -> String {
+        serde_json::json!({
+            "tool": tool,
+            "ok": ok,
+            "stdout": b64(stdout),
+            "stderr": b64(stderr),
+        })
+        .to_string()
+    }
+
+    fn test_client() -> GatewayClient {
+        GatewayClient::new("http://test.local", "test-token")
+    }
+
+    // =========================================================================
+    // decode_base64
+    // =========================================================================
+
+    #[test]
+    fn decode_base64_valid() {
+        assert_eq!(decode_base64("SGVsbG8="), "Hello");
+    }
+
+    #[test]
+    fn decode_base64_invalid() {
+        assert_eq!(decode_base64("not-base64!!!"), "not-base64!!!");
+    }
+
+    #[test]
+    fn decode_base64_empty() {
+        assert_eq!(decode_base64(""), "");
+    }
+
+    // =========================================================================
+    // format_tool_result  (via ToolResult::parse + format)
+    // =========================================================================
+
+    #[test]
+    fn format_tool_result_fs_ls_few_lines() {
+        let json = make_tool_json("fs.ls", true, "file1.txt\nfile2.txt\ndir1", "");
+        let output = format_tool_result(&json);
+        assert!(output.contains("file1.txt"), "output: {output}");
+        assert!(output.contains("file2.txt"), "output: {output}");
+        assert!(output.contains("dir1"), "output: {output}");
+    }
+
+    #[test]
+    fn format_tool_result_cmd_run_empty() {
+        let json = make_tool_json("cmd.run", true, "", "");
+        let output = format_tool_result(&json);
+        assert_eq!(output, "(no output)");
+    }
+
+    #[test]
+    fn format_tool_result_error_with_stderr() {
+        let json = make_tool_json("cmd.run", false, "", "permission denied");
+        let output = format_tool_result(&json);
+        assert!(output.starts_with("Error:"), "output: {output}");
+        assert!(output.contains("permission denied"), "output: {output}");
+    }
+
+    #[test]
+    fn format_tool_result_invalid_json() {
+        let raw = "this is not json at all";
+        let output = format_tool_result(raw);
+        assert_eq!(output, raw);
+    }
+
+    #[test]
+    fn format_tool_result_invalid_json_long_truncated() {
+        let raw = "x".repeat(600);
+        let output = format_tool_result(&raw);
+        assert!(output.len() < raw.len(), "should be truncated");
+        assert!(output.ends_with("..."), "output: {output}");
+    }
+
+    // =========================================================================
+    // ToolResult::parse
+    // =========================================================================
+
+    #[test]
+    fn tool_result_parse_valid() {
+        let json = make_tool_json("fs.ls", true, "hello", "");
+        let tr = ToolResult::parse(&json).expect("should parse");
+        assert_eq!(tr.tool, "fs.ls");
+        assert!(tr.ok);
+        assert_eq!(tr.stdout, "hello");
+        assert!(tr.stderr.is_empty());
+    }
+
+    #[test]
+    fn tool_result_parse_missing_field() {
+        let json = r#"{"tool":"fs.ls"}"#;
+        assert!(ToolResult::parse(json).is_none());
+    }
+
+    // =========================================================================
+    // format_tool_args
+    // =========================================================================
+
+    #[test]
+    fn format_tool_args_fs_ls_with_path() {
+        let args = serde_json::json!({"path": "/tmp"});
+        let out = format_tool_args("fs.ls", &args);
+        assert!(out.contains("/tmp"), "output: {out}");
+        assert!(out.starts_with("ls "), "output: {out}");
+    }
+
+    #[test]
+    fn format_tool_args_cmd_run() {
+        let args = serde_json::json!({"command": "echo hello"});
+        let out = format_tool_args("cmd.run", &args);
+        assert!(out.contains("echo hello"), "output: {out}");
+    }
+
+    #[test]
+    fn format_tool_args_null_args() {
+        let out = format_tool_args("unknown", &serde_json::Value::Null);
+        assert_eq!(out, "unknown");
+    }
+
+    #[test]
+    fn format_tool_args_generic_compact() {
+        let args = serde_json::json!({"a": 1});
+        let out = format_tool_args("my_tool", &args);
+        assert!(out.contains("my_tool"), "output: {out}");
+        assert!(out.contains(r#""a":1"#) || out.contains(r#""a": 1"#), "output: {out}");
+    }
+
+    #[test]
+    fn format_tool_args_empty_object() {
+        let args = serde_json::json!({});
+        let out = format_tool_args("my_tool", &args);
+        assert_eq!(out, "my_tool");
+    }
+
+    // =========================================================================
+    // App state
+    // =========================================================================
+
+    #[test]
+    fn app_initial_state() {
+        let app = App::new(test_client());
+        assert!(!app.command_mode);
+        assert!(app.agents.is_empty());
+        assert_eq!(app.chat_scroll, 0);
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+        assert!(!app.should_quit);
+        assert!(!app.is_streaming);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn input_insert_delete() {
+        let mut app = App::new(test_client());
+        app.insert_char('a');
+        app.insert_char('b');
+        app.insert_char('c');
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor_position, 3);
+
+        app.delete_char();
+        assert_eq!(app.input, "ab");
+        assert_eq!(app.cursor_position, 2);
+    }
+
+    #[test]
+    fn input_move_cursor() {
+        let mut app = App::new(test_client());
+        for c in "hello".chars() {
+            app.insert_char(c);
+        }
+        assert_eq!(app.cursor_position, 5);
+
+        app.move_cursor_left();
+        assert_eq!(app.cursor_position, 4);
+
+        app.insert_char('X');
+        assert_eq!(app.input, "hellXo");
+        assert_eq!(app.cursor_position, 5);
+    }
+
+    #[test]
+    fn input_clear() {
+        let mut app = App::new(test_client());
+        app.insert_char('h');
+        app.insert_char('i');
+        assert_eq!(app.input, "hi");
+
+        app.clear_input();
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn take_input_clears() {
+        let mut app = App::new(test_client());
+        for c in "msg".chars() {
+            app.insert_char(c);
+        }
+        let taken = app.take_input();
+        assert_eq!(taken, "msg");
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn scroll_saturating() {
+        let mut app = App::new(test_client());
+        assert_eq!(app.chat_scroll, 0);
+
+        app.scroll_chat_down(5);
+        assert_eq!(app.chat_scroll, 0, "saturating_sub at 0 stays 0");
+
+        app.scroll_chat_up(3);
+        assert_eq!(app.chat_scroll, 3);
+
+        app.scroll_chat_down(1);
+        assert_eq!(app.chat_scroll, 2);
+    }
+
+    #[test]
+    fn select_agent_empty() {
+        let mut app = App::new(test_client());
+        app.select_next_agent();
+        assert!(app.selected_agent.is_none());
+
+        app.select_prev_agent();
+        assert!(app.selected_agent.is_none());
+    }
+
+    #[test]
+    fn set_status_clears_error() {
+        let mut app = App::new(test_client());
+        app.set_error("oops");
+        assert_eq!(app.error_message.as_deref(), Some("oops"));
+
+        app.set_status("ok");
+        assert_eq!(app.status_message.as_deref(), Some("ok"));
+        assert!(app.error_message.is_none(), "set_status should clear error");
+    }
+
+    #[test]
+    fn dialog_mode_saves_input() {
+        let mut app = App::new(test_client());
+        for c in "draft".chars() {
+            app.insert_char(c);
+        }
+        assert_eq!(app.cursor_position, 5);
+
+        app.enter_dialog_mode(InputMode::CreatingAgent);
+        assert_eq!(app.input_mode, InputMode::CreatingAgent);
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+
+        app.exit_dialog_mode();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.cursor_position, 5);
+    }
+
+    #[test]
+    fn delete_char_at_start_is_noop() {
+        let mut app = App::new(test_client());
+        app.delete_char();
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn delete_char_forward() {
+        let mut app = App::new(test_client());
+        for c in "abc".chars() {
+            app.insert_char(c);
+        }
+        app.move_cursor_left();
+        app.move_cursor_left();
+        assert_eq!(app.cursor_position, 1);
+
+        app.delete_char_forward();
+        assert_eq!(app.input, "ac");
+        assert_eq!(app.cursor_position, 1);
+    }
+
+    #[test]
+    fn delete_char_forward_at_end_is_noop() {
+        let mut app = App::new(test_client());
+        app.insert_char('a');
+        app.delete_char_forward();
+        assert_eq!(app.input, "a");
+    }
+
+    #[test]
+    fn move_cursor_boundaries() {
+        let mut app = App::new(test_client());
+        app.move_cursor_left();
+        assert_eq!(app.cursor_position, 0);
+
+        app.insert_char('x');
+        app.move_cursor_right();
+        assert_eq!(app.cursor_position, 1, "can't go past end");
+    }
+
+    #[test]
+    fn tick_animation_wraps() {
+        let mut app = App::new(test_client());
+        for _ in 0..20 {
+            let ch = app.spinner_char();
+            assert!(!ch.is_empty());
+            app.tick_animation();
+        }
+    }
+
+    #[test]
+    fn clear_error() {
+        let mut app = App::new(test_client());
+        app.set_error("fail");
+        assert!(app.error_message.is_some());
+        app.clear_error();
+        assert!(app.error_message.is_none());
+    }
+
+    #[test]
+    fn move_cursor_start_end() {
+        let mut app = App::new(test_client());
+        for c in "hello".chars() {
+            app.insert_char(c);
+        }
+        app.move_cursor_start();
+        assert_eq!(app.cursor_position, 0);
+        app.move_cursor_end();
+        assert_eq!(app.cursor_position, 5);
+    }
+
+    // =========================================================================
+    // ToolResult format variants
+    // =========================================================================
+
+    #[test]
+    fn format_tool_result_fs_read_empty() {
+        let json = make_tool_json("fs.read", true, "", "");
+        let output = format_tool_result(&json);
+        assert_eq!(output, "(empty file)");
+    }
+
+    #[test]
+    fn format_tool_result_fs_write_ok() {
+        let json = make_tool_json("fs.write", true, "Wrote 42 bytes to foo.txt", "");
+        let output = format_tool_result(&json);
+        assert!(output.contains("Wrote 42 bytes"), "output: {output}");
+    }
+
+    #[test]
+    fn format_tool_result_generic_ok_no_stdout() {
+        let json = make_tool_json("some.tool", true, "", "");
+        let output = format_tool_result(&json);
+        assert_eq!(output, "OK");
+    }
+
+    #[test]
+    fn format_tool_result_error_empty_stderr() {
+        let json = make_tool_json("cmd.run", false, "", "");
+        let output = format_tool_result(&json);
+        assert!(output.contains("Unknown error"), "output: {output}");
+    }
+
+    #[test]
+    fn format_tool_result_fs_ls_empty_dir() {
+        let json = make_tool_json("fs.ls", true, "", "");
+        let output = format_tool_result(&json);
+        assert_eq!(output, "(empty directory)");
+    }
+}

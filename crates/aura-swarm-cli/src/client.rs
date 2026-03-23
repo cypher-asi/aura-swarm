@@ -338,3 +338,56 @@ impl GatewayClient {
         format!("{}/v1/sessions/{}/ws", ws_base, session_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_trailing_slash() {
+        let client = GatewayClient::new("http://example.com/", "tok");
+        assert_eq!(client.base_url(), "http://example.com");
+    }
+
+    #[test]
+    fn new_preserves_clean_url() {
+        let client = GatewayClient::new("http://example.com", "tok");
+        assert_eq!(client.base_url(), "http://example.com");
+    }
+
+    #[test]
+    fn new_stores_token() {
+        let client = GatewayClient::new("http://example.com", "my-secret");
+        assert_eq!(client.token(), "my-secret");
+    }
+
+    #[test]
+    fn ws_url_http_to_ws() {
+        let client = GatewayClient::new("http://localhost:8080", "tok");
+        let url = client.ws_url("sess-1");
+        assert!(url.starts_with("ws://"), "url: {url}");
+        assert!(!url.contains("http://"), "url: {url}");
+    }
+
+    #[test]
+    fn ws_url_https_to_wss() {
+        let client = GatewayClient::new("https://gateway.example.com", "tok");
+        let url = client.ws_url("sess-2");
+        assert!(url.starts_with("wss://"), "url: {url}");
+        assert!(!url.contains("https://"), "url: {url}");
+    }
+
+    #[test]
+    fn ws_url_includes_session_id() {
+        let client = GatewayClient::new("http://localhost:8080", "tok");
+        let url = client.ws_url("abc-123");
+        assert_eq!(url, "ws://localhost:8080/v1/sessions/abc-123/ws");
+    }
+
+    #[test]
+    fn ws_url_with_trailing_slash_base() {
+        let client = GatewayClient::new("https://api.example.com/", "tok");
+        let url = client.ws_url("s1");
+        assert_eq!(url, "wss://api.example.com/v1/sessions/s1/ws");
+    }
+}

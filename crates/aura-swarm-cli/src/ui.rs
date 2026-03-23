@@ -668,3 +668,97 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // truncate_middle
+    // =========================================================================
+
+    #[test]
+    fn truncate_middle_short_unchanged() {
+        assert_eq!(truncate_middle("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_middle_exact_length() {
+        assert_eq!(truncate_middle("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_middle_long_string() {
+        let result = truncate_middle("abcdefghij", 7);
+        assert_eq!(result.len(), 7);
+        assert!(result.contains("..."), "result: {result}");
+        assert!(result.starts_with("ab"), "result: {result}");
+        assert!(result.ends_with("ij"), "result: {result}");
+    }
+
+    #[test]
+    fn truncate_middle_very_small_max() {
+        let result = truncate_middle("abcdefghij", 3);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn truncate_middle_url() {
+        let url = "http://very-long-gateway-hostname.example.com:8080/api";
+        let result = truncate_middle(url, 20);
+        assert!(result.len() <= 20, "result len: {}", result.len());
+        assert!(result.contains("..."), "result: {result}");
+    }
+
+    // =========================================================================
+    // calculate_wrapped_line_count
+    // =========================================================================
+
+    #[test]
+    fn wrapped_line_count_empty_text() {
+        let text = Text::from(vec![]);
+        let count = calculate_wrapped_line_count(&text, 80);
+        assert_eq!(count, 2, "just the safety margin");
+    }
+
+    #[test]
+    fn wrapped_line_count_single_short_line() {
+        let text = Text::from("hello");
+        let count = calculate_wrapped_line_count(&text, 80);
+        assert_eq!(count, 3, "1 line + 2 safety margin");
+    }
+
+    #[test]
+    fn wrapped_line_count_wrapping() {
+        let long_line = "a".repeat(160);
+        let text = Text::from(long_line);
+        let count = calculate_wrapped_line_count(&text, 80);
+        assert!(count >= 4, "160 chars / 80 width = 2 wrapped + extra + margin = >= 4, got {count}");
+    }
+
+    #[test]
+    fn wrapped_line_count_zero_width() {
+        let text = Text::from(vec![Line::from("hello"), Line::from("world")]);
+        let count = calculate_wrapped_line_count(&text, 0);
+        assert_eq!(count, 2, "zero width falls back to line count");
+    }
+
+    #[test]
+    fn wrapped_line_count_multiple_lines() {
+        let text = Text::from(vec![
+            Line::from("short"),
+            Line::from(""),
+            Line::from("also short"),
+        ]);
+        let count = calculate_wrapped_line_count(&text, 80);
+        assert_eq!(count, 5, "3 lines + 2 safety margin");
+    }
+
+    #[test]
+    fn wrapped_line_count_empty_lines_counted() {
+        let text = Text::from(vec![Line::from(""), Line::from(""), Line::from("")]);
+        let count = calculate_wrapped_line_count(&text, 80);
+        assert_eq!(count, 5, "3 empty lines + 2 safety margin");
+    }
+}

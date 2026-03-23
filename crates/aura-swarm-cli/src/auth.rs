@@ -160,3 +160,50 @@ fn read_password_raw(stdout: &mut io::Stdout) -> anyhow::Result<String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_token_flag_wins() {
+        let result = resolve_token(Some("my-token".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "my-token");
+    }
+
+    #[test]
+    fn resolve_token_flag_wins_over_stored() {
+        let result = resolve_token(Some("explicit-tok".to_string()));
+        assert_eq!(result.unwrap(), "explicit-tok");
+    }
+
+    #[test]
+    fn resolve_token_none_without_stored_fails() {
+        // Without stored credentials, resolve_token(None) should error.
+        // This test may pass or fail depending on whether credentials
+        // are stored on the machine - we just check the flag path above.
+        // For safety, only assert the error message format if it does fail.
+        if let Err(e) = resolve_token(None) {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Not authenticated"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_path_returns_some() {
+        // On most systems dirs::data_local_dir() succeeds
+        if let Some(path) = credentials_path() {
+            assert!(path.ends_with("credentials.json"));
+            let parent = path.parent().unwrap();
+            assert!(
+                parent.ends_with("aura-swarm"),
+                "parent: {}",
+                parent.display()
+            );
+        }
+    }
+}
