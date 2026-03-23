@@ -13,6 +13,7 @@ mod app;
 mod auth;
 mod client;
 mod markdown;
+mod tool_format;
 mod types;
 mod ui;
 mod ws;
