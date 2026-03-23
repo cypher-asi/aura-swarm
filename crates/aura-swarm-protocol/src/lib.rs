@@ -266,4 +266,95 @@ mod tests {
             _ => panic!("Expected Error"),
         }
     }
+
+    #[test]
+    fn thinking_delta_deserializes() {
+        let json = r#"{"type":"thinking_delta","thinking":"Let me consider..."}"#;
+        let msg: OutboundMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            OutboundMessage::ThinkingDelta { thinking } => {
+                assert_eq!(thinking, "Let me consider...");
+            }
+            _ => panic!("Expected ThinkingDelta"),
+        }
+    }
+
+    #[test]
+    fn tool_call_deserializes() {
+        let json = r#"{"type":"tool_use_start","id":"call-1","name":"fs_read"}"#;
+        let msg: OutboundMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            OutboundMessage::ToolUseStart { id, name } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "fs_read");
+            }
+            _ => panic!("Expected ToolUseStart"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_deserializes() {
+        let json = r#"{"type":"tool_result","name":"fs_read","result":"contents","is_error":false}"#;
+        let msg: OutboundMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            OutboundMessage::ToolResult {
+                name,
+                result,
+                is_error,
+            } => {
+                assert_eq!(name, "fs_read");
+                assert_eq!(result, "contents");
+                assert!(!is_error);
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn assistant_message_start_deserializes() {
+        let json = r#"{"type":"assistant_message_start","message_id":"msg-42"}"#;
+        let msg: OutboundMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            OutboundMessage::AssistantMessageStart { message_id } => {
+                assert_eq!(message_id, "msg-42");
+            }
+            _ => panic!("Expected AssistantMessageStart"),
+        }
+    }
+
+    #[test]
+    fn text_delta_deserializes() {
+        let json = r#"{"type":"text_delta","text":"Hello world"}"#;
+        let msg: OutboundMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            OutboundMessage::TextDelta { text } => {
+                assert_eq!(text, "Hello world");
+            }
+            _ => panic!("Expected TextDelta"),
+        }
+    }
+
+    #[test]
+    fn inbound_tool_callback_response_serializes() {
+        let msg = InboundMessage::ToolCallbackResponse(ToolCallbackResponse {
+            callback_id: "cb-99".into(),
+            result: "done".into(),
+            is_error: false,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"tool_callback_response\""));
+        assert!(json.contains("\"callback_id\":\"cb-99\""));
+    }
+
+    #[test]
+    fn session_usage_defaults() {
+        let usage = SessionUsage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cumulative_input_tokens, 0);
+        assert_eq!(usage.cumulative_output_tokens, 0);
+        assert_eq!(usage.context_utilization, 0.0);
+        assert!(usage.model.is_empty());
+        assert!(usage.provider.is_empty());
+    }
 }
