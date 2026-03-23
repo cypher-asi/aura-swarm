@@ -2,6 +2,7 @@
 //!
 //! These types define the API contracts for agent and session management.
 
+use aura_swarm_core::AgentId;
 use aura_swarm_store::AgentSpec;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,10 @@ pub struct CreateAgentRequest {
     /// Optional resource specification. Uses defaults if not provided.
     #[serde(default)]
     pub spec: Option<AgentSpec>,
+    /// Optional caller-supplied agent ID (e.g. from aura-network).
+    /// If omitted, one is generated automatically via HKDF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
 }
 
 impl CreateAgentRequest {
@@ -22,6 +27,7 @@ impl CreateAgentRequest {
         Self {
             name: name.into(),
             spec: None,
+            agent_id: None,
         }
     }
 
@@ -31,7 +37,15 @@ impl CreateAgentRequest {
         Self {
             name: name.into(),
             spec: Some(spec),
+            agent_id: None,
         }
+    }
+
+    /// Set a caller-supplied agent ID (e.g. propagated from aura-network).
+    #[must_use]
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
     }
 }
 
@@ -142,6 +156,7 @@ mod tests {
         let req = CreateAgentRequest::new("my-agent");
         assert_eq!(req.name, "my-agent");
         assert!(req.spec.is_none());
+        assert!(req.agent_id.is_none());
     }
 
     #[test]
@@ -156,6 +171,15 @@ mod tests {
         let req = CreateAgentRequest::with_spec("my-agent", spec.clone());
         assert_eq!(req.name, "my-agent");
         assert_eq!(req.spec.unwrap().cpu_millicores, 1000);
+        assert!(req.agent_id.is_none());
+    }
+
+    #[test]
+    fn create_agent_request_with_agent_id() {
+        let id = AgentId::from_uuid(uuid::Uuid::new_v4());
+        let req = CreateAgentRequest::new("my-agent").with_agent_id(id);
+        assert_eq!(req.name, "my-agent");
+        assert_eq!(req.agent_id, Some(id));
     }
 
     #[test]

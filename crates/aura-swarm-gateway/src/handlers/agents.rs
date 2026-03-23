@@ -77,6 +77,10 @@ pub struct CreateAgentBody {
     /// Optional resource specification.
     #[serde(default)]
     pub spec: Option<AgentSpec>,
+    /// Optional caller-supplied agent ID (e.g. from aura-network).
+    /// If omitted, one is generated automatically.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// Response for lifecycle operations (start, stop, etc.).
@@ -207,11 +211,16 @@ where
         ));
     }
 
-    let request = if let Some(spec) = body.spec {
+    let mut request = if let Some(spec) = body.spec {
         CreateAgentRequest::with_spec(body.name, spec)
     } else {
         CreateAgentRequest::new(body.name)
     };
+
+    if let Some(id_str) = body.agent_id {
+        let id = parse_agent_id(&id_str)?;
+        request = request.with_agent_id(id);
+    }
 
     let agent = state.control.create_agent(&user.user_id, request).await?;
 

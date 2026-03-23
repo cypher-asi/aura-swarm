@@ -97,12 +97,17 @@ impl GatewayClient {
         Ok(body.agents)
     }
 
-    /// Create a new agent.
-    pub async fn create_agent(&self, name: &str) -> Result<Agent, ClientError> {
+    /// Create a new agent, optionally supplying an existing agent ID.
+    pub async fn create_agent(
+        &self,
+        name: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Agent, ClientError> {
         let url = format!("{}/v1/agents", self.base_url);
 
         let request = CreateAgentRequest {
             name: name.to_string(),
+            agent_id: agent_id.map(String::from),
         };
 
         let response = self

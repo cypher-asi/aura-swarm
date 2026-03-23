@@ -357,7 +357,9 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
 
         let now = Utc::now();
         let spec = request.spec.unwrap_or_default();
-        let agent_id = AgentId::generate(user_id, &request.name);
+        let agent_id = request
+            .agent_id
+            .unwrap_or_else(|| AgentId::generate(user_id, &request.name));
 
         let agent = Agent {
             agent_id,
@@ -736,6 +738,18 @@ mod tests {
         assert_eq!(agent.name, "test-agent");
         assert_eq!(agent.user_id, user_id);
         assert_eq!(agent.status, AgentState::Provisioning);
+    }
+
+    #[tokio::test]
+    async fn create_agent_with_supplied_id() {
+        let (service, _dir, user_id) = setup();
+
+        let supplied_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+        let request = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
+        let agent = service.create_agent(&user_id, request).await.unwrap();
+
+        assert_eq!(agent.agent_id, supplied_id);
+        assert_eq!(agent.name, "test-agent");
     }
 
     #[tokio::test]

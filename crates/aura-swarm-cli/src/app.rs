@@ -632,7 +632,7 @@ impl App {
 
     /// Create a new agent.
     pub async fn create_agent(&mut self, name: &str) -> Result<(), ClientError> {
-        let agent = self.client.create_agent(name).await?;
+        let agent = self.client.create_agent(name, None).await?;
         self.set_status(format!("Created agent: {}", agent.name));
         self.refresh_agents().await?;
 

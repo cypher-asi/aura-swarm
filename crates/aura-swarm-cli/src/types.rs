@@ -107,6 +107,9 @@ pub struct ListAgentsResponse {
 pub struct CreateAgentRequest {
     /// Human-readable name for the agent.
     pub name: String,
+    /// Optional caller-supplied agent ID (e.g. from aura-network).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Response for lifecycle operations.
