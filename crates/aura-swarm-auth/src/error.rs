@@ -83,3 +83,57 @@ impl AuthError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_error_variants_status_codes() {
+        assert_eq!(AuthError::TokenExpired.http_status_code(), 401);
+        assert_eq!(AuthError::InvalidSignature.http_status_code(), 401);
+        assert_eq!(AuthError::InvalidIssuer.http_status_code(), 401);
+        assert_eq!(AuthError::InvalidAudience.http_status_code(), 401);
+        assert_eq!(AuthError::InvalidUserId.http_status_code(), 401);
+        assert_eq!(AuthError::MissingClaim("x".into()).http_status_code(), 401);
+        assert_eq!(AuthError::InvalidToken("x".into()).http_status_code(), 401);
+        assert_eq!(
+            AuthError::ZosApi {
+                status: 403,
+                code: "forbidden".into(),
+                message: "no access".into(),
+            }
+            .http_status_code(),
+            403
+        );
+        assert_eq!(AuthError::KeyNotFound("k".into()).http_status_code(), 500);
+        assert_eq!(
+            AuthError::JwksFetchFailed("f".into()).http_status_code(),
+            500
+        );
+        assert_eq!(AuthError::Internal("i".into()).http_status_code(), 500);
+    }
+
+    #[test]
+    fn all_error_variants_retriable() {
+        assert!(AuthError::TokenExpired.is_retriable());
+        assert!(AuthError::JwksFetchFailed("fail".into()).is_retriable());
+
+        assert!(!AuthError::InvalidSignature.is_retriable());
+        assert!(!AuthError::InvalidIssuer.is_retriable());
+        assert!(!AuthError::InvalidAudience.is_retriable());
+        assert!(!AuthError::InvalidUserId.is_retriable());
+        assert!(!AuthError::MissingClaim("x".into()).is_retriable());
+        assert!(!AuthError::InvalidToken("x".into()).is_retriable());
+        assert!(!AuthError::KeyNotFound("k".into()).is_retriable());
+        assert!(!AuthError::Internal("i".into()).is_retriable());
+        assert!(
+            !AuthError::ZosApi {
+                status: 500,
+                code: "err".into(),
+                message: "msg".into(),
+            }
+            .is_retriable()
+        );
+    }
+}

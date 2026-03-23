@@ -257,4 +257,36 @@ mod tests {
         let result = JwksProvider::parse_key(&key).unwrap();
         assert!(result.is_none());
     }
+
+    #[test]
+    fn parse_key_missing_kid_skipped() {
+        let key = JwkKey {
+            kty: "OKP".to_string(),
+            crv: None,
+            x: Some("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo".to_string()),
+            n: None,
+            e: None,
+            kid: None,
+            key_use: None,
+            alg: None,
+        };
+        let result = JwksProvider::parse_key(&key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_key_unknown_kty_skipped() {
+        let key = JwkKey {
+            kty: "EC".to_string(),
+            crv: Some("P-256".to_string()),
+            x: Some("somevalue".to_string()),
+            n: None,
+            e: None,
+            kid: Some("ec-key".to_string()),
+            key_use: Some("sig".to_string()),
+            alg: Some("ES256".to_string()),
+        };
+        let result = JwksProvider::parse_key(&key).unwrap();
+        assert!(result.is_none());
+    }
 }

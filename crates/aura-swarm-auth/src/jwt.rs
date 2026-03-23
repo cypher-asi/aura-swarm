@@ -212,4 +212,24 @@ mod tests {
         let result = validator.validate("test-token:not-a-uuid").await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn audience_single_contains() {
+        assert!(Audience::Single("test".into()).contains("test"));
+    }
+
+    #[test]
+    fn audience_single_not_contains() {
+        assert!(!Audience::Single("test".into()).contains("other"));
+    }
+
+    #[test]
+    fn audience_multiple_contains() {
+        assert!(Audience::Multiple(vec!["a".into(), "b".into()]).contains("b"));
+    }
+
+    #[test]
+    fn audience_none_contains() {
+        assert!(!Audience::None.contains("test"));
+    }
 }
