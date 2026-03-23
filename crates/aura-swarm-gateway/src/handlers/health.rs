@@ -9,11 +9,11 @@ use serde::Serialize;
 
 /// Health check response.
 #[derive(Debug, Serialize)]
-pub struct HealthResponse {
+pub(crate) struct HealthResponse {
     /// Service status.
-    pub status: &'static str,
+    pub(crate) status: &'static str,
     /// Service version.
-    pub version: &'static str,
+    pub(crate) version: &'static str,
 }
 
 /// Health check handler.
@@ -32,7 +32,7 @@ pub struct HealthResponse {
 ///   "version": "0.1.0"
 /// }
 /// ```
-pub async fn health() -> impl IntoResponse {
+pub(crate) async fn health() -> impl IntoResponse {
     let response = HealthResponse {
         status: "healthy",
         version: env!("CARGO_PKG_VERSION"),

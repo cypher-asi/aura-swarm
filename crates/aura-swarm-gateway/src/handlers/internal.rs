@@ -28,30 +28,30 @@ use crate::state::GatewayState;
 
 /// Request body for updating agent status.
 #[derive(Debug, Deserialize)]
-pub struct StatusUpdateRequest {
+pub(crate) struct StatusUpdateRequest {
     /// The new agent state.
-    pub status: AgentState,
+    pub(crate) status: AgentState,
     /// Optional message describing the status change.
     #[serde(default)]
-    pub message: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 /// Response for status update.
 #[derive(Debug, Serialize)]
-pub struct StatusUpdateResponse {
+pub(crate) struct StatusUpdateResponse {
     /// Whether the update was successful.
-    pub success: bool,
+    pub(crate) success: bool,
     /// The agent's new status.
-    pub status: AgentState,
+    pub(crate) status: AgentState,
 }
 
 /// Error response for internal endpoints.
 #[derive(Debug, Serialize)]
-pub struct InternalErrorResponse {
+pub(crate) struct InternalErrorResponse {
     /// Error message.
-    pub error: String,
+    pub(crate) error: String,
     /// Error code.
-    pub code: u16,
+    pub(crate) code: u16,
 }
 
 // =============================================================================
@@ -74,7 +74,7 @@ pub struct InternalErrorResponse {
 /// # Errors
 ///
 /// Returns an error if the agent ID is invalid or the store update fails.
-pub async fn update_agent_status<C, V>(
+pub(crate) async fn update_agent_status<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
     Json(body): Json<StatusUpdateRequest>,
@@ -151,7 +151,7 @@ where
 /// Health check for internal services.
 ///
 /// This is a simple endpoint that schedulers can use to verify connectivity.
-pub async fn internal_health() -> impl IntoResponse {
+pub(crate) async fn internal_health() -> impl IntoResponse {
     #[derive(Serialize)]
     struct InternalHealthResponse {
         status: &'static str,

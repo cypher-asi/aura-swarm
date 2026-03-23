@@ -32,7 +32,7 @@ use crate::state::GatewayState;
 ///
 /// Returns an error if the session is not found, the user doesn't own it,
 /// the session is not active, or the agent is unavailable.
-pub async fn websocket_handler<C, V>(
+pub(crate) async fn websocket_handler<C, V>(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(session_id): Path<String>,

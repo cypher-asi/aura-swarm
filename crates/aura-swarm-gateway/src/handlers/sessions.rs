@@ -25,31 +25,31 @@ use crate::state::GatewayState;
 
 /// Response for a created session.
 #[derive(Debug, Serialize)]
-pub struct CreateSessionResponse {
+pub(crate) struct CreateSessionResponse {
     /// Session ID.
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// Agent ID.
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// WebSocket URL for connecting to this session.
-    pub ws_url: String,
+    pub(crate) ws_url: String,
     /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub(crate) created_at: DateTime<Utc>,
 }
 
 /// Response for a session.
 #[derive(Debug, Serialize)]
-pub struct SessionResponse {
+pub(crate) struct SessionResponse {
     /// Session ID.
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// Agent ID.
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// Current status.
-    pub status: SessionStatus,
+    pub(crate) status: SessionStatus,
     /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub(crate) created_at: DateTime<Utc>,
     /// When the session was closed (if closed).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub closed_at: Option<DateTime<Utc>>,
+    pub(crate) closed_at: Option<DateTime<Utc>>,
 }
 
 impl From<Session> for SessionResponse {
@@ -66,9 +66,9 @@ impl From<Session> for SessionResponse {
 
 /// Response for listing sessions.
 #[derive(Debug, Serialize)]
-pub struct ListSessionsResponse {
+pub(crate) struct ListSessionsResponse {
     /// List of sessions.
-    pub sessions: Vec<SessionResponse>,
+    pub(crate) sessions: Vec<SessionResponse>,
 }
 
 // =============================================================================
@@ -77,10 +77,10 @@ pub struct ListSessionsResponse {
 
 /// Request body for creating a session.
 #[derive(Debug, Deserialize, Default)]
-pub struct CreateSessionRequest {
+pub(crate) struct CreateSessionRequest {
     /// Per-session configuration for the harness runtime.
     #[serde(default)]
-    pub config: SessionConfig,
+    pub(crate) config: SessionConfig,
 }
 
 // =============================================================================
@@ -95,7 +95,7 @@ pub struct CreateSessionRequest {
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the agent is not in a runnable state.
-pub async fn create_session<C, V>(
+pub(crate) async fn create_session<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -128,7 +128,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the session is not found or the user doesn't own it.
-pub async fn get_session<C, V>(
+pub(crate) async fn get_session<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(session_id): Path<String>,
@@ -152,7 +152,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the agent is not found or the user doesn't own it.
-pub async fn list_sessions<C, V>(
+pub(crate) async fn list_sessions<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -180,7 +180,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the session is not found or the user doesn't own it.
-pub async fn close_session<C, V>(
+pub(crate) async fn close_session<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(session_id): Path<String>,

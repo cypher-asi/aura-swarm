@@ -25,26 +25,26 @@ use crate::state::GatewayState;
 
 /// Response for a single agent.
 #[derive(Debug, Serialize)]
-pub struct AgentResponse {
+pub(crate) struct AgentResponse {
     /// Agent ID.
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// Human-readable name.
-    pub name: String,
+    pub(crate) name: String,
     /// Current status.
-    pub status: AgentState,
+    pub(crate) status: AgentState,
     /// Resource specification.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub spec: Option<AgentSpec>,
+    pub(crate) spec: Option<AgentSpec>,
     /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
+    pub(crate) created_at: DateTime<Utc>,
     /// Last update timestamp.
-    pub updated_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
     /// Last heartbeat timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
     /// Error message if agent failed (e.g., provisioning error).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
+    pub(crate) error_message: Option<String>,
 }
 
 impl From<Agent> for AgentResponse {
@@ -64,43 +64,43 @@ impl From<Agent> for AgentResponse {
 
 /// Response for agent list.
 #[derive(Debug, Serialize)]
-pub struct ListAgentsResponse {
+pub(crate) struct ListAgentsResponse {
     /// List of agents.
-    pub agents: Vec<AgentResponse>,
+    pub(crate) agents: Vec<AgentResponse>,
 }
 
 /// Request to create an agent.
 #[derive(Debug, Deserialize)]
-pub struct CreateAgentBody {
+pub(crate) struct CreateAgentBody {
     /// Human-readable name for the agent.
-    pub name: String,
+    pub(crate) name: String,
     /// Optional resource specification.
     #[serde(default)]
-    pub spec: Option<AgentSpec>,
+    pub(crate) spec: Option<AgentSpec>,
     /// Optional caller-supplied agent ID (e.g. from aura-network).
     /// If omitted, one is generated automatically.
     #[serde(default)]
-    pub agent_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
 }
 
 /// Response for lifecycle operations (start, stop, etc.).
 #[derive(Debug, Serialize)]
-pub struct LifecycleResponse {
+pub(crate) struct LifecycleResponse {
     /// Agent ID.
-    pub agent_id: String,
+    pub(crate) agent_id: String,
     /// New status after the operation.
-    pub status: AgentState,
+    pub(crate) status: AgentState,
 }
 
 /// Query parameters for log retrieval.
 #[derive(Debug, Deserialize)]
-pub struct LogQuery {
+pub(crate) struct LogQuery {
     /// Number of lines to retrieve (default: 100).
     #[serde(default = "default_tail")]
-    pub tail: u32,
+    pub(crate) tail: u32,
     /// Retrieve logs since this timestamp.
     #[serde(default)]
-    pub since: Option<String>,
+    pub(crate) since: Option<String>,
 }
 
 const fn default_tail() -> u32 {
@@ -109,45 +109,45 @@ const fn default_tail() -> u32 {
 
 /// Response for agent logs.
 #[derive(Debug, Serialize)]
-pub struct LogsResponse {
+pub(crate) struct LogsResponse {
     /// Log entries.
-    pub logs: Vec<LogEntry>,
+    pub(crate) logs: Vec<LogEntry>,
 }
 
 /// A single log entry.
 #[derive(Debug, Serialize)]
-pub struct LogEntry {
+pub(crate) struct LogEntry {
     /// Timestamp of the log.
-    pub timestamp: DateTime<Utc>,
+    pub(crate) timestamp: DateTime<Utc>,
     /// Log level.
-    pub level: String,
+    pub(crate) level: String,
     /// Log message.
-    pub message: String,
+    pub(crate) message: String,
 }
 
 /// Response for agent status.
 #[derive(Debug, Serialize)]
-pub struct StatusResponse {
+pub(crate) struct StatusResponse {
     /// Current agent status.
-    pub status: AgentState,
+    pub(crate) status: AgentState,
     /// Uptime in seconds.
-    pub uptime_seconds: u64,
+    pub(crate) uptime_seconds: u64,
     /// Number of active sessions.
-    pub active_sessions: u32,
+    pub(crate) active_sessions: u32,
     /// Last heartbeat timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
     /// Resource usage.
-    pub resource_usage: ResourceUsage,
+    pub(crate) resource_usage: ResourceUsage,
 }
 
 /// Resource usage metrics.
 #[derive(Debug, Serialize)]
-pub struct ResourceUsage {
+pub(crate) struct ResourceUsage {
     /// CPU usage percentage (0-100).
-    pub cpu_percent: f64,
+    pub(crate) cpu_percent: f64,
     /// Memory usage in megabytes.
-    pub memory_mb: u64,
+    pub(crate) memory_mb: u64,
 }
 
 // =============================================================================
@@ -159,7 +159,7 @@ pub struct ResourceUsage {
 /// # Errors
 ///
 /// Returns an error if the control plane operation fails.
-pub async fn list_agents<C, V>(
+pub(crate) async fn list_agents<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
 ) -> Result<impl IntoResponse, ApiError>
@@ -184,7 +184,7 @@ where
 /// - The agent name is invalid
 /// - The user has reached their quota
 /// - The control plane operation fails
-pub async fn create_agent<C, V>(
+pub(crate) async fn create_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Json(body): Json<CreateAgentBody>,
@@ -232,7 +232,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the agent is not found or the user doesn't own it.
-pub async fn get_agent<C, V>(
+pub(crate) async fn get_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -253,7 +253,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the agent is not in a stopped state.
-pub async fn delete_agent<C, V>(
+pub(crate) async fn delete_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -274,7 +274,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the state transition is invalid.
-pub async fn start_agent<C, V>(
+pub(crate) async fn start_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -298,7 +298,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the state transition is invalid.
-pub async fn stop_agent<C, V>(
+pub(crate) async fn stop_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -322,7 +322,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the state transition is invalid.
-pub async fn restart_agent<C, V>(
+pub(crate) async fn restart_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -349,7 +349,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the state transition is invalid.
-pub async fn hibernate_agent<C, V>(
+pub(crate) async fn hibernate_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -376,7 +376,7 @@ where
 ///
 /// Returns an error if the agent is not found, the user doesn't own it,
 /// or the state transition is invalid.
-pub async fn wake_agent<C, V>(
+pub(crate) async fn wake_agent<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -402,7 +402,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the agent ID is invalid.
-pub async fn get_logs<C, V>(
+pub(crate) async fn get_logs<C, V>(
     State(_state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
@@ -436,7 +436,7 @@ where
 ///
 /// Returns an error if the agent is not found or the user doesn't own it.
 #[allow(clippy::cast_sign_loss)]
-pub async fn get_status<C, V>(
+pub(crate) async fn get_status<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,

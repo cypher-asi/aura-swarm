@@ -68,12 +68,12 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-pub mod auth;
-pub mod config;
-pub mod error;
-pub mod handlers;
-pub mod routes;
-pub mod state;
+pub(crate) mod auth;
+pub(crate) mod config;
+pub(crate) mod error;
+pub(crate) mod handlers;
+pub(crate) mod routes;
+pub(crate) mod state;
 
 pub use config::GatewayConfig;
 pub use error::ApiError;
