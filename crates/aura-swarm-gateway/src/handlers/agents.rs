@@ -500,6 +500,9 @@ pub(crate) struct AgentStateResponse {
     /// Isolation level ("container" or "micro_vm").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) isolation: Option<String>,
+    /// Pod network endpoint (IP:port) if running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
     /// When the agent was created.
     pub(crate) created_at: DateTime<Utc>,
 }
@@ -533,6 +536,7 @@ where
     };
 
     let isolation = agent.spec.isolation.map(|i| format!("{i:?}").to_lowercase());
+    let endpoint = state.control.resolve_agent_endpoint(&agent.agent_id).await.ok().flatten();
 
     Ok(Json(AgentStateResponse {
         state: agent.status,
@@ -546,6 +550,7 @@ where
         memory_mb: agent.spec.memory_mb,
         runtime_version: agent.spec.runtime_version,
         isolation,
+        endpoint,
         created_at: agent.created_at,
     }))
 }
