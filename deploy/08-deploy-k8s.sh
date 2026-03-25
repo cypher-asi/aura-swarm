@@ -258,6 +258,84 @@ rm -rf "${DEPLOY_TMP_DIR}"
 echo ""
 
 #------------------------------------------------------------------------------
+# Pre-flight: verify EFS CSI driver + PVCs before waiting on deployments
+#------------------------------------------------------------------------------
+
+echo "Checking EFS CSI driver health..."
+
+EFS_CSI_RUNNING=$(kubectl get pods -n kube-system -l app=efs-csi-controller \
+    --no-headers 2>/dev/null | grep -c "Running" || true)
+
+if [[ "$EFS_CSI_RUNNING" -eq 0 ]]; then
+    echo -e "${RED}✗${NC} EFS CSI controller is not running!"
+    echo "  The gateway and control PVCs will not provision without it."
+    echo "  Run ./05-configure-eks.sh to install the EFS CSI driver, then re-run this script."
+    echo ""
+    echo "  Quick check:  kubectl get pods -n kube-system -l app=efs-csi-controller"
+    exit 1
+fi
+
+echo -e "${GREEN}✓${NC} EFS CSI controller is running"
+echo ""
+
+echo "Waiting for PVCs to bind (up to 60s)..."
+
+PVC_TIMEOUT=60
+PVC_INTERVAL=5
+PVC_ELAPSED=0
+PVC_OK=false
+
+while [[ $PVC_ELAPSED -lt $PVC_TIMEOUT ]]; do
+    GW_PVC=$(kubectl get pvc aura-swarm-gateway-data -n "${K8S_NAMESPACE_SYSTEM}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+    CTL_PVC=$(kubectl get pvc aura-swarm-control-data -n "${K8S_NAMESPACE_SYSTEM}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+
+    echo "  [${PVC_ELAPSED}s] gateway-data=${GW_PVC}  control-data=${CTL_PVC}"
+
+    if [[ "$GW_PVC" == "Bound" && "$CTL_PVC" == "Bound" ]]; then
+        PVC_OK=true
+        break
+    fi
+    sleep "$PVC_INTERVAL"
+    PVC_ELAPSED=$((PVC_ELAPSED + PVC_INTERVAL))
+done
+
+echo ""
+
+if [[ "$PVC_OK" == "true" ]]; then
+    echo -e "${GREEN}✓${NC} All PVCs bound"
+else
+    echo -e "${RED}✗${NC} PVCs did not bind within ${PVC_TIMEOUT}s"
+    echo ""
+
+    for PVC_NAME in aura-swarm-gateway-data aura-swarm-control-data; do
+        PVC_PHASE=$(kubectl get pvc "$PVC_NAME" -n "${K8S_NAMESPACE_SYSTEM}" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+        if [[ "$PVC_PHASE" != "Bound" ]]; then
+            echo "  --- ${PVC_NAME} (${PVC_PHASE}) ---"
+            kubectl get events -n "${K8S_NAMESPACE_SYSTEM}" \
+                --field-selector "involvedObject.name=${PVC_NAME}" \
+                --sort-by='.lastTimestamp' 2>/dev/null | tail -5
+            echo ""
+        fi
+    done
+
+    echo -e "${YELLOW}Common causes:${NC}"
+    echo "  1. IRSA misconfigured — trust policy doesn't match cluster OIDC provider"
+    echo "     Fix: re-run ./05-configure-eks.sh (it reconciles the trust policy)"
+    echo "  2. EFS CSI driver unhealthy"
+    echo "     Check: kubectl logs -n kube-system -l app=efs-csi-controller --tail=20"
+    echo "  3. EFS mount targets not reachable from node subnets"
+    echo "     Check: security groups allow NFS (2049) from agent subnets to EFS"
+    echo ""
+    echo "After fixing, re-run this script."
+    exit 1
+fi
+
+echo ""
+
+#------------------------------------------------------------------------------
 # Wait for deployments
 #------------------------------------------------------------------------------
 

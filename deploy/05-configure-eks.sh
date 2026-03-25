@@ -56,24 +56,26 @@ echo ""
 
 echo "Installing AWS EFS CSI Driver..."
 
-# Get OIDC provider URL
-OIDC_PROVIDER=$(terraform output -json | jq -r '.eks_oidc_provider_url.value // empty')
+# Get OIDC provider URL directly from the cluster (single source of truth)
+OIDC_ISSUER_URL=$(aws eks describe-cluster \
+    --name "${EKS_CLUSTER_NAME}" \
+    --query "cluster.identity.oidc.issuer" \
+    --output text)
+OIDC_PROVIDER="${OIDC_ISSUER_URL#https://}"
 
 if [[ -z "$OIDC_PROVIDER" ]]; then
-    echo -e "${RED}✗${NC} Could not get OIDC provider URL"
+    echo -e "${RED}✗${NC} Could not get OIDC provider URL from cluster"
     exit 1
 fi
 
-# Create IAM role for EFS CSI driver
+echo "  OIDC provider: ${OIDC_PROVIDER}"
+
 EFS_ROLE_NAME="${RESOURCE_PREFIX}-efs-csi-role"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+EFS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EFS_ROLE_NAME}"
 
-# Check if role exists
-if ! aws iam get-role --role-name "${EFS_ROLE_NAME}" &> /dev/null; then
-    echo "Creating IAM role for EFS CSI driver..."
-    
-    # Build the trust policy as a JSON string (avoids file:// issues on Windows)
-    TRUST_POLICY=$(cat <<EOF
+# Build trust policy — uses StringLike to cover all efs-csi-* service accounts
+TRUST_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -84,9 +86,9 @@ if ! aws iam get-role --role-name "${EFS_ROLE_NAME}" &> /dev/null; then
       },
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
-        "StringEquals": {
-          "${OIDC_PROVIDER}:aud": "sts.amazonaws.com",
-          "${OIDC_PROVIDER}:sub": "system:serviceaccount:kube-system:efs-csi-controller-sa"
+        "StringLike": {
+          "${OIDC_PROVIDER}:sub": "system:serviceaccount:kube-system:efs-csi-*",
+          "${OIDC_PROVIDER}:aud": "sts.amazonaws.com"
         }
       }
     }
@@ -94,38 +96,65 @@ if ! aws iam get-role --role-name "${EFS_ROLE_NAME}" &> /dev/null; then
 }
 EOF
 )
-    
+
+# Create or update the IAM role (always reconcile the trust policy so a
+# cluster rebuild with a new OIDC issuer doesn't leave a stale policy)
+if aws iam get-role --role-name "${EFS_ROLE_NAME}" &>/dev/null; then
+    echo "  IAM role exists — updating trust policy to match current cluster..."
+    aws iam update-assume-role-policy \
+        --role-name "${EFS_ROLE_NAME}" \
+        --policy-document "$TRUST_POLICY"
+    echo -e "  ${GREEN}✓${NC} Trust policy updated"
+else
+    echo "  Creating IAM role ${EFS_ROLE_NAME}..."
     aws iam create-role \
         --role-name "${EFS_ROLE_NAME}" \
         --assume-role-policy-document "$TRUST_POLICY"
-    
-    aws iam attach-role-policy \
-        --role-name "${EFS_ROLE_NAME}" \
-        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy
-    
-    echo -e "${GREEN}✓${NC} IAM role created: ${EFS_ROLE_NAME}"
+    echo -e "  ${GREEN}✓${NC} IAM role created"
 fi
 
-EFS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EFS_ROLE_NAME}"
+# Ensure the EFS policy is attached (idempotent)
+aws iam attach-role-policy \
+    --role-name "${EFS_ROLE_NAME}" \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy 2>/dev/null || true
 
-# Install EFS CSI driver using EKS add-on
-echo "Installing EFS CSI driver add-on..."
+# Install or update the EFS CSI driver EKS add-on
+echo "  Configuring EFS CSI driver add-on..."
 
-if aws eks describe-addon --cluster-name "${EKS_CLUSTER_NAME}" --addon-name aws-efs-csi-driver &> /dev/null; then
-    echo -e "${YELLOW}⚠${NC} EFS CSI driver already installed"
+if aws eks describe-addon --cluster-name "${EKS_CLUSTER_NAME}" --addon-name aws-efs-csi-driver &>/dev/null; then
+    echo -e "  ${YELLOW}⚠${NC} Add-on already exists — ensuring role ARN is correct..."
+    aws eks update-addon \
+        --cluster-name "${EKS_CLUSTER_NAME}" \
+        --addon-name aws-efs-csi-driver \
+        --service-account-role-arn "${EFS_ROLE_ARN}" \
+        --resolve-conflicts OVERWRITE
 else
     aws eks create-addon \
         --cluster-name "${EKS_CLUSTER_NAME}" \
         --addon-name aws-efs-csi-driver \
         --service-account-role-arn "${EFS_ROLE_ARN}" \
         --resolve-conflicts OVERWRITE
-    
-    echo "Waiting for EFS CSI driver to be ready..."
-    aws eks wait addon-active \
-        --cluster-name "${EKS_CLUSTER_NAME}" \
-        --addon-name aws-efs-csi-driver
-    
-    echo -e "${GREEN}✓${NC} EFS CSI driver installed"
+fi
+
+echo "  Waiting for EFS CSI driver to become active..."
+aws eks wait addon-active \
+    --cluster-name "${EKS_CLUSTER_NAME}" \
+    --addon-name aws-efs-csi-driver
+
+echo -e "  ${GREEN}✓${NC} EFS CSI driver active"
+
+# Validate IRSA: verify the CSI controller SA is annotated with the correct role
+echo "  Validating IRSA configuration..."
+
+CSI_SA_ROLE=$(kubectl get sa efs-csi-controller-sa -n kube-system \
+    -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "")
+
+if [[ "$CSI_SA_ROLE" == "$EFS_ROLE_ARN" ]]; then
+    echo -e "  ${GREEN}✓${NC} Service account annotated with correct role"
+else
+    echo -e "  ${YELLOW}⚠${NC} SA role annotation: '${CSI_SA_ROLE}' (expected '${EFS_ROLE_ARN}')"
+    echo "    The EKS add-on should set this automatically. If PVC provisioning"
+    echo "    fails later, re-run this script or check the add-on configuration."
 fi
 
 echo ""
