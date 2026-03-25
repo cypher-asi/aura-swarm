@@ -555,6 +555,11 @@ impl App {
 
         let agent_id = agent.agent_id.clone();
 
+        // Disconnect previous session (drops old WsSender, stopping the forwarder task)
+        if self.ws_sender.is_some() {
+            self.disconnect().await;
+        }
+
         // Create session
         let session = self
             .client
@@ -567,6 +572,12 @@ impl App {
 
         // Connect WebSocket
         let (sender, receiver) = ws::connect(&ws_url, self.client.token())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Send session_init (required by the harness before any user_message)
+        sender
+            .send_session_init(aura_swarm_protocol::SessionInit::default())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -805,6 +816,40 @@ impl App {
                 true
             }
         }
+    }
+
+    /// Handle a WebSocket event tagged with the originating agent_id.
+    ///
+    /// If the event belongs to the currently viewed agent, apply it live.
+    /// Otherwise, route it to the background agent's message cache.
+    pub fn handle_ws_event_for_agent(&mut self, agent_id: &str, event: WsEvent) -> bool {
+        let is_active = self
+            .connected_agent_id
+            .as_deref()
+            .map_or(false, |id| id == agent_id);
+
+        if is_active {
+            return self.handle_ws_event(event);
+        }
+
+        // Background agent: accumulate text into cached messages
+        let cached = self.message_cache.entry(agent_id.to_string()).or_default();
+        match event {
+            WsEvent::TurnStart => {
+                cached.push(ChatMessage::assistant(String::new()));
+            }
+            WsEvent::TextDelta(text) => {
+                if let Some(last) = cached.last_mut() {
+                    if last.role == "assistant" {
+                        last.content.push_str(&text);
+                    }
+                }
+            }
+            WsEvent::TurnComplete(_) | WsEvent::ToolComplete { .. } => {}
+            WsEvent::Disconnected => {}
+            _ => {}
+        }
+        false
     }
 
     /// Update the streaming message in-place for real-time display.

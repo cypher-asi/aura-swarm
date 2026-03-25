@@ -152,6 +152,9 @@ impl From<ControlError> for ApiError {
     fn from(err: ControlError) -> Self {
         match err {
             ControlError::AgentNotFound(id) => Self::NotFound(format!("agent {id}")),
+            ControlError::AgentAlreadyExists { agent_id } => {
+                Self::Conflict(format!("agent {agent_id} already exists"))
+            }
             ControlError::SessionNotFound(id) => Self::NotFound(format!("session {id}")),
             ControlError::QuotaExceeded { limit, .. } => {
                 Self::Conflict(format!("agent quota exceeded: limit is {limit}"))

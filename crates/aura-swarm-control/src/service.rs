@@ -42,14 +42,19 @@ pub trait ControlPlane: Send + Sync {
 
     /// Create a new agent for the given user.
     ///
+    /// Returns `(agent, true)` if a new agent was created, or `(agent, false)` if
+    /// a caller-supplied `agent_id` matched an existing agent owned by the same
+    /// user (idempotent return).
+    ///
     /// # Errors
     ///
     /// Returns `ControlError::QuotaExceeded` if the user has reached their limit.
+    /// Returns `ControlError::AgentAlreadyExists` if the ID is owned by another user.
     async fn create_agent(
         &self,
         user_id: &UserId,
         request: CreateAgentRequest,
-    ) -> Result<Agent>;
+    ) -> Result<(Agent, bool)>;
 
     /// Get an agent by ID, verifying ownership.
     ///
@@ -350,11 +355,37 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         &self,
         user_id: &UserId,
         request: CreateAgentRequest,
-    ) -> Result<Agent> {
+    ) -> Result<(Agent, bool)> {
         self.check_agent_credits(user_id).await?;
 
         let uid = *user_id;
         let max = self.config.max_agents_per_user;
+
+        // Idempotent create: if a caller-supplied ID already exists, return it
+        // (same user) or reject it (different user) instead of overwriting.
+        if let Some(ref supplied_id) = request.agent_id {
+            let check_id = *supplied_id;
+            let check_uid = uid;
+            let existing = blocking_store(&self.store, move |s| {
+                Ok(s.get_agent(&check_id)?)
+            })
+            .await?;
+
+            if let Some(agent) = existing {
+                if agent.user_id == check_uid {
+                    tracing::info!(
+                        agent_id = %agent.agent_id,
+                        user_id = %check_uid,
+                        "Idempotent create: returning existing agent"
+                    );
+                    return Ok((agent, false));
+                }
+                return Err(ControlError::AgentAlreadyExists {
+                    agent_id: check_id,
+                });
+            }
+        }
+
         let agent = blocking_store(&self.store, move |s| {
             let count = s.count_agents_by_user(&uid)?;
             if count >= max {
@@ -411,7 +442,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             "Created agent"
         );
 
-        Ok(agent)
+        Ok((agent, true))
     }
 
     async fn get_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
@@ -770,8 +801,9 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, created) = service.create_agent(&user_id, request).await.unwrap();
 
+        assert!(created);
         assert_eq!(agent.name, "test-agent");
         assert_eq!(agent.user_id, user_id);
         assert_eq!(agent.status, AgentState::Provisioning);
@@ -783,10 +815,63 @@ mod tests {
 
         let supplied_id = AgentId::from_uuid(uuid::Uuid::new_v4());
         let request = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, created) = service.create_agent(&user_id, request).await.unwrap();
 
+        assert!(created);
         assert_eq!(agent.agent_id, supplied_id);
         assert_eq!(agent.name, "test-agent");
+    }
+
+    #[tokio::test]
+    async fn create_agent_idempotent_same_user() {
+        let (service, _dir, user_id) = setup();
+
+        let supplied_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+        let request = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
+        let (agent1, created1) = service.create_agent(&user_id, request).await.unwrap();
+        assert!(created1);
+
+        let request2 = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
+        let (agent2, created2) = service.create_agent(&user_id, request2).await.unwrap();
+        assert!(!created2);
+        assert_eq!(agent1.agent_id, agent2.agent_id);
+        assert_eq!(agent1.created_at, agent2.created_at);
+    }
+
+    #[tokio::test]
+    async fn create_agent_conflict_different_user() {
+        let (service, _dir, user_id) = setup();
+        let other_user = UserId::from_uuid(uuid::Uuid::new_v4());
+
+        let supplied_id = AgentId::from_uuid(uuid::Uuid::new_v4());
+        let request = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
+        service.create_agent(&user_id, request).await.unwrap();
+
+        let request2 = CreateAgentRequest::new("test-agent").with_agent_id(supplied_id);
+        let result = service.create_agent(&other_user, request2).await;
+        assert!(matches!(
+            result,
+            Err(ControlError::AgentAlreadyExists { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_agent_idempotent_does_not_count_toward_quota() {
+        let (service, _dir, user_id) = setup();
+
+        // Create max agents (quota is 3)
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let request = CreateAgentRequest::new(format!("agent-{i}"));
+            let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+            ids.push(agent.agent_id);
+        }
+
+        // Idempotent re-create of the first agent should succeed
+        let request = CreateAgentRequest::new("agent-0").with_agent_id(ids[0]);
+        let (agent, created) = service.create_agent(&user_id, request).await.unwrap();
+        assert!(!created);
+        assert_eq!(agent.agent_id, ids[0]);
     }
 
     #[tokio::test]
@@ -799,7 +884,7 @@ mod tests {
             service.create_agent(&user_id, request).await.unwrap();
         }
 
-        // Try to create one more
+        // Try to create one more (without supplied ID → no idempotent match)
         let request = CreateAgentRequest::new("agent-overflow");
         let result = service.create_agent(&user_id, request).await;
 
@@ -815,7 +900,7 @@ mod tests {
         let other_user = UserId::from_uuid(uuid::Uuid::new_v4());
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
         let result = service.get_agent(&other_user, &agent.agent_id).await;
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
@@ -827,7 +912,7 @@ mod tests {
 
         // Create agent (starts in Provisioning)
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         assert_eq!(agent.status, AgentState::Provisioning);
 
         // Simulate provisioning complete (normally done by scheduler)
@@ -882,7 +967,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
         // Simulate running
         service
@@ -901,7 +986,7 @@ mod tests {
 
         // Create and start agent
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -951,7 +1036,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
         assert!(agent.last_heartbeat_at.is_none());
 
@@ -966,7 +1051,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -984,7 +1069,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Stopped)
@@ -1032,7 +1117,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Stopped)
@@ -1050,7 +1135,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -1065,7 +1150,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -1083,7 +1168,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -1101,7 +1186,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         assert_eq!(agent.status, AgentState::Provisioning);
 
         let result = service.hibernate_agent(&user_id, &agent.agent_id).await;
@@ -1113,7 +1198,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         service
             .store
             .update_agent_status(&agent.agent_id, AgentState::Running)
@@ -1128,7 +1213,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
         service
             .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
@@ -1158,7 +1243,7 @@ mod tests {
         let (service, _dir, user_id) = setup();
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
         service
             .update_agent_status_internal(

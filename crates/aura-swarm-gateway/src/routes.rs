@@ -37,6 +37,7 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/wake` - Wake agent
 /// - `GET /v1/agents/:agent_id/logs` - Get agent logs
 /// - `GET /v1/agents/:agent_id/status` - Get agent status
+/// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
 ///
 /// ## Sessions (authenticated)
 /// - `POST /v1/agents/:agent_id/sessions` - Create session
@@ -102,6 +103,10 @@ where
         .route(
             "/v1/agents/:agent_id/status",
             get(agents::get_status::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/state",
+            get(agents::get_agent_state::<C, V>),
         )
         // Sessions
         .route(

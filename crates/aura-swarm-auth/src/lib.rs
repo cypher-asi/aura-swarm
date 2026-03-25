@@ -65,7 +65,7 @@ pub mod jwt;
 
 pub use client::{ZosClient, ZosLoginRequest, ZosLoginResponse};
 pub use error::{AuthError, Result};
-pub use jwt::{JwksValidator, JwtValidator, ValidatedClaims};
+pub use jwt::{JwksValidator, JwtValidator, ValidatedClaims, ZosTokenValidator};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use jwt::MockJwtValidator;

@@ -329,6 +329,120 @@ async fn delete_agent_success_when_stopped() {
 }
 
 // ---------------------------------------------------------------------------
+// Idempotent Create / ID Parity
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_agent_with_supplied_id_returns_201() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let agent_id = "aa".repeat(16); // valid hex
+    let resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "parity-agent", "agent_id": agent_id}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::CREATED);
+    let body: Value = resp.json();
+    assert!(body["agent_id"].as_str().is_some());
+    assert_eq!(body["name"], "parity-agent");
+}
+
+#[tokio::test]
+async fn create_agent_idempotent_same_user_returns_200() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let agent_id = "bb".repeat(16);
+
+    // First create → 201
+    let resp1 = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "idem-agent", "agent_id": agent_id}))
+        .await;
+    resp1.assert_status(axum::http::StatusCode::CREATED);
+    let body1: Value = resp1.json();
+    let created_agent_id = body1["agent_id"].as_str().unwrap().to_string();
+    let created_at = body1["created_at"].as_str().unwrap().to_string();
+
+    // Second create with same ID + same user → 200 (idempotent)
+    let resp2 = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "idem-agent", "agent_id": agent_id}))
+        .await;
+    resp2.assert_status(axum::http::StatusCode::OK);
+    let body2: Value = resp2.json();
+    assert_eq!(body2["agent_id"], created_agent_id);
+    assert_eq!(
+        body2["created_at"].as_str().unwrap(),
+        created_at,
+        "idempotent return should have the same created_at"
+    );
+}
+
+#[tokio::test]
+async fn create_agent_conflict_different_user_returns_409() {
+    let (server, _tmp) = build_test_app();
+
+    let agent_id = "cc".repeat(16);
+
+    // User 1 creates the agent
+    let (hdr1, val1) = auth_header(TEST_USER_UUID);
+    let resp1 = server
+        .post("/v1/agents")
+        .add_header(hdr1.clone(), val1.clone())
+        .json(&json!({"name": "owned-agent", "agent_id": agent_id}))
+        .await;
+    resp1.assert_status(axum::http::StatusCode::CREATED);
+
+    // User 2 tries to create an agent with the same ID → 409
+    let (hdr2, val2) = auth_header(OTHER_USER_UUID);
+    let resp2 = server
+        .post("/v1/agents")
+        .add_header(hdr2.clone(), val2.clone())
+        .json(&json!({"name": "stolen-agent", "agent_id": agent_id}))
+        .await;
+    resp2.assert_status(axum::http::StatusCode::CONFLICT);
+    let body: Value = resp2.json();
+    assert_eq!(body["error"]["code"], "conflict");
+}
+
+#[tokio::test]
+async fn create_agent_idempotent_does_not_duplicate_in_list() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let agent_id = "dd".repeat(16);
+
+    // Create twice with same ID
+    server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "dup-agent", "agent_id": agent_id}))
+        .await
+        .assert_status(axum::http::StatusCode::CREATED);
+
+    server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "dup-agent", "agent_id": agent_id}))
+        .await
+        .assert_status(axum::http::StatusCode::OK);
+
+    // List should have exactly one agent
+    let resp = server
+        .get("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["agents"].as_array().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Agent Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -766,6 +880,98 @@ async fn get_status_returns_placeholder() {
     assert_eq!(body["status"], "provisioning");
     assert!(body.get("uptime_seconds").is_some());
     assert!(body.get("resource_usage").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Agent state endpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_agent_state_returns_lifecycle_state() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "state-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/state"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["state"], "provisioning");
+    assert_eq!(body["uptime_seconds"], 0);
+    assert_eq!(body["active_sessions"], 0);
+}
+
+#[tokio::test]
+async fn get_agent_state_running_has_uptime() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "running-state-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status_ok();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/state"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["state"], "running");
+    assert!(body["uptime_seconds"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn get_agent_state_includes_error_message() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "error-state-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .json(&json!({"status": "error", "message": "OOM killed"}))
+        .await
+        .assert_status_ok();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/state"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["state"], "error");
+    assert_eq!(body["error_message"], "OOM killed");
 }
 
 // ---------------------------------------------------------------------------

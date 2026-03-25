@@ -45,7 +45,7 @@
 //! // Create an agent
 //! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //! let request = CreateAgentRequest::new("my-agent");
-//! let agent = control.create_agent(&user_id, request).await?;
+//! let (agent, _created) = control.create_agent(&user_id, request).await?;
 //!
 //! println!("Created agent: {}", agent.agent_id);
 //! # Ok(())

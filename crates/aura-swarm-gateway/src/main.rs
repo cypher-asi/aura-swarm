@@ -22,7 +22,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[cfg(feature = "dev-mode")]
 use aura_swarm_auth::MockJwtValidator;
 #[cfg(not(feature = "dev-mode"))]
-use aura_swarm_auth::{AuthConfig, JwksValidator};
+use aura_swarm_auth::{AuthConfig, ZosTokenValidator};
 use aura_swarm_control::{
     BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlaneService,
     HttpSchedulerClient,
@@ -112,7 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             audience: auth_audience,
             jwks_refresh_seconds: 300,
         };
-        Arc::new(JwksValidator::new(auth_config)?)
+        let cache_ttl = std::time::Duration::from_secs(60);
+        tracing::info!("Using zOS token introspection (cache TTL = {cache_ttl:?})");
+        Arc::new(ZosTokenValidator::new(auth_config, cache_ttl)?)
     };
     tracing::info!("JWT validator initialized");
 

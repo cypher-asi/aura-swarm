@@ -9,6 +9,7 @@ members = [
     "crates/aura-swarm-gateway",
     "crates/aura-swarm-cli",
     "crates/aura-swarm-protocol",
+    "crates/aura-swarm-client",
 ]
 default-members = [
     "crates/aura-swarm-core",
@@ -19,6 +20,7 @@ default-members = [
     "crates/aura-swarm-gateway",
     "crates/aura-swarm-cli",
     "crates/aura-swarm-protocol",
+    "crates/aura-swarm-client",
 ]
 
 [workspace.package]

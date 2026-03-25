@@ -195,6 +195,12 @@ async fn cmd_tui(args: Args) -> anyhow::Result<()> {
     result
 }
 
+/// A WebSocket event tagged with the agent it belongs to.
+struct TaggedWsEvent {
+    agent_id: String,
+    event: WsEvent,
+}
+
 /// Main event loop with real-time streaming support.
 ///
 /// The event loop immediately redraws on every WebSocket event for smooth streaming.
@@ -202,8 +208,8 @@ async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
-    // Channel for WebSocket events
-    let (ws_tx, mut ws_rx) = mpsc::channel::<WsEvent>(128);
+    // Channel for WebSocket events, tagged with agent_id
+    let (ws_tx, mut ws_rx) = mpsc::channel::<TaggedWsEvent>(128);
 
     // Refresh timer
     let mut refresh_interval = tokio::time::interval(REFRESH_INTERVAL);
@@ -240,9 +246,9 @@ async fn run_event_loop(
                 }
             }
 
-            // WebSocket events - immediate redraw for real-time streaming
-            Some(event) = ws_rx.recv() => {
-                let needs_redraw = app.handle_ws_event(event);
+            // WebSocket events - route to the correct agent
+            Some(tagged) = ws_rx.recv() => {
+                let needs_redraw = app.handle_ws_event_for_agent(&tagged.agent_id, tagged.event);
                 if needs_redraw {
                     terminal.draw(|f| ui::render(f, app))?;
                 }
@@ -279,7 +285,7 @@ async fn run_event_loop(
 async fn handle_input(
     app: &mut App,
     event: Event,
-    ws_tx: &mpsc::Sender<WsEvent>,
+    ws_tx: &mpsc::Sender<TaggedWsEvent>,
 ) -> anyhow::Result<()> {
     match event {
         Event::Key(key) => {
@@ -329,7 +335,7 @@ async fn handle_normal_mode(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
-    ws_tx: &mpsc::Sender<WsEvent>,
+    ws_tx: &mpsc::Sender<TaggedWsEvent>,
 ) -> anyhow::Result<()> {
     // ESC toggles command mode
     if code == KeyCode::Esc {
@@ -392,7 +398,7 @@ async fn handle_normal_mode(
 async fn handle_command_mode(
     app: &mut App,
     code: KeyCode,
-    ws_tx: &mpsc::Sender<WsEvent>,
+    ws_tx: &mpsc::Sender<TaggedWsEvent>,
 ) -> anyhow::Result<()> {
     match code {
         KeyCode::Char('q') => {
@@ -444,12 +450,17 @@ async fn handle_command_mode(
                 // Show immediate feedback about agent state
                 show_agent_wake_status(app);
 
+                let agent_id = app.selected_agent().unwrap().agent_id.clone();
                 match app.ensure_ready_and_connect().await {
                     Ok(mut rx) => {
                         let ws_tx = ws_tx.clone();
                         tokio::spawn(async move {
                             while let Some(event) = rx.recv().await {
-                                if ws_tx.send(event).await.is_err() {
+                                let tagged = TaggedWsEvent {
+                                    agent_id: agent_id.clone(),
+                                    event,
+                                };
+                                if ws_tx.send(tagged).await.is_err() {
                                     break;
                                 }
                             }
@@ -490,7 +501,7 @@ async fn handle_input_mode(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
-    ws_tx: &mpsc::Sender<WsEvent>,
+    ws_tx: &mpsc::Sender<TaggedWsEvent>,
 ) -> anyhow::Result<()> {
     match code {
         KeyCode::Enter => {
@@ -504,13 +515,18 @@ async fn handle_input_mode(
                     // Show immediate feedback about agent state
                     show_agent_wake_status(app);
 
+                    let agent_id = app.selected_agent().unwrap().agent_id.clone();
                     // Auto-connect (wake/start if needed) and send
                     match app.ensure_ready_and_connect().await {
                         Ok(mut rx) => {
                             let ws_tx = ws_tx.clone();
                             tokio::spawn(async move {
                                 while let Some(event) = rx.recv().await {
-                                    if ws_tx.send(event).await.is_err() {
+                                    let tagged = TaggedWsEvent {
+                                        agent_id: agent_id.clone(),
+                                        event,
+                                    };
+                                    if ws_tx.send(tagged).await.is_err() {
                                         break;
                                     }
                                 }
@@ -532,13 +548,18 @@ async fn handle_input_mode(
                 // Show immediate feedback about agent state
                 show_agent_wake_status(app);
 
+                let agent_id = app.selected_agent().unwrap().agent_id.clone();
                 // Connect on Enter if not connected and input is empty (auto-wake/start)
                 match app.ensure_ready_and_connect().await {
                     Ok(mut rx) => {
                         let ws_tx = ws_tx.clone();
                         tokio::spawn(async move {
                             while let Some(event) = rx.recv().await {
-                                if ws_tx.send(event).await.is_err() {
+                                let tagged = TaggedWsEvent {
+                                    agent_id: agent_id.clone(),
+                                    event,
+                                };
+                                if ws_tx.send(tagged).await.is_err() {
                                     break;
                                 }
                             }

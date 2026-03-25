@@ -70,7 +70,7 @@ impl GatewayClient {
     async fn handle_error(response: reqwest::Response) -> ClientError {
         let status = response.status().as_u16();
         let message = match response.json::<ApiErrorResponse>().await {
-            Ok(err) => err.error,
+            Ok(err) => err.error.message,
             Err(_) => "Unknown error".to_string(),
         };
         ClientError::Api { status, message }

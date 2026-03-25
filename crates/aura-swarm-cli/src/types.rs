@@ -184,14 +184,24 @@ impl ChatMessage {
 // Error Response
 // =============================================================================
 
+/// Inner error body returned by the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorBody {
+    /// Error code (e.g. "unauthorized", "internal_error").
+    #[serde(default)]
+    pub code: String,
+    /// Human-readable error message.
+    #[serde(default)]
+    pub message: String,
+}
+
 /// Error response from the API.
+///
+/// The gateway returns `{"error": {"code": "...", "message": "..."}}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorResponse {
-    /// Error message.
-    pub error: String,
-    /// Optional error code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    /// Structured error body.
+    pub error: ApiErrorBody,
 }
 
 // =============================================================================

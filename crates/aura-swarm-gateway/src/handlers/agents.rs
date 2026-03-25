@@ -222,9 +222,15 @@ where
         request = request.with_agent_id(id);
     }
 
-    let agent = state.control.create_agent(&user.user_id, request).await?;
+    let (agent, created) = state.control.create_agent(&user.user_id, request).await?;
 
-    Ok((StatusCode::CREATED, Json(AgentResponse::from(agent))))
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    Ok((status, Json(AgentResponse::from(agent))))
 }
 
 /// Get a single agent by ID.
@@ -461,6 +467,63 @@ where
             cpu_percent: 0.0,
             memory_mb: 0,
         },
+    }))
+}
+
+/// Response for the remote agent state endpoint.
+///
+/// Returns lifecycle state only — no resource metrics or logs.
+/// Designed for consumption by external clients (e.g. aura-os-link `SwarmClient`).
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentStateResponse {
+    /// Current lifecycle state.
+    pub(crate) state: AgentState,
+    /// Uptime in seconds (0 if not running).
+    pub(crate) uptime_seconds: u64,
+    /// Number of active sessions.
+    pub(crate) active_sessions: u32,
+    /// Last heartbeat from the agent runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Error message if the agent is in an error state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_message: Option<String>,
+}
+
+/// Get remote agent state (lifecycle only).
+///
+/// This endpoint returns a minimal state payload suitable for external
+/// consumers that need to know whether the backing VM is ready, without
+/// full resource metrics or logs.
+///
+/// # Errors
+///
+/// Returns an error if the agent is not found or the user doesn't own it.
+#[allow(clippy::cast_sign_loss)]
+pub(crate) async fn get_agent_state<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    user: AuthUser,
+    Path(agent_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agent_id = parse_agent_id(&agent_id)?;
+    let agent = state.control.get_agent(&user.user_id, &agent_id).await?;
+
+    let uptime_seconds = if matches!(agent.status, AgentState::Running | AgentState::Idle) {
+        (Utc::now() - agent.created_at).num_seconds().max(0) as u64
+    } else {
+        0
+    };
+
+    Ok(Json(AgentStateResponse {
+        state: agent.status,
+        uptime_seconds,
+        active_sessions: 0,
+        last_heartbeat_at: agent.last_heartbeat_at,
+        error_message: agent.error_message,
     }))
 }
 

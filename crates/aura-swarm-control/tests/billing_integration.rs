@@ -258,7 +258,7 @@ mod live {
             ControlPlaneService::with_integrations(store.clone(), ControlConfig::default(), None, Some(billing));
 
         let request = CreateAgentRequest::new("test-agent");
-        let agent = service.create_agent(&user_id, request).await.unwrap();
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         Store::update_agent_status(&*store, &agent.agent_id, AgentState::Running).unwrap();
 
         let result = service

@@ -3,11 +3,15 @@
 //! This module provides the core JWT validation logic, including signature
 //! verification and claims validation.
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
+use parking_lot::RwLock;
 use serde::Deserialize;
 
 use aura_swarm_core::UserId;
@@ -155,6 +159,160 @@ impl JwtValidator for JwksValidator {
             user_id,
             expires_at,
         })
+    }
+}
+
+/// Token validator that introspects tokens via the zOS user info API.
+///
+/// zOS uses HS256 (shared-secret) JWTs and does not expose a JWKS endpoint.
+/// This validator calls `GET /api/users/current` with the bearer token to
+/// confirm validity, then extracts the user ID from the response. Results
+/// are cached to avoid hitting zOS on every request.
+pub struct ZosTokenValidator {
+    config: AuthConfig,
+    client: reqwest::Client,
+    cache: RwLock<HashMap<u64, CachedValidation>>,
+    cache_ttl: Duration,
+}
+
+struct CachedValidation {
+    claims: ValidatedClaims,
+    validated_at: Instant,
+}
+
+/// Claims decoded from the JWT payload without signature verification,
+/// used only to read the `exp` timestamp.
+#[derive(Debug, Deserialize)]
+struct UnsafeMinimalClaims {
+    #[allow(dead_code)]
+    sub: String,
+    exp: u64,
+}
+
+impl ZosTokenValidator {
+    /// Create a new zOS token validator.
+    ///
+    /// `cache_ttl` controls how long a successfully validated token is
+    /// trusted before re-checking with zOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError::Internal` if the HTTP client cannot be created.
+    pub fn new(config: AuthConfig, cache_ttl: Duration) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| AuthError::Internal(format!("failed to create HTTP client: {e}")))?;
+
+        Ok(Self {
+            config,
+            client,
+            cache: RwLock::new(HashMap::new()),
+            cache_ttl,
+        })
+    }
+
+    fn token_hash(token: &str) -> u64 {
+        let mut h = DefaultHasher::new();
+        token.hash(&mut h);
+        h.finish()
+    }
+}
+
+#[async_trait]
+impl JwtValidator for ZosTokenValidator {
+    async fn validate(&self, token: &str) -> Result<ValidatedClaims> {
+        let key = Self::token_hash(token);
+
+        // Check cache
+        {
+            let cache = self.cache.read();
+            if let Some(entry) = cache.get(&key) {
+                if entry.validated_at.elapsed() < self.cache_ttl {
+                    return Ok(entry.claims.clone());
+                }
+            }
+        }
+
+        // Call zOS to validate
+        let url = self.config.user_info_url();
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| AuthError::Internal(format!("zOS introspection failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return match status.as_u16() {
+                401 => Err(AuthError::InvalidToken("token rejected by zOS".to_string())),
+                code => Err(AuthError::ZosApi {
+                    status: code,
+                    code: "INTROSPECTION_FAILED".to_string(),
+                    message: format!("zOS returned HTTP {code}"),
+                }),
+            };
+        }
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| AuthError::Internal(format!("invalid zOS response: {e}")))?;
+
+        let user_id_str = body
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::Internal("zOS response missing 'id' field".to_string()))?;
+
+        let user_id =
+            UserId::from_str(user_id_str).map_err(|_| AuthError::InvalidUserId)?;
+
+        // Decode exp from JWT payload (no signature check — zOS already validated)
+        let expires_at = {
+            let mut insecure = Validation::default();
+            insecure.insecure_disable_signature_validation();
+            insecure.validate_exp = false;
+            insecure.validate_aud = false;
+            insecure.required_spec_claims.clear();
+            match decode::<UnsafeMinimalClaims>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(b""),
+                &insecure,
+            ) {
+                Ok(data) => {
+                    let secs = i64::try_from(data.claims.exp).unwrap_or(i64::MAX);
+                    DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now)
+                }
+                Err(_) => Utc::now() + chrono::Duration::hours(1),
+            }
+        };
+
+        let claims = ValidatedClaims {
+            user_id,
+            expires_at,
+        };
+
+        // Update cache
+        {
+            let mut cache = self.cache.write();
+            cache.insert(
+                key,
+                CachedValidation {
+                    claims: claims.clone(),
+                    validated_at: Instant::now(),
+                },
+            );
+
+            // Evict stale entries periodically
+            if cache.len() > 1000 {
+                let ttl = self.cache_ttl;
+                cache.retain(|_, v| v.validated_at.elapsed() < ttl);
+            }
+        }
+
+        Ok(claims)
     }
 }
 

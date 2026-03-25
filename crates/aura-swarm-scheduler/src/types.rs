@@ -151,7 +151,7 @@ impl SchedulerConfig {
     ///
     /// Supported environment variables:
     /// - `SCHEDULER_NAMESPACE`: Kubernetes namespace for agent pods
-    /// - `AURA_IMAGE`: Container image for the aura-harness reasoning engine
+    /// - `AURA_HARNESS_IMAGE`: Container image for the aura-harness reasoning engine
     /// - `CONTROL_PLANE_URL`: Internal URL of the control plane service (deprecated)
     /// - `GATEWAY_URL`: Internal URL of the gateway service for status callbacks
     /// - `STATE_PVC_NAME`: PVC name for agent state storage
@@ -167,7 +167,7 @@ impl SchedulerConfig {
         if let Ok(val) = std::env::var("SCHEDULER_NAMESPACE") {
             config.namespace = val;
         }
-        if let Ok(val) = std::env::var("AURA_IMAGE") {
+        if let Ok(val) = std::env::var("AURA_HARNESS_IMAGE") {
             config.image = val;
         }
         if let Ok(val) = std::env::var("CONTROL_PLANE_URL") {

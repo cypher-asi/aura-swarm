@@ -17,6 +17,13 @@ pub enum ControlError {
     #[error("agent not found: {0}")]
     AgentNotFound(AgentId),
 
+    /// An agent with the given ID already exists and is owned by a different user.
+    #[error("agent {agent_id} already exists (owned by another user)")]
+    AgentAlreadyExists {
+        /// The conflicting agent ID.
+        agent_id: AgentId,
+    },
+
     /// The requested session was not found.
     #[error("session not found: {0}")]
     SessionNotFound(SessionId),
@@ -92,6 +99,7 @@ impl ControlError {
     pub const fn http_status_code(&self) -> u16 {
         match self {
             Self::AgentNotFound(_) | Self::SessionNotFound(_) => 404,
+            Self::AgentAlreadyExists { .. } => 409,
             Self::QuotaExceeded { .. } => 429, // Too Many Requests
             Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => 402, // Payment Required
             Self::NotOwner { .. } => 403,
@@ -177,6 +185,7 @@ mod tests {
 
         let cases: Vec<(ControlError, u16)> = vec![
             (ControlError::AgentNotFound(agent_id), 404),
+            (ControlError::AgentAlreadyExists { agent_id }, 409),
             (ControlError::SessionNotFound(session_id), 404),
             (
                 ControlError::QuotaExceeded {
@@ -253,6 +262,7 @@ mod tests {
 
         let not_retriable = vec![
             ControlError::AgentNotFound(agent_id),
+            ControlError::AgentAlreadyExists { agent_id },
             ControlError::SessionNotFound(session_id),
             ControlError::QuotaExceeded {
                 user_id,
