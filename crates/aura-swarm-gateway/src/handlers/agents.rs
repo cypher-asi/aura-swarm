@@ -472,7 +472,6 @@ where
 
 /// Response for the remote agent state endpoint.
 ///
-/// Returns lifecycle state only — no resource metrics or logs.
 /// Designed for consumption by external clients (e.g. aura-os-link `SwarmClient`).
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentStateResponse {
@@ -488,6 +487,21 @@ pub(crate) struct AgentStateResponse {
     /// Error message if the agent is in an error state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error_message: Option<String>,
+    /// Agent ID.
+    pub(crate) agent_id: String,
+    /// Human-readable name.
+    pub(crate) name: String,
+    /// CPU allocation in millicores.
+    pub(crate) cpu_millicores: u32,
+    /// Memory allocation in megabytes.
+    pub(crate) memory_mb: u32,
+    /// Runtime version.
+    pub(crate) runtime_version: String,
+    /// Isolation level ("container" or "micro_vm").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) isolation: Option<String>,
+    /// When the agent was created.
+    pub(crate) created_at: DateTime<Utc>,
 }
 
 /// Get remote agent state (lifecycle only).
@@ -518,12 +532,21 @@ where
         0
     };
 
+    let isolation = agent.spec.isolation.map(|i| format!("{i:?}").to_lowercase());
+
     Ok(Json(AgentStateResponse {
         state: agent.status,
         uptime_seconds,
         active_sessions: 0,
         last_heartbeat_at: agent.last_heartbeat_at,
         error_message: agent.error_message,
+        agent_id: agent.agent_id.to_string(),
+        name: agent.name,
+        cpu_millicores: agent.spec.cpu_millicores,
+        memory_mb: agent.spec.memory_mb,
+        runtime_version: agent.spec.runtime_version,
+        isolation,
+        created_at: agent.created_at,
     }))
 }
 
