@@ -130,7 +130,9 @@ echo ""
 echo "Running Terraform destroy..."
 echo ""
 
-terraform destroy -auto-approve
+# Enable force_delete on ECR repos so non-empty repositories can be removed.
+# The ecr-emptying step above handles most cases, but this is a safety net.
+terraform destroy -auto-approve -var="ecr_force_delete=true"
 
 echo ""
 

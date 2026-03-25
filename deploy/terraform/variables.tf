@@ -127,6 +127,12 @@ variable "ecr_image_retention_count" {
   default     = 30
 }
 
+variable "ecr_force_delete" {
+  description = "Allow deletion of ECR repositories even when they contain images"
+  type        = bool
+  default     = false
+}
+
 #------------------------------------------------------------------------------
 # Storage Configuration
 #------------------------------------------------------------------------------

@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.env"
+source "${SCRIPT_DIR}/_helpers.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,18 +50,7 @@ echo ""
 
 terraform plan -out=ecr.tfplan
 
-echo ""
-echo "=============================================="
-echo -e "${YELLOW}Review the plan above before proceeding${NC}"
-echo "=============================================="
-echo ""
-read -p "Apply this plan? (yes/no) [no]: " confirm
-confirm=${confirm:-no}
-
-if [[ "$confirm" != "yes" ]]; then
-    echo "Aborted. Run this script again when ready."
-    exit 0
-fi
+confirm_plan "ecr.tfplan"
 
 echo ""
 echo "Applying ECR infrastructure..."

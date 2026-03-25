@@ -103,5 +103,6 @@ module "ecr" {
   resource_prefix          = local.resource_prefix
   repositories             = var.ecr_repositories
   image_retention_count    = var.ecr_image_retention_count
+  force_delete             = var.ecr_force_delete
   tags                     = local.common_tags
 }
