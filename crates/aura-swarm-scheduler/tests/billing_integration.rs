@@ -1,19 +1,27 @@
-//! Integration tests for scheduler billing.
+//! Integration tests for scheduler billing against the live z-billing service.
 //!
-//! Tests compute usage reporting.
-//!
-//! Requires z-billing service running at localhost:8081.
+//! Environment variables:
+//!   Z_BILLING_URL       - Service URL (default: https://z-billing.onrender.com)
+//!   Z_BILLING_API_KEY   - Service-to-service API key (default: test-service-key)
+//!   Z_BILLING_ADMIN_KEY - Admin API key for test account setup
 
 use std::time::Duration;
 
 use aura_swarm_scheduler::{ComputeUsageReporter, SchedulerBillingConfig};
 use serde_json::json;
 
-/// The billing service URL for integration tests.
-const BILLING_URL: &str = "http://localhost:8081";
+fn billing_url() -> String {
+    std::env::var("Z_BILLING_URL")
+        .unwrap_or_else(|_| "https://z-billing.onrender.com".to_string())
+}
 
-/// The service API key for z-billing.
-const SERVICE_API_KEY: &str = "test-service-key";
+fn service_api_key() -> String {
+    std::env::var("Z_BILLING_API_KEY").unwrap_or_else(|_| "test-service-key".to_string())
+}
+
+fn admin_api_key() -> String {
+    std::env::var("Z_BILLING_ADMIN_KEY").unwrap_or_else(|_| "test-admin-key".to_string())
+}
 
 /// Generate a unique UUID for each test (z-billing uses UUID format).
 fn unique_user_uuid() -> String {
@@ -28,7 +36,7 @@ fn unique_user_uuid() -> String {
 fn scheduler_billing_config_defaults() {
     let config = SchedulerBillingConfig::default();
 
-    assert_eq!(config.url, "http://z-billing:8080");
+    assert_eq!(config.url, "https://z-billing.onrender.com");
     assert!(config.enabled);
     assert!(!config.fail_closed);
     assert_eq!(config.report_interval_seconds, 300);
@@ -115,27 +123,47 @@ async fn reporter_disabled_reports_zero() {
 mod live {
     use super::*;
 
-    /// Helper to create a funded test account via the billing service.
+    fn has_billing_keys() -> bool {
+        std::env::var("Z_BILLING_API_KEY").map_or(false, |v| !v.is_empty())
+    }
+
+    fn test_billing_config() -> SchedulerBillingConfig {
+        SchedulerBillingConfig {
+            url: billing_url(),
+            api_key: service_api_key(),
+            enabled: true,
+            report_interval_seconds: 0,
+            fail_closed: true,
+        }
+    }
+
+    /// Create a funded test account via the z-billing API.
+    ///
+    /// Triggers auto-account-creation via a usage check, then adds credits
+    /// through the admin endpoint.
     async fn create_funded_account(user_uuid: &str, balance_cents: i64) -> reqwest::Result<()> {
+        let url = billing_url();
+        let api_key = service_api_key();
         let client = reqwest::Client::new();
 
-        // Create account
+        // Usage check auto-creates the account with zero balance
         client
-            .post(format!("{}/v1/accounts", BILLING_URL))
-            .header("authorization", format!("Bearer test-token:{user_uuid}"))
-            .json(&json!({}))
+            .post(format!("{url}/v1/usage/check"))
+            .header("x-api-key", &api_key)
+            .header("x-service-name", "aura-scheduler-test")
+            .json(&json!({ "user_id": user_uuid, "required_cents": 0 }))
             .send()
             .await?
             .error_for_status()?;
 
-        // Add credits if needed
         if balance_cents > 0 {
             client
-                .post(format!("{}/v1/credits/add", BILLING_URL))
+                .post(format!("{url}/v1/credits/add"))
+                .header("x-admin-key", admin_api_key())
                 .json(&json!({
                     "user_id": user_uuid,
                     "amount_cents": balance_cents,
-                    "reason": "Test funding"
+                    "reason": "Integration test funding"
                 }))
                 .send()
                 .await?
@@ -146,46 +174,30 @@ mod live {
     }
 
     #[tokio::test]
-    #[ignore = "requires z-billing service at localhost:8081"]
     async fn reporter_reports_compute_usage() {
+        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
         let user_uuid = unique_user_uuid();
-        let agent_uuid = unique_user_uuid(); // Agent ID must be a valid UUID
-
-        // Create funded account
+        let agent_uuid = unique_user_uuid();
         create_funded_account(&user_uuid, 10000)
             .await
             .expect("Failed to create test account");
 
-        let config = SchedulerBillingConfig {
-            url: BILLING_URL.to_string(),
-            api_key: SERVICE_API_KEY.to_string(),
-            enabled: true,
-            report_interval_seconds: 0, // Report immediately
-            fail_closed: true,
-        };
-
-        let reporter = ComputeUsageReporter::new(config).unwrap();
-
-        // Register pod
+        let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
         reporter.register_pod(&agent_uuid, &user_uuid, 500, 512);
-
-        // Wait a moment for interval check
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Report usage
         let count = reporter.report_all_usage().await;
         assert_eq!(count, 1, "Should report 1 pod");
     }
 
     #[tokio::test]
-    #[ignore = "requires z-billing service at localhost:8081"]
     async fn reporter_reports_multiple_pods() {
+        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
         let user_uuid_1 = unique_user_uuid();
         let user_uuid_2 = unique_user_uuid();
-        let agent_uuid_1 = unique_user_uuid(); // Agent IDs must be valid UUIDs
+        let agent_uuid_1 = unique_user_uuid();
         let agent_uuid_2 = unique_user_uuid();
 
-        // Create funded accounts
         create_funded_account(&user_uuid_1, 10000)
             .await
             .expect("Failed to create test account 1");
@@ -193,72 +205,44 @@ mod live {
             .await
             .expect("Failed to create test account 2");
 
-        let config = SchedulerBillingConfig {
-            url: BILLING_URL.to_string(),
-            api_key: SERVICE_API_KEY.to_string(),
-            enabled: true,
-            report_interval_seconds: 0,
-            fail_closed: true,
-        };
-
-        let reporter = ComputeUsageReporter::new(config).unwrap();
-
-        // Register multiple pods
+        let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
         reporter.register_pod(&agent_uuid_1, &user_uuid_1, 500, 512);
         reporter.register_pod(&agent_uuid_2, &user_uuid_2, 1000, 1024);
-
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Report usage
         let count = reporter.report_all_usage().await;
         assert_eq!(count, 2, "Should report 2 pods");
     }
 
     #[tokio::test]
-    #[ignore = "requires z-billing service at localhost:8081"]
     async fn full_compute_usage_flow() {
+        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
         let user_uuid = unique_user_uuid();
-        let agent_uuid_1 = unique_user_uuid(); // Agent IDs must be valid UUIDs
+        let agent_uuid_1 = unique_user_uuid();
         let agent_uuid_2 = unique_user_uuid();
-
-        // Create funded account
         create_funded_account(&user_uuid, 10000)
             .await
             .expect("Failed to create test account");
 
-        let config = SchedulerBillingConfig {
-            url: BILLING_URL.to_string(),
-            api_key: SERVICE_API_KEY.to_string(),
-            enabled: true,
-            report_interval_seconds: 0,
-            fail_closed: true,
-        };
+        let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
 
-        let reporter = ComputeUsageReporter::new(config).unwrap();
-
-        // Simulate pod lifecycle
-        // 1. Pod starts
         reporter.register_pod(&agent_uuid_1, &user_uuid, 500, 512);
         reporter.register_pod(&agent_uuid_2, &user_uuid, 1000, 1024);
         assert_eq!(reporter.tracked_pod_count(), 2);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // 2. Report usage
         let count = reporter.report_all_usage().await;
         assert_eq!(count, 2, "Should report 2 pods");
 
-        // 3. One pod terminates
         reporter.unregister_pod(&agent_uuid_1);
         assert_eq!(reporter.tracked_pod_count(), 1);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // 4. Report again (only one pod)
         let count = reporter.report_all_usage().await;
         assert_eq!(count, 1, "Should report 1 pod");
 
-        // 5. All pods terminate
         reporter.unregister_pod(&agent_uuid_2);
         assert_eq!(reporter.tracked_pod_count(), 0);
     }

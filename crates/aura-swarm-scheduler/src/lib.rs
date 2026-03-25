@@ -78,22 +78,22 @@
 //! For testing without a real Kubernetes cluster, enable the `test-utils` feature
 //! and use the mock scheduler:
 //!
-//! ```ignore
+//! ```text
 //! use aura_swarm_scheduler::{Scheduler, MockScheduler};
 //! use aura_swarm_core::{AgentId, UserId};
 //! use aura_swarm_store::AgentSpec;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let scheduler = MockScheduler::new();
+//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     let scheduler = MockScheduler::new();
 //!
-//! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-//! let agent_id = AgentId::generate(&user_id, "test-agent");
-//! let spec = AgentSpec::default();
+//!     let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+//!     let agent_id = AgentId::generate(&user_id, "test-agent");
+//!     let spec = AgentSpec::default();
 //!
-//! scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
-//! assert_eq!(scheduler.pod_count(), 1);
-//! # Ok(())
-//! # }
+//!     scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
+//!     assert_eq!(scheduler.pod_count(), 1);
+//!     Ok(())
+//! }
 //! ```
 
 #![forbid(unsafe_code)]

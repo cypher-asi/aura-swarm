@@ -20,7 +20,7 @@ pub struct SchedulerBillingConfig {
 impl Default for SchedulerBillingConfig {
     fn default() -> Self {
         Self {
-            url: "http://z-billing:8080".to_string(),
+            url: "https://z-billing.onrender.com".to_string(),
             api_key: String::new(),
             enabled: true,
             report_interval_seconds: 300, // 5 minutes

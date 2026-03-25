@@ -26,7 +26,7 @@ pub struct BillingConfig {
 impl Default for BillingConfig {
     fn default() -> Self {
         Self {
-            url: "http://z-billing:8080".to_string(),
+            url: "https://z-billing.onrender.com".to_string(),
             api_key: String::new(),
             enabled: true,
             min_credits_for_agent: 100,  // $1.00 minimum

@@ -10,6 +10,16 @@ members = [
     "crates/aura-swarm-cli",
     "crates/aura-swarm-protocol",
 ]
+default-members = [
+    "crates/aura-swarm-core",
+    "crates/aura-swarm-store",
+    "crates/aura-swarm-auth",
+    "crates/aura-swarm-control",
+    "crates/aura-swarm-scheduler",
+    "crates/aura-swarm-gateway",
+    "crates/aura-swarm-cli",
+    "crates/aura-swarm-protocol",
+]
 
 [workspace.package]
 version = "0.1.0"
