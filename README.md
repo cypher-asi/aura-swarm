@@ -24,7 +24,7 @@ Aura Swarm is a platform for running isolated AI agents as long-lived services. 
 
 Users interact with their agents through WebSocket sessions proxied by the gateway, or through the `aswarm` terminal UI. The platform handles the full agent lifecycle — provisioning, running, hibernation, wake-on-demand, and teardown — while keeping per-user state isolated under `/state/<user_id>/<agent_id>/`.
 
-Authentication is handled via zOS (JWT/JWKS), and usage is tracked through z-billing for credit-based access to LLM-powered agents.
+Authentication is handled via zOS (JWT/JWKS), and usage is tracked through the zbilling service for credit-based access to LLM-powered agents.
 
 ---
 

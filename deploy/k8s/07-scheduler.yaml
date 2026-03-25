@@ -65,7 +65,7 @@ spec:
                   name: aura-swarm-config
                   key: STATE_PVC_NAME
                   optional: true
-            # z-billing integration
+            # zbilling integration
             - name: Z_BILLING_URL
               valueFrom:
                 configMapKeyRef:

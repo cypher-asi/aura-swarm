@@ -68,7 +68,7 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: SCHEDULER_URL
-            # z-billing integration
+            # zbilling integration
             - name: Z_BILLING_URL
               valueFrom:
                 configMapKeyRef:

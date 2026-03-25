@@ -115,6 +115,17 @@ echo "Image Tag: ${IMAGE_TAG}"
 echo ""
 
 #------------------------------------------------------------------------------
+# Verify Docker is running
+#------------------------------------------------------------------------------
+
+if ! docker info &> /dev/null; then
+    echo -e "${RED}✗ Docker is not running.${NC}"
+    echo ""
+    echo "  Start Docker Desktop and wait for it to be ready, then re-run this script."
+    exit 1
+fi
+
+#------------------------------------------------------------------------------
 # Authenticate with ECR
 #------------------------------------------------------------------------------
 

@@ -1,14 +1,15 @@
 //! Compute usage reporter for billing.
 //!
-//! Periodically collects pod resource metrics and reports to z-billing.
+//! Periodically collects pod resource metrics and reports to the zbilling service.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use parking_lot::RwLock;
-use z_billing_client::{ClientOptions, ComputeUsageEvent, ZBillingClient};
+use reqwest::Client;
+use serde::Serialize;
 
 use super::config::SchedulerBillingConfig;
 
@@ -20,19 +21,11 @@ pub struct PodUsageInfo {
     /// Agent ID.
     pub agent_id: String,
     /// Last report time.
-    pub last_report: DateTime<Utc>,
+    pub last_report: chrono::DateTime<Utc>,
     /// CPU millicores allocated.
     pub cpu_millicores: u32,
     /// Memory MB allocated.
     pub memory_mb: u32,
-}
-
-/// Compute usage reporter that tracks pod metrics and reports to billing.
-pub struct ComputeUsageReporter {
-    client: ZBillingClient,
-    config: SchedulerBillingConfig,
-    /// Tracks last report time per agent.
-    pod_tracking: RwLock<HashMap<String, PodTrackingInfo>>,
 }
 
 struct PodTrackingInfo {
@@ -42,19 +35,37 @@ struct PodTrackingInfo {
     memory_mb: u32,
 }
 
+#[derive(Serialize)]
+struct ComputeUsageRequest {
+    event_id: String,
+    user_id: String,
+    agent_id: Option<String>,
+    cpu_hours: f64,
+    memory_gb_hours: f64,
+}
+
+/// Compute usage reporter that tracks pod metrics and reports to billing.
+pub struct ComputeUsageReporter {
+    http: Client,
+    config: SchedulerBillingConfig,
+    /// Tracks last report time per agent.
+    pod_tracking: RwLock<HashMap<String, PodTrackingInfo>>,
+}
+
 impl ComputeUsageReporter {
     /// Create a new compute usage reporter.
     ///
     /// # Errors
     ///
-    /// Returns `ReportError::Client` if the billing client cannot be created.
+    /// Returns `ReportError::Client` if the HTTP client cannot be created.
     pub fn new(config: SchedulerBillingConfig) -> Result<Self, ReportError> {
-        let options = ClientOptions::with_service_name("aura-scheduler");
-        let client = ZBillingClient::with_options(&config.url, &config.api_key, options)
-            .map_err(|e| ReportError::Client(format!("failed to create billing client: {e}")))?;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ReportError::Client(format!("failed to create HTTP client: {e}")))?;
 
         Ok(Self {
-            client,
+            http,
             config,
             pod_tracking: RwLock::new(HashMap::new()),
         })
@@ -153,30 +164,55 @@ impl ComputeUsageReporter {
         let cpu_hours = (f64::from(info.cpu_millicores) / 1000.0) * elapsed_hours;
         let memory_gb_hours = (f64::from(info.memory_mb) / 1024.0) * elapsed_hours;
 
-        let event = ComputeUsageEvent {
+        let url = format!("{}/v1/usage/compute", self.config.url);
+        let body = ComputeUsageRequest {
             event_id: format!("compute:{}:{}", agent_id, Utc::now().timestamp_millis()),
             user_id: info.user_id.clone(),
             agent_id: Some(agent_id.to_string()),
             cpu_hours,
             memory_gb_hours,
-            metadata: None,
         };
 
-        match self.client.report_compute_usage(event).await {
-            Ok(response) => {
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.config.api_key)
+            .header("x-service-name", "aura-scheduler")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
                 tracing::debug!(
                     agent_id = %agent_id,
                     cpu_hours = %cpu_hours,
                     memory_gb_hours = %memory_gb_hours,
-                    cost_cents = response.cost_cents,
                     "Reported compute usage"
                 );
                 self.update_last_report(agent_id);
                 Ok(())
             }
-            Err(z_billing_client::ClientError::DuplicateEvent { .. }) => {
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+                // Duplicate event — treat as success
                 self.update_last_report(agent_id);
                 Ok(())
+            }
+            Ok(r) if !self.config.fail_closed => {
+                let status = r.status();
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    status = %status,
+                    "Failed to report compute usage, continuing"
+                );
+                Ok(())
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                Err(ReportError::Client(format!(
+                    "billing service returned {status}: {body}"
+                )))
             }
             Err(e) if !self.config.fail_closed => {
                 tracing::warn!(

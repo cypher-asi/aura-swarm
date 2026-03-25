@@ -1,4 +1,4 @@
-//! Integration tests for scheduler billing against the live z-billing service.
+//! Integration tests for scheduler billing against the live zbilling service.
 //!
 //! Environment variables:
 //!   Z_BILLING_URL       - Service URL (default: https://z-billing.onrender.com)
@@ -23,7 +23,7 @@ fn admin_api_key() -> String {
     std::env::var("Z_BILLING_ADMIN_KEY").unwrap_or_else(|_| "test-admin-key".to_string())
 }
 
-/// Generate a unique UUID for each test (z-billing uses UUID format).
+/// Generate a unique UUID for each test (zbilling uses UUID format).
 fn unique_user_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -117,7 +117,7 @@ async fn reporter_disabled_reports_zero() {
 }
 
 // ============================================================================
-// Live Integration Tests (require z-billing at localhost:8081)
+// Live Integration Tests (require zbilling service)
 // ============================================================================
 
 mod live {
@@ -137,7 +137,7 @@ mod live {
         }
     }
 
-    /// Create a funded test account via the z-billing API.
+    /// Create a funded test account via the zbilling API.
     ///
     /// Triggers auto-account-creation via a usage check, then adds credits
     /// through the admin endpoint.

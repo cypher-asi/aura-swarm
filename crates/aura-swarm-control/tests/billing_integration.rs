@@ -1,4 +1,4 @@
-//! Integration tests for control plane billing against the live z-billing service.
+//! Integration tests for control plane billing against the live zbilling service.
 //!
 //! Environment variables:
 //!   Z_BILLING_URL       - Service URL (default: https://z-billing.onrender.com)
@@ -37,7 +37,7 @@ fn create_user_id() -> UserId {
     UserId::from_uuid(uuid::Uuid::new_v4())
 }
 
-/// Generate a unique UUID for each test (z-billing uses UUID format).
+/// Generate a unique UUID for each test (zbilling uses UUID format).
 fn unique_user_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -142,7 +142,7 @@ mod live {
         }
     }
 
-    /// Create a funded test account via the z-billing API.
+    /// Create a funded test account via the zbilling API.
     ///
     /// Triggers auto-account-creation via a usage check, then adds credits
     /// through the admin endpoint.

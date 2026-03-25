@@ -1,15 +1,17 @@
 //! Billing integration for the control plane.
 //!
 //! Provides credit balance checks before agent and session creation.
+//! Calls the external zbilling service via its REST API.
 
 use std::sync::Arc;
 
-use z_billing_client::{ClientOptions, ZBillingClient};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 /// Configuration for billing integration.
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
-    /// URL of the z-billing service.
+    /// URL of the zbilling service.
     pub url: String,
     /// API key for service authentication.
     pub api_key: String,
@@ -75,9 +77,22 @@ impl BillingConfig {
     }
 }
 
+#[derive(Serialize)]
+struct BalanceCheckRequest<'a> {
+    user_id: &'a str,
+    required_cents: i64,
+}
+
+#[derive(Deserialize)]
+struct BalanceCheckResponse {
+    sufficient: bool,
+    balance_cents: i64,
+    required_cents: i64,
+}
+
 /// Billing checker for credit balance verification.
 pub struct BillingChecker {
-    client: ZBillingClient,
+    http: Client,
     config: BillingConfig,
 }
 
@@ -88,10 +103,11 @@ impl BillingChecker {
     ///
     /// Returns `BillingCheckError::ServiceError` if the HTTP client cannot be created.
     pub fn new(config: BillingConfig) -> Result<Self, BillingCheckError> {
-        let options = ClientOptions::with_service_name("aura-control");
-        let client = ZBillingClient::with_options(&config.url, &config.api_key, options)
-            .map_err(|e| BillingCheckError::ServiceError(format!("failed to create billing client: {e}")))?;
-        Ok(Self { client, config })
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| BillingCheckError::ServiceError(format!("failed to create HTTP client: {e}")))?;
+        Ok(Self { http, config })
     }
 
     /// Create a billing checker wrapped in an Arc.
@@ -135,22 +151,54 @@ impl BillingChecker {
             return Ok(());
         }
 
-        match self.client.check_balance(user_id, required).await {
-            Ok(response) => {
-                if response.sufficient {
+        let url = format!("{}/v1/usage/check", self.config.url);
+        let body = BalanceCheckRequest {
+            user_id,
+            required_cents: required,
+        };
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.config.api_key)
+            .header("x-service-name", "aura-control")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                Err(BillingCheckError::AccountNotFound {
+                    user_id: user_id.to_string(),
+                })
+            }
+            Ok(r) if r.status().is_success() => {
+                let check: BalanceCheckResponse = r.json().await.map_err(|e| {
+                    BillingCheckError::ServiceError(format!("invalid response: {e}"))
+                })?;
+                if check.sufficient {
                     Ok(())
                 } else {
                     Err(BillingCheckError::InsufficientCredits {
-                        balance: response.balance_cents,
-                        required: response.required_cents,
+                        balance: check.balance_cents,
+                        required: check.required_cents,
                     })
                 }
             }
-            Err(z_billing_client::ClientError::InsufficientCredits { balance, required }) => {
-                Err(BillingCheckError::InsufficientCredits { balance, required })
-            }
-            Err(z_billing_client::ClientError::AccountNotFound { user_id }) => {
-                Err(BillingCheckError::AccountNotFound { user_id })
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let msg = format!("billing service returned {status}: {body}");
+                if self.config.fail_closed {
+                    Err(BillingCheckError::ServiceError(msg))
+                } else {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %msg,
+                        "Failed to check billing balance, continuing (fail_closed=false)"
+                    );
+                    Ok(())
+                }
             }
             Err(e) if !self.config.fail_closed => {
                 tracing::warn!(

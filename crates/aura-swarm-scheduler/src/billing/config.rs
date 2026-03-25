@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Configuration for scheduler billing integration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerBillingConfig {
-    /// URL of the z-billing service.
+    /// URL of the zbilling service.
     pub url: String,
     /// API key for service authentication.
     pub api_key: String,
