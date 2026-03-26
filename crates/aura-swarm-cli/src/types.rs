@@ -53,7 +53,7 @@ impl AgentState {
         use ratatui::style::Color;
         match self {
             Self::Running => Color::Green,
-            Self::Idle => Color::Yellow,
+            Self::Idle => Color::Blue,
             Self::Provisioning => Color::Cyan,
             Self::Hibernating => Color::Magenta,
             Self::Stopping => Color::Yellow,

@@ -1,9 +1,12 @@
-//! Endpoint cache for fast agent routing.
+//! Caches for fast agent routing and state-change deduplication.
 //!
-//! This module provides a simple in-memory cache for pod endpoints,
-//! avoiding repeated Kubernetes API calls for frequently accessed agents.
+//! This module provides simple in-memory caches:
+//! - `EndpointCache` — pod endpoints, avoiding repeated K8s API calls.
+//! - `StateCache` — last-pushed `AgentState` per agent, so the scheduler only
+//!   notifies the gateway when the mapped state actually changes.
 
 use aura_swarm_core::AgentId;
+use aura_swarm_store::AgentState;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
@@ -66,6 +69,36 @@ impl EndpointCache {
     #[must_use]
     pub fn agent_ids(&self) -> Vec<AgentId> {
         self.cache.read().keys().copied().collect()
+    }
+}
+
+/// Tracks the last `AgentState` pushed to the gateway for each agent.
+///
+/// The scheduler uses this to avoid redundant HTTP notifications when the
+/// K8s watcher fires repeated events that map to the same logical state.
+#[derive(Debug, Default)]
+pub struct StateCache {
+    cache: RwLock<HashMap<AgentId, AgentState>>,
+}
+
+impl StateCache {
+    /// Create a new empty state cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `state` and return `true` if it differs from the previously
+    /// recorded state (i.e. this is a genuine change that should be pushed).
+    pub fn update_if_changed(&self, agent_id: AgentId, state: AgentState) -> bool {
+        let mut map = self.cache.write();
+        let prev = map.insert(agent_id, state);
+        prev.map_or(true, |p| p != state)
+    }
+
+    /// Remove the cached state for an agent (e.g. on pod deletion).
+    pub fn remove(&self, agent_id: &AgentId) {
+        self.cache.write().remove(agent_id);
     }
 }
 
@@ -177,5 +210,42 @@ mod tests {
         let cache = EndpointCache::new();
         let agent_id = test_agent_id();
         assert!(cache.get(&agent_id).is_none());
+    }
+
+    // =========================================================================
+    // StateCache tests
+    // =========================================================================
+
+    #[test]
+    fn state_cache_first_insert_is_change() {
+        let cache = StateCache::new();
+        let agent_id = test_agent_id();
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
+    }
+
+    #[test]
+    fn state_cache_same_state_is_not_change() {
+        let cache = StateCache::new();
+        let agent_id = test_agent_id();
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
+        assert!(!cache.update_if_changed(agent_id, AgentState::Running));
+    }
+
+    #[test]
+    fn state_cache_different_state_is_change() {
+        let cache = StateCache::new();
+        let agent_id = test_agent_id();
+        assert!(cache.update_if_changed(agent_id, AgentState::Provisioning));
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
+        assert!(cache.update_if_changed(agent_id, AgentState::Idle));
+    }
+
+    #[test]
+    fn state_cache_remove_resets() {
+        let cache = StateCache::new();
+        let agent_id = test_agent_id();
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
+        cache.remove(&agent_id);
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
     }
 }

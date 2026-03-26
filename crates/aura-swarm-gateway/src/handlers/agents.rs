@@ -454,14 +454,14 @@ where
     let agent_id = parse_agent_id(&agent_id)?;
     let agent = state.control.get_agent(&user.user_id, &agent_id).await?;
 
-    // Calculate uptime (placeholder - would come from pod start time)
     // Safe: max(0) ensures non-negative
     let uptime_seconds = (Utc::now() - agent.created_at).num_seconds().max(0) as u64;
+    let active_sessions = state.control.count_active_sessions(&agent_id).await.unwrap_or(0);
 
     Ok(Json(StatusResponse {
         status: agent.status,
         uptime_seconds,
-        active_sessions: 0, // Placeholder
+        active_sessions,
         last_heartbeat_at: agent.last_heartbeat_at,
         resource_usage: ResourceUsage {
             cpu_percent: 0.0,
@@ -537,11 +537,12 @@ where
 
     let isolation = agent.spec.isolation.map(|i| format!("{i:?}").to_lowercase());
     let endpoint = state.control.resolve_agent_endpoint(&agent.agent_id).await.ok().flatten();
+    let active_sessions = state.control.count_active_sessions(&agent.agent_id).await.unwrap_or(0);
 
     Ok(Json(AgentStateResponse {
         state: agent.status,
         uptime_seconds,
-        active_sessions: 0,
+        active_sessions,
         last_heartbeat_at: agent.last_heartbeat_at,
         error_message: agent.error_message,
         agent_id: agent.agent_id.to_string(),

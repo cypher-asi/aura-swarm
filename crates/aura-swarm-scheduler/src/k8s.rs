@@ -19,7 +19,7 @@ use aura_swarm_core::AgentId;
 use aura_swarm_store::{AgentSpec, AgentState};
 
 use crate::billing::ComputeUsageReporter;
-use crate::cache::EndpointCache;
+use crate::cache::{EndpointCache, StateCache};
 use crate::pod::{build_pod, pod_name_for_agent};
 use crate::types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
 use crate::{Result, SchedulerError};
@@ -83,6 +83,7 @@ pub struct K8sScheduler {
     client: Client,
     config: SchedulerConfig,
     endpoint_cache: EndpointCache,
+    state_cache: StateCache,
     http_client: reqwest::Client,
     /// Optional billing reporter for compute usage tracking.
     billing_reporter: Option<Arc<ComputeUsageReporter>>,
@@ -109,6 +110,7 @@ impl K8sScheduler {
             client,
             config,
             endpoint_cache: EndpointCache::new(),
+            state_cache: StateCache::new(),
             http_client,
             billing_reporter: None,
         })
@@ -145,6 +147,7 @@ impl K8sScheduler {
             client,
             config,
             endpoint_cache: EndpointCache::new(),
+            state_cache: StateCache::new(),
             http_client,
             billing_reporter: None,
         })
@@ -369,7 +372,16 @@ impl K8sScheduler {
             }
         };
 
-        // Notify the gateway of the status change
+        // Only notify the gateway when the mapped state actually changes
+        if !self.state_cache.update_if_changed(agent_id, new_state) {
+            debug!(
+                agent_id = %agent_id,
+                state = ?new_state,
+                "Skipping redundant status notification"
+            );
+            return;
+        }
+
         if let Err(e) = self
             .notify_status_change(&agent_id, new_state, message.clone())
             .await
@@ -473,8 +485,8 @@ impl K8sScheduler {
             return;
         };
 
-        // Remove from endpoint cache
         self.endpoint_cache.remove(&agent_id);
+        self.state_cache.remove(&agent_id);
 
         // Notify gateway that pod is deleted (transition to Stopped)
         // Note: The gateway will check if agent is hibernating and skip if so
@@ -672,8 +684,8 @@ impl Scheduler for K8sScheduler {
             );
         }
 
-        // Remove from endpoint cache
         self.endpoint_cache.remove(agent_id);
+        self.state_cache.remove(agent_id);
 
         match pods.delete(&pod_name, &DeleteParams::default()).await {
             Ok(_) => {

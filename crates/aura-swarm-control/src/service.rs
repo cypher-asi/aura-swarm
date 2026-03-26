@@ -138,6 +138,24 @@ pub trait ControlPlane: Send + Sync {
     // Internal Operations (for scheduler callbacks)
     // =========================================================================
 
+    /// Count active sessions for an agent (no ownership check).
+    ///
+    /// Used by internal endpoints to report accurate session metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::AgentNotFound` if the agent doesn't exist.
+    async fn count_active_sessions(&self, agent_id: &AgentId) -> Result<u32>;
+
+    /// Reconcile agent states on startup.
+    ///
+    /// Finds agents stored as `Running` that have zero active sessions and
+    /// transitions them to `Idle`. This corrects stale state that can occur
+    /// when the process restarts or sessions are lost without a clean close.
+    ///
+    /// Returns the number of agents reconciled.
+    async fn reconcile_idle_agents(&self) -> Result<u32>;
+
     /// Update an agent's status without ownership verification.
     ///
     /// This is used by the scheduler to report pod status changes. It does NOT
@@ -698,6 +716,42 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         blocking_store(&self.store, move |s| session::list_sessions(s, &uid, &aid)).await
     }
 
+    async fn count_active_sessions(&self, agent_id: &AgentId) -> Result<u32> {
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            if s.get_agent(&aid)?.is_none() {
+                return Err(ControlError::AgentNotFound(aid));
+            }
+            let count = session::count_active_sessions(s, &aid)?;
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(count as u32)
+        })
+        .await
+    }
+
+    async fn reconcile_idle_agents(&self) -> Result<u32> {
+        blocking_store(&self.store, move |s| {
+            let running = s.list_agents_by_status(AgentState::Running)?;
+            let mut reconciled = 0u32;
+
+            for agent in &running {
+                let active = session::count_active_sessions(s, &agent.agent_id)?;
+                if active == 0 {
+                    s.update_agent_status(&agent.agent_id, AgentState::Idle)?;
+                    tracing::info!(
+                        agent_id = %agent.agent_id,
+                        name = %agent.name,
+                        "Reconciled stale Running → Idle (0 active sessions)"
+                    );
+                    reconciled += 1;
+                }
+            }
+
+            Ok(reconciled)
+        })
+        .await
+    }
+
     // =========================================================================
     // Operational
     // =========================================================================
@@ -748,26 +802,46 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     ) -> Result<()> {
         let aid = *agent_id;
         let err_msg = error_message.clone();
-        blocking_store(&self.store, move |s| {
-            if s.get_agent(&aid)?.is_none() {
-                return Err(ControlError::AgentNotFound(aid));
-            }
+        let applied = blocking_store(&self.store, move |s| {
+            let agent = s
+                .get_agent(&aid)?
+                .ok_or(ControlError::AgentNotFound(aid))?;
 
-            if err_msg.is_some() || status == AgentState::Error {
-                s.update_agent_error(&aid, status, err_msg)?;
+            // The scheduler maps K8s "Running + Ready" to AgentState::Running,
+            // but the control plane distinguishes Running (has sessions) from
+            // Idle (pod alive, no sessions).  Don't let the scheduler overwrite
+            // a session-driven state with a redundant pod-health signal.
+            let effective_status = if status == AgentState::Running
+                && matches!(agent.status, AgentState::Running | AgentState::Idle)
+            {
+                return Ok(false);
             } else {
-                s.update_agent_status(&aid, status)?;
+                status
+            };
+
+            if err_msg.is_some() || effective_status == AgentState::Error {
+                s.update_agent_error(&aid, effective_status, err_msg)?;
+            } else {
+                s.update_agent_status(&aid, effective_status)?;
             }
-            Ok(())
+            Ok(true)
         })
         .await?;
 
-        tracing::info!(
-            agent_id = %agent_id,
-            status = ?status,
-            error_message = ?error_message,
-            "Updated agent status (internal)"
-        );
+        if applied {
+            tracing::info!(
+                agent_id = %agent_id,
+                status = ?status,
+                error_message = ?error_message,
+                "Updated agent status (internal)"
+            );
+        } else {
+            tracing::debug!(
+                agent_id = %agent_id,
+                requested = ?status,
+                "Skipped redundant scheduler status update"
+            );
+        }
 
         Ok(())
     }
@@ -1269,5 +1343,137 @@ mod tests {
 
         let result = service.process_heartbeat(&fake_id).await;
         assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn internal_running_does_not_overwrite_idle() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+        // Simulate scheduler pushing Running (Provisioning → Running)
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Running);
+
+        // Control plane transitions to Idle (last session closed)
+        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Idle);
+
+        // Scheduler pushes Running again — should be a no-op
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Idle, "Idle must not be overwritten by scheduler Running");
+    }
+
+    #[tokio::test]
+    async fn internal_running_does_not_overwrite_running() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+
+        // Second push — still a no-op (already Running)
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Running);
+    }
+
+    #[tokio::test]
+    async fn internal_error_still_applies_over_idle() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+
+        // Error should always go through regardless of current state
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Error,
+                Some("OOM".to_string()),
+            )
+            .await
+            .unwrap();
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Error);
+        assert_eq!(a.error_message.as_deref(), Some("OOM"));
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_empty() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+        let count = service.count_active_sessions(&agent.agent_id).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_idle_agents_transitions_stale_running() {
+        let (service, _dir, user_id) = setup();
+
+        let (a1, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("agent-1"))
+            .await
+            .unwrap();
+        let (a2, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("agent-2"))
+            .await
+            .unwrap();
+
+        // Force both to Running (simulating scheduler push)
+        service.store.update_agent_status(&a1.agent_id, AgentState::Running).unwrap();
+        service.store.update_agent_status(&a2.agent_id, AgentState::Running).unwrap();
+
+        let reconciled = service.reconcile_idle_agents().await.unwrap();
+        assert_eq!(reconciled, 2);
+
+        let a1 = service.get_agent(&user_id, &a1.agent_id).await.unwrap();
+        let a2 = service.get_agent(&user_id, &a2.agent_id).await.unwrap();
+        assert_eq!(a1.status, AgentState::Idle);
+        assert_eq!(a2.status, AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn reconcile_idle_agents_skips_running_with_sessions() {
+        let (service, _dir, user_id) = setup();
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("agent-1"))
+            .await
+            .unwrap();
+
+        // Force to Running and create a session
+        service.store.update_agent_status(&agent.agent_id, AgentState::Running).unwrap();
+        service
+            .create_session(&user_id, &agent.agent_id, Default::default())
+            .await
+            .unwrap();
+
+        let reconciled = service.reconcile_idle_agents().await.unwrap();
+        assert_eq!(reconciled, 0);
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Running);
     }
 }

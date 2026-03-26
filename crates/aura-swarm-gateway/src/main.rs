@@ -24,8 +24,8 @@ use aura_swarm_auth::MockJwtValidator;
 #[cfg(not(feature = "dev-mode"))]
 use aura_swarm_auth::{AuthConfig, ZosTokenValidator};
 use aura_swarm_control::{
-    BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlaneService,
-    HttpSchedulerClient,
+    BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlane,
+    ControlPlaneService, HttpSchedulerClient,
 };
 use aura_swarm_gateway::{create_router, GatewayConfig, GatewayState};
 use aura_swarm_store::RocksStore;
@@ -97,6 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         has_billing = control.has_billing(),
         "Control plane initialized"
     );
+
+    match control.reconcile_idle_agents().await {
+        Ok(0) => tracing::debug!("No stale Running agents to reconcile"),
+        Ok(n) => tracing::info!(count = n, "Reconciled stale Running agents → Idle"),
+        Err(e) => tracing::warn!(error = %e, "Failed to reconcile idle agents on startup"),
+    }
 
     #[cfg(feature = "dev-mode")]
     let jwt_validator = {
