@@ -71,54 +71,84 @@ where
         "WebSocket connection initiated"
     );
 
+    let control = Arc::clone(&state.control);
+
     Ok(ws.on_upgrade(move |socket| {
-        handle_websocket(socket, endpoint, session_id_str, agent_id_str, timeout)
+        handle_websocket(
+            socket,
+            endpoint,
+            session_id,
+            session_id_str,
+            agent_id_str,
+            user_id_str,
+            timeout,
+            control,
+        )
     }))
 }
 
 /// Handle the WebSocket connection after upgrade.
 ///
 /// Connects to the agent's `/stream` endpoint and proxies bidirectionally.
-async fn handle_websocket(
+/// When the proxy ends for any reason, the session is automatically closed
+/// so that the agent can transition to Idle when no sessions remain.
+async fn handle_websocket<C: ControlPlane + 'static>(
     client_socket: WebSocket,
     agent_endpoint: String,
-    session_id: String,
-    agent_id: String,
+    session_id: SessionId,
+    session_id_str: String,
+    agent_id_str: String,
+    user_id_str: String,
     timeout: std::time::Duration,
+    control: Arc<C>,
 ) {
     let agent_url = format!("ws://{agent_endpoint}/stream");
     let Some(agent_socket) =
-        connect_to_agent(&agent_url, timeout, &session_id, &agent_id).await
+        connect_to_agent(&agent_url, timeout, &session_id_str, &agent_id_str).await
     else {
         return;
     };
 
     tracing::info!(
-        session_id = %session_id,
-        agent_id = %agent_id,
+        session_id = %session_id_str,
+        agent_id = %agent_id_str,
         "Connected to agent, starting proxy"
     );
 
     let (client_write, client_read) = client_socket.split();
     let (agent_write, agent_read) = agent_socket.split();
 
-    let client_to_agent = forward_client_to_agent(client_read, agent_write, &session_id);
-    let agent_to_client = forward_agent_to_client(agent_read, client_write, &session_id);
+    let client_to_agent = forward_client_to_agent(client_read, agent_write, &session_id_str);
+    let agent_to_client = forward_agent_to_client(agent_read, client_write, &session_id_str);
 
     tokio::select! {
         result = client_to_agent => {
             if let Err(e) = result {
-                tracing::debug!(session_id = %session_id, error = %e, "Client to agent forward ended");
+                tracing::debug!(session_id = %session_id_str, error = %e, "Client to agent forward ended");
             }
         }
         result = agent_to_client => {
             if let Err(e) = result {
-                tracing::debug!(session_id = %session_id, error = %e, "Agent to client forward ended");
+                tracing::debug!(session_id = %session_id_str, error = %e, "Agent to client forward ended");
             }
         }
     }
 
-    tracing::info!(session_id = %session_id, "WebSocket proxy ended");
+    // Always close the session when the WebSocket proxy ends, regardless of
+    // how the connection was terminated.  This prevents orphaned Active
+    // sessions that block the Running → Idle transition.
+    if let Ok(user_id) = user_id_str.parse::<aura_swarm_core::UserId>() {
+        match control.close_session(&user_id, &session_id).await {
+            Ok(()) => {
+                tracing::info!(session_id = %session_id_str, "Session closed on proxy end");
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %session_id_str, error = %e, "Failed to close session on proxy end");
+            }
+        }
+    }
+
+    tracing::info!(session_id = %session_id_str, "WebSocket proxy ended");
 }
 
 /// Connect to the agent's WebSocket endpoint with timeout.

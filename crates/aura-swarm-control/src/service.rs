@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_swarm_core::{AgentId, UserId, SessionId};
-use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, Store};
+use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, SessionStatus, Store};
 use chrono::Utc;
 
 use crate::billing::BillingChecker;
@@ -732,8 +732,29 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     async fn reconcile_idle_agents(&self) -> Result<u32> {
         blocking_store(&self.store, move |s| {
             let running = s.list_agents_by_status(AgentState::Running)?;
+            let idle = s.list_agents_by_status(AgentState::Idle)?;
             let mut reconciled = 0u32;
 
+            // First pass: close orphaned Active sessions on all live agents.
+            // A session is orphaned if it is Active but has no backing
+            // WebSocket (which we can't check here), so on startup we
+            // conservatively close ALL Active sessions — any real client
+            // will simply create a new one when it reconnects.
+            for agent in running.iter().chain(idle.iter()) {
+                let sessions = s.list_sessions_by_agent(&agent.agent_id)?;
+                for sess in &sessions {
+                    if sess.status == SessionStatus::Active {
+                        s.update_session_status(&sess.session_id, SessionStatus::Closed)?;
+                        tracing::info!(
+                            session_id = %sess.session_id,
+                            agent_id = %agent.agent_id,
+                            "Closed orphaned session on startup"
+                        );
+                    }
+                }
+            }
+
+            // Second pass: transition Running agents (now with 0 sessions) to Idle.
             for agent in &running {
                 let active = session::count_active_sessions(s, &agent.agent_id)?;
                 if active == 0 {
@@ -1455,7 +1476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_idle_agents_skips_running_with_sessions() {
+    async fn reconcile_closes_orphaned_sessions_then_idles() {
         let (service, _dir, user_id) = setup();
 
         let (agent, _) = service
@@ -1463,17 +1484,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Force to Running and create a session
+        // Force to Running and create a session (simulating an orphan)
         service.store.update_agent_status(&agent.agent_id, AgentState::Running).unwrap();
-        service
+        let sess = service
             .create_session(&user_id, &agent.agent_id, Default::default())
             .await
             .unwrap();
 
+        // Reconciliation should close the orphaned session and transition to Idle
         let reconciled = service.reconcile_idle_agents().await.unwrap();
-        assert_eq!(reconciled, 0);
+        assert_eq!(reconciled, 1);
 
         let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
-        assert_eq!(a.status, AgentState::Running);
+        assert_eq!(a.status, AgentState::Idle);
+
+        // Session should be closed
+        let s = service.get_session(&user_id, &sess.session_id).await.unwrap();
+        assert_eq!(s.status, SessionStatus::Closed);
     }
 }
