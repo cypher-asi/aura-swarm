@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::Json;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -31,8 +31,7 @@ use crate::state::GatewayState;
 // ---------------------------------------------------------------------------
 
 fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
-    s.parse()
-        .map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
+    AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
 async fn resolve_endpoint<C: ControlPlane>(
