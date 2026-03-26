@@ -89,6 +89,22 @@ spec:
                   name: aura-swarm-config
                   key: Z_BILLING_FAIL_CLOSED
                   optional: true
+            # Service URLs passed through to agent pods
+            - name: AURA_ROUTER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: AURA_ROUTER_URL
+            - name: AURA_STORAGE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: AURA_STORAGE_URL
+            - name: AURA_NETWORK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: AURA_NETWORK_URL
           resources:
             requests:
               cpu: 250m

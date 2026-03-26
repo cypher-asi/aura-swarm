@@ -217,8 +217,6 @@ fn build_env_vars(
             value: Some(config.control_plane_url.clone()),
             ..Default::default()
         },
-        build_secret_env_var("ANTHROPIC_API_KEY", LLM_SECRETS_NAME, "ANTHROPIC_API_KEY"),
-        build_secret_env_var("OPENAI_API_KEY", LLM_SECRETS_NAME, "OPENAI_API_KEY"),
         EnvVar {
             name: "AURA_DATA_DIR".to_string(),
             value: Some("/state".to_string()),
@@ -226,9 +224,25 @@ fn build_env_vars(
         },
         EnvVar {
             name: "AURA_LLM_ROUTING".to_string(),
-            value: Some("direct".to_string()),
+            value: Some("proxy".to_string()),
             ..Default::default()
         },
+        EnvVar {
+            name: "AURA_ROUTER_URL".to_string(),
+            value: Some(config.aura_router_url.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_STORAGE_URL".to_string(),
+            value: Some(config.aura_storage_url.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_NETWORK_URL".to_string(),
+            value: Some(config.aura_network_url.clone()),
+            ..Default::default()
+        },
+        build_secret_env_var("INTERNAL_SERVICE_TOKEN", LLM_SECRETS_NAME, "INTERNAL_SERVICE_TOKEN"),
         EnvVar {
             name: "ENABLE_FS_TOOLS".to_string(),
             value: Some("true".to_string()),
@@ -445,8 +459,11 @@ mod tests {
         assert!(env_names.contains(&"STATE_DIR"));
         assert!(env_names.contains(&"AURA_LISTEN_ADDR"));
         assert!(env_names.contains(&"CONTROL_PLANE_URL"));
-        assert!(env_names.contains(&"ANTHROPIC_API_KEY"));
-        assert!(env_names.contains(&"OPENAI_API_KEY"));
+        assert!(env_names.contains(&"AURA_LLM_ROUTING"));
+        assert!(env_names.contains(&"AURA_ROUTER_URL"));
+        assert!(env_names.contains(&"AURA_STORAGE_URL"));
+        assert!(env_names.contains(&"AURA_NETWORK_URL"));
+        assert!(env_names.contains(&"INTERNAL_SERVICE_TOKEN"));
     }
 
     #[test]
@@ -523,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn build_pod_injects_llm_api_keys_from_secret() {
+    fn build_pod_injects_internal_token_from_secret() {
         let agent_id = test_agent_id();
         let spec = test_spec();
         let config = SchedulerConfig::default();
@@ -532,23 +549,16 @@ mod tests {
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let env = container.env.as_ref().unwrap();
 
-        // Find the ANTHROPIC_API_KEY env var
-        let anthropic_env = env.iter().find(|e| e.name == "ANTHROPIC_API_KEY").unwrap();
+        let token_env = env
+            .iter()
+            .find(|e| e.name == "INTERNAL_SERVICE_TOKEN")
+            .unwrap();
 
-        // Verify it references a secret, not a direct value
-        assert!(anthropic_env.value.is_none());
-        let value_from = anthropic_env.value_from.as_ref().unwrap();
+        assert!(token_env.value.is_none());
+        let value_from = token_env.value_from.as_ref().unwrap();
         let secret_ref = value_from.secret_key_ref.as_ref().unwrap();
         assert_eq!(secret_ref.name, "aura-swarm-secrets");
-        assert_eq!(secret_ref.key, "ANTHROPIC_API_KEY");
+        assert_eq!(secret_ref.key, "INTERNAL_SERVICE_TOKEN");
         assert_eq!(secret_ref.optional, Some(true));
-
-        // Same for OPENAI_API_KEY
-        let openai_env = env.iter().find(|e| e.name == "OPENAI_API_KEY").unwrap();
-        assert!(openai_env.value.is_none());
-        let value_from = openai_env.value_from.as_ref().unwrap();
-        let secret_ref = value_from.secret_key_ref.as_ref().unwrap();
-        assert_eq!(secret_ref.name, "aura-swarm-secrets");
-        assert_eq!(secret_ref.key, "OPENAI_API_KEY");
     }
 }

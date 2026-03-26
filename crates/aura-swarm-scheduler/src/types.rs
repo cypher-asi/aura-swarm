@@ -117,6 +117,12 @@ pub struct SchedulerConfig {
     /// Billing configuration.
     #[serde(default)]
     pub billing: crate::billing::SchedulerBillingConfig,
+    /// URL of the Aura router service for LLM proxy routing.
+    pub aura_router_url: String,
+    /// URL of the Aura storage service.
+    pub aura_storage_url: String,
+    /// URL of the Aura network service.
+    pub aura_network_url: String,
 }
 
 impl Default for SchedulerConfig {
@@ -133,6 +139,9 @@ impl Default for SchedulerConfig {
             max_cpu_millicores: 4000,
             max_memory_mb: 8192,
             billing: crate::billing::SchedulerBillingConfig::default(),
+            aura_router_url: "https://aura-router.onrender.com".to_string(),
+            aura_storage_url: "https://aura-storage.onrender.com".to_string(),
+            aura_network_url: "https://aura-network.onrender.com".to_string(),
         }
     }
 }
@@ -160,6 +169,9 @@ impl SchedulerConfig {
     /// - `DEFAULT_MEMORY_MB`: Default memory allocation
     /// - `MAX_CPU_MILLICORES`: Maximum CPU allowed
     /// - `MAX_MEMORY_MB`: Maximum memory allowed
+    /// - `AURA_ROUTER_URL`: URL of the Aura router service
+    /// - `AURA_STORAGE_URL`: URL of the Aura storage service
+    /// - `AURA_NETWORK_URL`: URL of the Aura network service
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -209,6 +221,15 @@ impl SchedulerConfig {
             if let Ok(n) = val.parse() {
                 config.max_memory_mb = n;
             }
+        }
+        if let Ok(val) = std::env::var("AURA_ROUTER_URL") {
+            config.aura_router_url = val;
+        }
+        if let Ok(val) = std::env::var("AURA_STORAGE_URL") {
+            config.aura_storage_url = val;
+        }
+        if let Ok(val) = std::env::var("AURA_NETWORK_URL") {
+            config.aura_network_url = val;
         }
 
         config
