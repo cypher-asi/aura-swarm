@@ -473,9 +473,9 @@ async fn handle_command_mode(
             }
         }
         KeyCode::Char('x') => {
-            // Disconnect from agent
+            // Disconnect the selected agent only (others stay connected)
             if app.is_connected() {
-                app.disconnect().await;
+                app.disconnect_selected().await;
             }
         }
         KeyCode::Char('j') => {

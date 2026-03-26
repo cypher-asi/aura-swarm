@@ -55,12 +55,10 @@ pub struct App {
     pub cursor_position: usize,
     /// Current input mode.
     pub input_mode: InputMode,
-    /// WebSocket sender (if connected).
-    ws_sender: Option<WsSender>,
-    /// Current session ID (if connected).
-    current_session_id: Option<String>,
-    /// Agent ID of the currently connected session.
-    connected_agent_id: Option<String>,
+    /// WebSocket senders per connected agent (by agent_id).
+    ws_senders: HashMap<String, WsSender>,
+    /// Active session IDs per connected agent (by agent_id).
+    session_ids: HashMap<String, String>,
     /// Chat scroll position.
     pub chat_scroll: usize,
     /// Status message to display.
@@ -69,8 +67,6 @@ pub struct App {
     pub should_quit: bool,
     /// Error message to display.
     pub error_message: Option<String>,
-    /// Whether WebSocket is connected.
-    pub ws_connected: bool,
     /// Last refresh error to display to user.
     pub refresh_error: Option<String>,
     /// Cached streaming state per agent, used when the connected agent is not
@@ -112,26 +108,20 @@ impl App {
             input: String::new(),
             cursor_position: 0,
             input_mode: InputMode::Normal,
-            ws_sender: None,
-            current_session_id: None,
-            connected_agent_id: None,
+            ws_senders: HashMap::new(),
+            session_ids: HashMap::new(),
             chat_scroll: 0,
             status_message: None,
             should_quit: false,
             error_message: None,
-            ws_connected: false,
             refresh_error: None,
             streaming_state_cache: HashMap::new(),
-            // Streaming state
             current_request_id: None,
             streaming_text_buffer: String::new(),
             streaming_message_idx: None,
             is_streaming: false,
-            // Start in normal input mode (not command mode)
             command_mode: false,
-            // Animation
             animation_frame: 0,
-            // No saved input initially
             saved_chat_input: None,
         }
     }
@@ -594,22 +584,23 @@ impl App {
     }
 
     /// Connect to the selected agent's chat session.
+    ///
+    /// Does NOT disconnect other agents — multiple concurrent connections are
+    /// supported so users can chat with several agents at once.
     pub async fn connect_to_agent(&mut self) -> Result<mpsc::Receiver<WsEvent>, String> {
         let agent = self.selected_agent().ok_or("No agent selected")?;
 
-        // Check agent is in a runnable state
         if !matches!(agent.status, AgentState::Running | AgentState::Idle) {
             return Err(format!("Agent is not running (status: {:?})", agent.status));
         }
 
         let agent_id = agent.agent_id.clone();
 
-        // Disconnect previous session (drops old WsSender, stopping the forwarder task)
-        if self.ws_sender.is_some() {
-            self.disconnect().await;
+        // If this specific agent already has a connection, tear it down first
+        if self.ws_senders.contains_key(&agent_id) {
+            self.disconnect_agent(&agent_id).await;
         }
 
-        // Create session
         let session = self
             .client
             .create_session(&agent_id)
@@ -619,24 +610,19 @@ impl App {
         let session_id = session.session_id.clone();
         let ws_url = self.client.ws_url(&session_id);
 
-        // Connect WebSocket
         let (sender, receiver) = ws::connect(&ws_url, self.client.token())
             .await
             .map_err(|e| e.to_string())?;
 
-        // Send session_init (required by the harness before any user_message)
         sender
             .send_session_init(aura_swarm_protocol::SessionInit::default())
             .await
             .map_err(|e| e.to_string())?;
 
-        self.ws_sender = Some(sender);
-        self.current_session_id = Some(session_id);
-        self.connected_agent_id = Some(agent_id.clone());
+        self.ws_senders.insert(agent_id.clone(), sender);
+        self.session_ids.insert(agent_id.clone(), session_id);
 
-        // Load cached messages for this agent (preserves history)
         self.load_messages_from_cache(&agent_id);
-        self.ws_connected = true;
 
         self.set_status("Connected to agent");
 
@@ -655,27 +641,52 @@ impl App {
         self.connect_to_agent().await
     }
 
-    /// Disconnect from the current session.
-    pub async fn disconnect(&mut self) {
-        if let Some(agent_id) = self.connected_agent_id.take() {
-            let is_selected = self
-                .selected_agent_id()
-                .map_or(false, |id| id == agent_id);
+    /// Disconnect a specific agent's WebSocket session.
+    async fn disconnect_agent(&mut self, agent_id: &str) {
+        self.ws_senders.remove(agent_id);
+        self.streaming_state_cache.remove(agent_id);
 
-            if is_selected && !self.messages.is_empty() {
-                self.message_cache
-                    .insert(agent_id.clone(), std::mem::take(&mut self.messages));
+        if let Some(session_id) = self.session_ids.remove(agent_id) {
+            let _ = self.client.close_session(&session_id).await;
+        }
+    }
+
+    /// Disconnect the currently selected agent.
+    pub async fn disconnect_selected(&mut self) {
+        if let Some(agent_id) = self.selected_agent_id().map(String::from) {
+            if self.ws_senders.contains_key(&agent_id) {
+                if !self.messages.is_empty() {
+                    self.message_cache
+                        .insert(agent_id.clone(), std::mem::take(&mut self.messages));
+                }
+
+                self.disconnect_agent(&agent_id).await;
+
+                self.is_streaming = false;
+                self.streaming_message_idx = None;
+                self.streaming_text_buffer.clear();
+                self.current_request_id = None;
+                self.set_status("Disconnected");
             }
+        }
+    }
 
-            self.streaming_state_cache.remove(&agent_id);
+    /// Disconnect all agent sessions (used on app exit).
+    pub async fn disconnect(&mut self) {
+        if let Some(agent_id) = self.selected_agent_id().map(String::from) {
+            if !self.messages.is_empty() {
+                self.message_cache
+                    .insert(agent_id, std::mem::take(&mut self.messages));
+            }
         }
 
-        if let Some(session_id) = self.current_session_id.take() {
+        let session_ids: Vec<String> = self.session_ids.drain().map(|(_, v)| v).collect();
+        for session_id in session_ids {
             let _ = self.client.close_session(&session_id).await;
         }
 
-        self.ws_sender = None;
-        self.ws_connected = false;
+        self.ws_senders.clear();
+        self.streaming_state_cache.clear();
         self.is_streaming = false;
         self.streaming_message_idx = None;
         self.streaming_text_buffer.clear();
@@ -685,9 +696,16 @@ impl App {
 
     /// Send a chat message using the Aura runtime protocol.
     ///
-    /// Sends a prompt request and prepares the app for receiving streaming deltas.
+    /// Sends to the currently *selected* agent's WebSocket connection.
     pub async fn send_message(&mut self, content: String) -> Result<(), String> {
-        let sender = self.ws_sender.as_ref().ok_or("Not connected")?;
+        let agent_id = self
+            .selected_agent_id()
+            .ok_or("No agent selected")?
+            .to_string();
+        let sender = self
+            .ws_senders
+            .get(&agent_id)
+            .ok_or("Not connected to this agent")?;
 
         self.messages.push(ChatMessage::user(&content));
 
@@ -711,14 +729,14 @@ impl App {
     pub fn handle_ws_event(&mut self, event: WsEvent) -> bool {
         match event {
             WsEvent::Connected => {
-                self.ws_connected = true;
                 self.set_status("WebSocket connected");
                 true
             }
             WsEvent::SessionReady { session_id, tools } => {
-                self.ws_connected = true;
                 let tool_count = tools.len();
-                self.current_session_id = Some(session_id);
+                if let Some(agent_id) = self.selected_agent_id().map(String::from) {
+                    self.session_ids.insert(agent_id, session_id);
+                }
                 self.set_status(format!("Session ready ({tool_count} tools available)"));
                 true
             }
@@ -865,9 +883,6 @@ impl App {
                 true
             }
             WsEvent::Disconnected => {
-                self.ws_connected = false;
-                self.ws_sender = None;
-                self.current_session_id = None;
                 self.is_streaming = false;
                 self.streaming_message_idx = None;
                 self.set_status("Disconnected");
@@ -878,21 +893,23 @@ impl App {
 
     /// Handle a WebSocket event tagged with the originating agent_id.
     ///
-    /// If the event belongs to the currently *selected* (viewed) agent AND that
-    /// agent is the connected session, apply it live to `self.messages`.
-    /// Otherwise, route it to the background message + streaming caches so
-    /// switching back to that agent later shows the correct history.
+    /// If the event belongs to the currently *selected* (viewed) agent, apply
+    /// it live to `self.messages`. Otherwise, route it to the background
+    /// message + streaming caches so switching back to that agent later shows
+    /// the correct history.
     pub fn handle_ws_event_for_agent(&mut self, agent_id: &str, event: WsEvent) -> bool {
-        let is_connected = self
-            .connected_agent_id
-            .as_deref()
-            .map_or(false, |id| id == agent_id);
+        // Clean up connection bookkeeping on disconnect regardless of which
+        // agent it is or whether it is selected.
+        if matches!(event, WsEvent::Disconnected) {
+            self.ws_senders.remove(agent_id);
+            self.session_ids.remove(agent_id);
+        }
 
         let is_selected = self
             .selected_agent_id()
             .map_or(false, |id| id == agent_id);
 
-        if is_connected && is_selected {
+        if is_selected {
             return self.handle_ws_event(event);
         }
 
@@ -1055,20 +1072,27 @@ impl App {
         self.is_streaming
     }
 
-    /// Check if connected to a session.
+    /// Check if the currently selected agent has an active connection.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.ws_sender.is_some() && self.ws_connected
+        self.selected_agent_id()
+            .map_or(false, |id| self.ws_senders.contains_key(id))
     }
 
     /// Cancel the current streaming response.
     ///
     /// Returns `true` if a cancel was sent, `false` if not streaming.
     pub async fn cancel_streaming(&mut self) -> bool {
-        if let Some(sender) = self.ws_sender.as_ref() {
-            if !self.is_streaming {
-                return false;
-            }
+        if !self.is_streaming {
+            return false;
+        }
+
+        let agent_id = match self.selected_agent_id() {
+            Some(id) => id.to_string(),
+            None => return false,
+        };
+
+        if let Some(sender) = self.ws_senders.get(&agent_id) {
             if let Err(e) = sender.cancel().await {
                 self.set_error(format!("Failed to cancel: {e}"));
                 return false;
