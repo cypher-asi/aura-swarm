@@ -28,6 +28,15 @@ pub enum InputMode {
     ConfirmingDelete,
 }
 
+/// Per-agent streaming state, saved when switching away from a streaming agent.
+#[derive(Debug, Clone, Default)]
+struct StreamingState {
+    streaming_text_buffer: String,
+    streaming_message_idx: Option<usize>,
+    is_streaming: bool,
+    current_request_id: Option<String>,
+}
+
 /// Application state.
 pub struct App {
     /// HTTP client for the gateway.
@@ -64,6 +73,9 @@ pub struct App {
     pub ws_connected: bool,
     /// Last refresh error to display to user.
     pub refresh_error: Option<String>,
+    /// Cached streaming state per agent, used when the connected agent is not
+    /// the currently selected (viewed) agent.
+    streaming_state_cache: HashMap<String, StreamingState>,
 
     // =========================================================================
     // Streaming State
@@ -109,6 +121,7 @@ impl App {
             error_message: None,
             ws_connected: false,
             refresh_error: None,
+            streaming_state_cache: HashMap::new(),
             // Streaming state
             current_request_id: None,
             streaming_text_buffer: String::new(),
@@ -161,6 +174,11 @@ impl App {
         self.selected_agent.and_then(|i| self.agents.get(i))
     }
 
+    /// Get the currently selected agent's ID.
+    fn selected_agent_id(&self) -> Option<&str> {
+        self.selected_agent().map(|a| a.agent_id.as_str())
+    }
+
     /// Get the gateway URL for display.
     #[must_use]
     pub fn gateway_url(&self) -> &str {
@@ -210,16 +228,47 @@ impl App {
 
     /// Switch to viewing a different agent's chat.
     fn switch_agent_view(&mut self, new_index: usize) {
-        // Save current agent's messages
+        self.save_streaming_state();
         self.save_messages_to_cache();
 
-        // Update selection
         self.selected_agent = Some(new_index);
 
-        // Load new agent's messages from cache
         if let Some(agent) = self.agents.get(new_index) {
             let id = agent.agent_id.clone();
             self.load_messages_from_cache(&id);
+            self.restore_streaming_state(&id);
+        }
+    }
+
+    /// Save the current global streaming state into the per-agent cache.
+    fn save_streaming_state(&mut self) {
+        if let Some(agent) = self.selected_agent() {
+            if self.is_streaming || self.streaming_message_idx.is_some() {
+                let agent_id = agent.agent_id.clone();
+                self.streaming_state_cache.insert(
+                    agent_id,
+                    StreamingState {
+                        streaming_text_buffer: std::mem::take(&mut self.streaming_text_buffer),
+                        streaming_message_idx: self.streaming_message_idx.take(),
+                        is_streaming: self.is_streaming,
+                        current_request_id: self.current_request_id.take(),
+                    },
+                );
+            }
+        }
+        self.is_streaming = false;
+        self.streaming_text_buffer.clear();
+        self.streaming_message_idx = None;
+        self.current_request_id = None;
+    }
+
+    /// Restore per-agent streaming state back into the global fields.
+    fn restore_streaming_state(&mut self, agent_id: &str) {
+        if let Some(state) = self.streaming_state_cache.remove(agent_id) {
+            self.streaming_text_buffer = state.streaming_text_buffer;
+            self.streaming_message_idx = state.streaming_message_idx;
+            self.is_streaming = state.is_streaming;
+            self.current_request_id = state.current_request_id;
         }
     }
 
@@ -608,12 +657,17 @@ impl App {
 
     /// Disconnect from the current session.
     pub async fn disconnect(&mut self) {
-        // Save messages to cache before disconnecting
         if let Some(agent_id) = self.connected_agent_id.take() {
-            if !self.messages.is_empty() {
+            let is_selected = self
+                .selected_agent_id()
+                .map_or(false, |id| id == agent_id);
+
+            if is_selected && !self.messages.is_empty() {
                 self.message_cache
-                    .insert(agent_id, std::mem::take(&mut self.messages));
+                    .insert(agent_id.clone(), std::mem::take(&mut self.messages));
             }
+
+            self.streaming_state_cache.remove(&agent_id);
         }
 
         if let Some(session_id) = self.current_session_id.take() {
@@ -622,6 +676,10 @@ impl App {
 
         self.ws_sender = None;
         self.ws_connected = false;
+        self.is_streaming = false;
+        self.streaming_message_idx = None;
+        self.streaming_text_buffer.clear();
+        self.current_request_id = None;
         self.set_status("Disconnected");
     }
 
@@ -820,36 +878,140 @@ impl App {
 
     /// Handle a WebSocket event tagged with the originating agent_id.
     ///
-    /// If the event belongs to the currently viewed agent, apply it live.
-    /// Otherwise, route it to the background agent's message cache.
+    /// If the event belongs to the currently *selected* (viewed) agent AND that
+    /// agent is the connected session, apply it live to `self.messages`.
+    /// Otherwise, route it to the background message + streaming caches so
+    /// switching back to that agent later shows the correct history.
     pub fn handle_ws_event_for_agent(&mut self, agent_id: &str, event: WsEvent) -> bool {
-        let is_active = self
+        let is_connected = self
             .connected_agent_id
             .as_deref()
             .map_or(false, |id| id == agent_id);
 
-        if is_active {
+        let is_selected = self
+            .selected_agent_id()
+            .map_or(false, |id| id == agent_id);
+
+        if is_connected && is_selected {
             return self.handle_ws_event(event);
         }
 
-        // Background agent: accumulate text into cached messages
-        let cached = self.message_cache.entry(agent_id.to_string()).or_default();
+        self.handle_background_ws_event(agent_id, event)
+    }
+
+    /// Accumulate a WS event into the per-agent caches (message_cache +
+    /// streaming_state_cache) for an agent that is not currently viewed.
+    fn handle_background_ws_event(&mut self, agent_id: &str, event: WsEvent) -> bool {
+        let cached_msgs = self.message_cache.entry(agent_id.to_string()).or_default();
+        let streaming = self
+            .streaming_state_cache
+            .entry(agent_id.to_string())
+            .or_default();
+
         match event {
+            WsEvent::Connected | WsEvent::SessionReady { .. } => {}
             WsEvent::TurnStart => {
-                cached.push(ChatMessage::assistant(String::new()));
+                streaming.is_streaming = true;
+                streaming.streaming_text_buffer.clear();
+                streaming.streaming_message_idx = None;
             }
             WsEvent::TextDelta(text) => {
-                if let Some(last) = cached.last_mut() {
-                    if last.role == "assistant" {
-                        last.content.push_str(&text);
+                streaming.streaming_text_buffer.push_str(&text);
+                Self::update_cached_streaming_message(cached_msgs, streaming);
+            }
+            WsEvent::ThinkingDelta(thinking) => {
+                if !streaming.streaming_text_buffer.ends_with("*thinking...*\n")
+                    && !streaming.streaming_text_buffer.contains("💭")
+                {
+                    streaming
+                        .streaming_text_buffer
+                        .push_str("\n💭 *thinking...*\n");
+                }
+                streaming
+                    .streaming_text_buffer
+                    .push_str(&format!("*{thinking}*"));
+                Self::update_cached_streaming_message(cached_msgs, streaming);
+            }
+            WsEvent::ToolStart { tool_name, args } => {
+                if streaming.streaming_text_buffer.contains("💭")
+                    && !streaming.streaming_text_buffer.ends_with("\n\n")
+                {
+                    streaming.streaming_text_buffer.push_str("\n\n");
+                }
+                let args_display = format_tool_args(&tool_name, &args);
+                let display = if args_display.is_empty() {
+                    format!("`{tool_name}`")
+                } else {
+                    format!("`{args_display}`")
+                };
+                streaming.streaming_text_buffer.push_str(&display);
+                Self::update_cached_streaming_message(cached_msgs, streaming);
+            }
+            WsEvent::ToolComplete {
+                tool_name: _,
+                result,
+                is_error,
+            } => {
+                let display_result = format_tool_result(&result);
+                let formatted_result = if display_result.lines().count() > 1 {
+                    format!("\n```\n{display_result}\n```\n")
+                } else if display_result.is_empty()
+                    || display_result == "OK"
+                    || display_result == "ok"
+                {
+                    if is_error {
+                        " x\n".to_string()
+                    } else {
+                        " +\n".to_string()
+                    }
+                } else {
+                    let marker = if is_error { " x " } else { " + " };
+                    format!("{marker}{display_result}\n")
+                };
+                streaming.streaming_text_buffer.push_str(&formatted_result);
+                Self::update_cached_streaming_message(cached_msgs, streaming);
+            }
+            WsEvent::TurnComplete(_) => {
+                if let Some(idx) = streaming.streaming_message_idx {
+                    if let Some(msg) = cached_msgs.get_mut(idx) {
+                        msg.content = std::mem::take(&mut streaming.streaming_text_buffer);
                     }
                 }
+                streaming.is_streaming = false;
+                streaming.streaming_message_idx = None;
+                streaming.current_request_id = None;
             }
-            WsEvent::TurnComplete(_) | WsEvent::ToolComplete { .. } => {}
-            WsEvent::Disconnected => {}
-            _ => {}
+            WsEvent::Error { .. } => {
+                streaming.is_streaming = false;
+                streaming.streaming_message_idx = None;
+                streaming.current_request_id = None;
+            }
+            WsEvent::Disconnected => {
+                streaming.is_streaming = false;
+                streaming.streaming_message_idx = None;
+            }
+            WsEvent::ToolCallbackRequest { .. } => {}
         }
         false
+    }
+
+    /// Update the in-progress assistant message inside a cached message list.
+    fn update_cached_streaming_message(
+        cached: &mut Vec<ChatMessage>,
+        streaming: &mut StreamingState,
+    ) {
+        let content = streaming.streaming_text_buffer.clone();
+        match streaming.streaming_message_idx {
+            Some(idx) => {
+                if let Some(msg) = cached.get_mut(idx) {
+                    msg.content = content;
+                }
+            }
+            None => {
+                cached.push(ChatMessage::assistant(content));
+                streaming.streaming_message_idx = Some(cached.len() - 1);
+            }
+        }
     }
 
     /// Update the streaming message in-place for real-time display.
