@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -40,9 +40,7 @@ use crate::state::GatewayState;
 /// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
 ///
 /// ## Terminal (authenticated, proxied to agent pod)
-/// - `POST /v1/agents/:agent_id/terminal` - Spawn terminal on agent pod
-/// - `DELETE /v1/agents/:agent_id/terminal/:terminal_id` - Kill terminal
-/// - `GET /v1/agents/:agent_id/terminal/:terminal_id/ws` - Terminal WebSocket
+/// - `GET /v1/agents/:agent_id/terminal/ws` - Terminal WebSocket (spawn/IO/kill)
 ///
 /// ## Sessions (authenticated)
 /// - `POST /v1/agents/:agent_id/sessions` - Create session
@@ -113,17 +111,9 @@ where
             "/v1/agents/:agent_id/state",
             get(agents::get_agent_state::<C, V>),
         )
-        // Terminal proxy
+        // Terminal proxy (single WS — spawn/IO/kill all flow as protocol messages)
         .route(
-            "/v1/agents/:agent_id/terminal",
-            post(terminal::spawn_terminal::<C, V>),
-        )
-        .route(
-            "/v1/agents/:agent_id/terminal/:terminal_id",
-            delete(terminal::kill_terminal::<C, V>),
-        )
-        .route(
-            "/v1/agents/:agent_id/terminal/:terminal_id/ws",
+            "/v1/agents/:agent_id/terminal/ws",
             get(terminal::terminal_ws::<C, V>),
         )
         // Sessions

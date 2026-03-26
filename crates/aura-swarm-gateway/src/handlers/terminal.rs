@@ -1,20 +1,17 @@
-//! Terminal proxy endpoints.
+//! Terminal WebSocket proxy.
 //!
-//! Proxies terminal spawn/kill HTTP requests and terminal I/O WebSocket
-//! connections to the agent pod. The gateway is a transparent proxy; the
-//! JSON terminal protocol (`input`/`output`/`resize`/`exit`) flows
-//! unmodified between the client and the agent pod.
+//! Provides a single WebSocket endpoint that proxies the full terminal
+//! lifecycle (spawn, I/O, kill-on-close) to the agent pod. No HTTP
+//! forwarding is needed — the client sends a `spawn` message as the
+//! first frame and the pod allocates the PTY. When either side closes
+//! the connection the pod tears down the terminal automatically.
 
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Json;
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -26,117 +23,18 @@ use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::GatewayState;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
-async fn resolve_endpoint<C: ControlPlane>(
-    control: &C,
-    agent_id: &AgentId,
-) -> Result<String, ApiError> {
-    control
-        .resolve_agent_endpoint(agent_id)
-        .await?
-        .ok_or(ApiError::AgentUnavailable)
-}
-
-// ---------------------------------------------------------------------------
-// POST /v1/agents/:agent_id/terminal  – spawn terminal on the pod
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct SpawnTerminalBody {
-    #[serde(default = "default_cols")]
-    cols: u16,
-    #[serde(default = "default_rows")]
-    rows: u16,
-    cwd: Option<String>,
-}
-
-fn default_cols() -> u16 { 80 }
-fn default_rows() -> u16 { 24 }
-
-pub(crate) async fn spawn_terminal<C, V>(
-    State(state): State<Arc<GatewayState<C, V>>>,
-    Path(agent_id): Path<String>,
-    _user: AuthUser,
-    Json(body): Json<SpawnTerminalBody>,
-) -> Result<Response, ApiError>
-where
-    C: ControlPlane + 'static,
-    V: JwtValidator + 'static,
-{
-    let agent_id = parse_agent_id(&agent_id)?;
-    let endpoint = resolve_endpoint(&*state.control, &agent_id).await?;
-
-    let url = format!("http://{endpoint}/api/terminal");
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "cols": body.cols,
-            "rows": body.rows,
-            "cwd": body.cwd,
-        }))
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to proxy spawn terminal to pod");
-            ApiError::AgentUnavailable
-        })?;
-
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let bytes = resp.bytes().await.unwrap_or_default();
-
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(bytes))
-        .unwrap())
-}
-
-// ---------------------------------------------------------------------------
-// DELETE /v1/agents/:agent_id/terminal/:terminal_id  – kill terminal on pod
-// ---------------------------------------------------------------------------
-
-pub(crate) async fn kill_terminal<C, V>(
-    State(state): State<Arc<GatewayState<C, V>>>,
-    Path((agent_id, terminal_id)): Path<(String, String)>,
-    _user: AuthUser,
-) -> Result<Response, ApiError>
-where
-    C: ControlPlane + 'static,
-    V: JwtValidator + 'static,
-{
-    let agent_id = parse_agent_id(&agent_id)?;
-    let endpoint = resolve_endpoint(&*state.control, &agent_id).await?;
-
-    let url = format!("http://{endpoint}/api/terminal/{terminal_id}");
-    let client = reqwest::Client::new();
-    let resp = client.delete(&url).send().await.map_err(|e| {
-        tracing::error!(error = %e, "Failed to proxy kill terminal to pod");
-        ApiError::AgentUnavailable
-    })?;
-
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    Ok(Response::builder()
-        .status(status)
-        .body(Body::empty())
-        .unwrap())
-}
-
-// ---------------------------------------------------------------------------
-// GET /v1/agents/:agent_id/terminal/:terminal_id/ws  – WebSocket proxy
-// ---------------------------------------------------------------------------
-
+/// `GET /v1/agents/:agent_id/terminal/ws`
+///
+/// Upgrades to a WebSocket and transparently proxies all frames to
+/// `ws://{pod_ip}:8080/ws/terminal` on the agent pod.
 pub(crate) async fn terminal_ws<C, V>(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState<C, V>>>,
-    Path((agent_id, terminal_id)): Path<(String, String)>,
+    Path(agent_id): Path<String>,
     _user: AuthUser,
 ) -> Result<Response, ApiError>
 where
@@ -144,23 +42,28 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
-    let endpoint = resolve_endpoint(&*state.control, &agent_id).await?;
+
+    let endpoint = state
+        .control
+        .resolve_agent_endpoint(&agent_id)
+        .await?
+        .ok_or(ApiError::AgentUnavailable)?;
+
     let timeout = state.config.websocket_timeout();
     let agent_id_str = agent_id.to_string();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_terminal_ws(socket, endpoint, terminal_id, agent_id_str, timeout)
+        proxy_terminal(socket, endpoint, agent_id_str, timeout)
     }))
 }
 
-async fn handle_terminal_ws(
+async fn proxy_terminal(
     client_socket: WebSocket,
     agent_endpoint: String,
-    terminal_id: String,
     agent_id_str: String,
     timeout: std::time::Duration,
 ) {
-    let agent_url = format!("ws://{agent_endpoint}/ws/terminal/{terminal_id}");
+    let agent_url = format!("ws://{agent_endpoint}/ws/terminal");
 
     let agent_socket = match tokio::time::timeout(
         timeout,
@@ -172,7 +75,6 @@ async fn handle_terminal_ws(
         Ok(Err(e)) => {
             tracing::error!(
                 agent_id = %agent_id_str,
-                terminal_id = %terminal_id,
                 error = %e,
                 "Failed to connect to agent terminal"
             );
@@ -181,18 +83,13 @@ async fn handle_terminal_ws(
         Err(_) => {
             tracing::error!(
                 agent_id = %agent_id_str,
-                terminal_id = %terminal_id,
                 "Timeout connecting to agent terminal"
             );
             return;
         }
     };
 
-    tracing::info!(
-        agent_id = %agent_id_str,
-        terminal_id = %terminal_id,
-        "Terminal WebSocket proxy started"
-    );
+    tracing::info!(agent_id = %agent_id_str, "Terminal WS proxy started");
 
     let (client_write, client_read) = client_socket.split();
     let (agent_write, agent_read) = agent_socket.split();
@@ -205,21 +102,17 @@ async fn handle_terminal_ws(
         _ = a2c => {}
     }
 
-    tracing::info!(
-        agent_id = %agent_id_str,
-        terminal_id = %terminal_id,
-        "Terminal WebSocket proxy ended"
-    );
+    tracing::info!(agent_id = %agent_id_str, "Terminal WS proxy ended");
 }
 
 async fn forward_client_to_agent(
-    mut client_read: futures::stream::SplitStream<WebSocket>,
-    mut agent_write: futures::stream::SplitSink<
+    mut rx: futures::stream::SplitStream<WebSocket>,
+    mut tx: futures::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         TungsteniteMessage,
     >,
 ) {
-    while let Some(Ok(msg)) = client_read.next().await {
+    while let Some(Ok(msg)) = rx.next().await {
         let tung = match msg {
             Message::Text(t) => TungsteniteMessage::Text(t),
             Message::Binary(b) => TungsteniteMessage::Binary(b),
@@ -227,19 +120,19 @@ async fn forward_client_to_agent(
             Message::Pong(p) => TungsteniteMessage::Pong(p),
             Message::Close(_) => break,
         };
-        if agent_write.send(tung).await.is_err() {
+        if tx.send(tung).await.is_err() {
             break;
         }
     }
 }
 
 async fn forward_agent_to_client(
-    mut agent_read: futures::stream::SplitStream<
+    mut rx: futures::stream::SplitStream<
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     >,
-    mut client_write: futures::stream::SplitSink<WebSocket, Message>,
+    mut tx: futures::stream::SplitSink<WebSocket, Message>,
 ) {
-    while let Some(Ok(msg)) = agent_read.next().await {
+    while let Some(Ok(msg)) = rx.next().await {
         let axum_msg = match &msg {
             TungsteniteMessage::Text(t) => Some(Message::Text(t.clone())),
             TungsteniteMessage::Binary(b) => Some(Message::Binary(b.clone())),
@@ -248,7 +141,7 @@ async fn forward_agent_to_client(
             TungsteniteMessage::Close(_) | TungsteniteMessage::Frame(_) => None,
         };
         if let Some(m) = axum_msg {
-            if client_write.send(m).await.is_err() {
+            if tx.send(m).await.is_err() {
                 break;
             }
         } else if matches!(msg, TungsteniteMessage::Close(_)) {
