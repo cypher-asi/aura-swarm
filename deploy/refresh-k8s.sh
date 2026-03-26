@@ -120,28 +120,48 @@ fi
 if [[ "$REFRESH_AGENTS" == "true" ]]; then
     echo ""
     echo "=============================================="
-    echo "  Restarting Agent Pods"
+    echo "  Restarting Agent Pods (graceful)"
     echo "=============================================="
     echo ""
     
-    AGENT_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --no-headers 2>/dev/null | wc -l || echo "0")
+    GATEWAY_URL=$(kubectl get svc aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
     
-    if [[ "$AGENT_COUNT" -gt 0 ]]; then
-        echo "Found ${AGENT_COUNT} running agent pod(s)."
-        echo "Deleting all agent pods to pull new runtime image..."
-        echo ""
-        
-        kubectl delete pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --wait=false
-        
-        echo ""
-        echo -e "${GREEN}✓${NC} Agent pods deleted."
-        echo ""
-        echo "Agent pods in ${K8S_NAMESPACE_AGENTS}:"
-        kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent 2>/dev/null || echo "  (no pods)"
-        echo ""
-        echo -e "${YELLOW}Note:${NC} Agents will be recreated with new image when sessions are opened."
+    if [[ -z "$GATEWAY_URL" ]]; then
+        echo -e "${YELLOW}⚠${NC} Could not determine gateway URL."
+        echo "  Agents will pick up the new image on next manual restart."
     else
-        echo "No running agent pods found in ${K8S_NAMESPACE_AGENTS}."
+        GATEWAY_URL="http://${GATEWAY_URL}"
+        echo "Gateway URL: ${GATEWAY_URL}"
+        echo ""
+        
+        AGENT_IDS=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+            --no-headers -o jsonpath='{range .items[*]}{.metadata.annotations.swarm\.io/agent-id-full}{"\n"}{end}' 2>/dev/null || echo "")
+        
+        if [[ -z "$AGENT_IDS" ]]; then
+            echo "No running agent pods found in ${K8S_NAMESPACE_AGENTS}."
+        else
+            AGENT_COUNT=$(echo "$AGENT_IDS" | grep -c . || echo "0")
+            echo "Found ${AGENT_COUNT} running agent(s). Restarting via gateway API..."
+            echo ""
+            
+            for AGENT_ID in $AGENT_IDS; do
+                [[ -z "$AGENT_ID" ]] && continue
+                echo -n "  Restarting agent ${AGENT_ID:0:16}... "
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -X POST "${GATEWAY_URL}/v1/agents/${AGENT_ID}/restart" \
+                    -H "Content-Type: application/json" 2>/dev/null || echo "000")
+                
+                if [[ "$HTTP_CODE" == "200" ]]; then
+                    echo -e "${GREEN}✓${NC}"
+                else
+                    echo -e "${YELLOW}⚠ HTTP ${HTTP_CODE}${NC}"
+                fi
+            done
+            
+            echo ""
+            echo -e "${GREEN}✓${NC} Agent restart requests sent. Pods will be recreated with the new image."
+        fi
     fi
 fi
 
