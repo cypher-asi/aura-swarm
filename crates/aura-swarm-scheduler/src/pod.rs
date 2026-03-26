@@ -242,7 +242,6 @@ fn build_env_vars(
             value: Some(config.aura_network_url.clone()),
             ..Default::default()
         },
-        build_secret_env_var("INTERNAL_SERVICE_TOKEN", LLM_SECRETS_NAME, "INTERNAL_SERVICE_TOKEN"),
         EnvVar {
             name: "ENABLE_FS_TOOLS".to_string(),
             value: Some("true".to_string()),
@@ -463,7 +462,6 @@ mod tests {
         assert!(env_names.contains(&"AURA_ROUTER_URL"));
         assert!(env_names.contains(&"AURA_STORAGE_URL"));
         assert!(env_names.contains(&"AURA_NETWORK_URL"));
-        assert!(env_names.contains(&"INTERNAL_SERVICE_TOKEN"));
     }
 
     #[test]
@@ -539,26 +537,4 @@ mod tests {
         assert_eq!(pod_spec.runtime_class_name, None);
     }
 
-    #[test]
-    fn build_pod_injects_internal_token_from_secret() {
-        let agent_id = test_agent_id();
-        let spec = test_spec();
-        let config = SchedulerConfig::default();
-
-        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
-        let container = &pod.spec.as_ref().unwrap().containers[0];
-        let env = container.env.as_ref().unwrap();
-
-        let token_env = env
-            .iter()
-            .find(|e| e.name == "INTERNAL_SERVICE_TOKEN")
-            .unwrap();
-
-        assert!(token_env.value.is_none());
-        let value_from = token_env.value_from.as_ref().unwrap();
-        let secret_ref = value_from.secret_key_ref.as_ref().unwrap();
-        assert_eq!(secret_ref.name, "aura-swarm-secrets");
-        assert_eq!(secret_ref.key, "INTERNAL_SERVICE_TOKEN");
-        assert_eq!(secret_ref.optional, Some(true));
-    }
 }
