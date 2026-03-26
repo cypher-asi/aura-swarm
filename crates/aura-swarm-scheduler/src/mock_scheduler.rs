@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use aura_swarm_core::AgentId;
 use aura_swarm_store::AgentSpec;
 
-use crate::pod::pod_name_for_agent;
 use crate::types::{PodInfo, PodPhase, PodStatus};
 use crate::{Result, Scheduler, SchedulerError};
 
@@ -20,6 +19,7 @@ pub struct MockScheduler {
 
 struct MockPod {
     user_id_hex: String,
+    agent_name: String,
     spec: AgentSpec,
     status: PodStatus,
     endpoint: Option<String>,
@@ -74,6 +74,7 @@ impl Scheduler for MockScheduler {
         &self,
         agent_id: &AgentId,
         user_id_hex: &str,
+        agent_name: &str,
         spec: &AgentSpec,
     ) -> Result<()> {
         let mut pods = self.pods.lock();
@@ -83,9 +84,10 @@ impl Scheduler for MockScheduler {
         }
 
         pods.insert(
-            agent_id.clone(),
+            *agent_id,
             MockPod {
                 user_id_hex: user_id_hex.to_string(),
+                agent_name: agent_name.to_string(),
                 spec: spec.clone(),
                 status: PodStatus {
                     phase: PodPhase::Pending,
@@ -127,8 +129,8 @@ impl Scheduler for MockScheduler {
         Ok(pods
             .iter()
             .map(|(agent_id, pod)| PodInfo {
-                agent_id: agent_id.clone(),
-                pod_name: pod_name_for_agent(agent_id),
+                agent_id: *agent_id,
+                pod_name: format!("{}-mock", pod.agent_name),
                 node_name: Some("mock-node".to_string()),
                 pod_ip: pod
                     .endpoint

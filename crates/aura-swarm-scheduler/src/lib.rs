@@ -56,10 +56,10 @@
 //!
 //! // Schedule an agent
 //! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-//! let agent_id = AgentId::generate(&user_id, "my-agent");
+//! let agent_id = AgentId::generate();
 //! let spec = AgentSpec::default();
 //!
-//! scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
+//! scheduler.schedule_agent(&agent_id, &user_id.to_string(), "my-agent", &spec).await?;
 //!
 //! // Check if it's ready
 //! let status = scheduler.get_pod_status(&agent_id).await?;
@@ -87,10 +87,10 @@
 //!     let scheduler = MockScheduler::new();
 //!
 //!     let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-//!     let agent_id = AgentId::generate(&user_id, "test-agent");
+//!     let agent_id = AgentId::generate();
 //!     let spec = AgentSpec::default();
 //!
-//!     scheduler.schedule_agent(&agent_id, &user_id.to_string(), &spec).await?;
+//!     scheduler.schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec).await?;
 //!     assert_eq!(scheduler.pod_count(), 1);
 //!     Ok(())
 //! }

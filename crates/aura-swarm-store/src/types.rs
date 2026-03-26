@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn agent_serde_json_roundtrip() {
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-        let agent_id = AgentId::generate(&user_id, "roundtrip-test");
+        let agent_id = AgentId::generate();
         let now = chrono::Utc::now();
 
         let agent = Agent {

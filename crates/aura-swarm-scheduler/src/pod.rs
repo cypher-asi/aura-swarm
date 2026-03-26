@@ -28,58 +28,99 @@ const AURA_PORT: i32 = 8080;
 /// - Environment variables for agent configuration
 /// - Volume mounts for persistent state
 /// - Health probes for readiness and liveness
+///
+/// A Pod ID (UUID v4) is generated internally and used in the pod name.
 #[must_use]
 pub fn build_pod(
     agent_id: &AgentId,
     user_id_hex: &str,
+    agent_name: &str,
     spec: &AgentSpec,
     config: &SchedulerConfig,
 ) -> Pod {
-    let pod_name = pod_name_for_agent(agent_id);
+    let pod_id = uuid::Uuid::new_v4();
+    let pod_name = build_pod_name(agent_name, &pod_id);
     let agent_id_hex = agent_id.to_hex();
 
     Pod {
-        metadata: build_metadata(&pod_name, &agent_id_hex, user_id_hex, config),
+        metadata: build_metadata(&pod_name, &agent_id_hex, agent_name, &pod_id, config),
         spec: Some(build_pod_spec(&agent_id_hex, user_id_hex, spec, config)),
         ..Default::default()
     }
 }
 
-/// Generate the pod name for an agent.
+/// Build a DNS-safe pod name from the agent name and pod ID.
 ///
-/// Uses the first 16 characters of the agent ID hex for brevity.
-#[must_use]
-pub fn pod_name_for_agent(agent_id: &AgentId) -> String {
-    format!("agent-{}", &agent_id.to_hex()[..16])
+/// Format: `{sanitized_agent_name}-{first 8 hex chars of pod_id}`
+/// Sanitized: lowercase, non-alphanumeric replaced with `-`, consecutive `-`
+/// collapsed, leading/trailing `-` trimmed, capped at 63 chars total.
+fn build_pod_name(agent_name: &str, pod_id: &uuid::Uuid) -> String {
+    let suffix = &pod_id.simple().to_string()[..8];
+    let max_name_len = 63 - 1 - suffix.len(); // 63 - hyphen - suffix
+
+    let sanitized: String = agent_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse consecutive hyphens and trim
+    let mut collapsed = String::with_capacity(sanitized.len());
+    let mut prev_hyphen = true; // treat start as hyphen to trim leading
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                collapsed.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            collapsed.push(c);
+            prev_hyphen = false;
+        }
+    }
+    let trimmed = collapsed.trim_end_matches('-');
+
+    // Truncate to max length, ensuring we don't cut in the middle and leave a trailing hyphen
+    let name_part = if trimmed.len() > max_name_len {
+        trimmed[..max_name_len].trim_end_matches('-')
+    } else {
+        trimmed
+    };
+
+    if name_part.is_empty() {
+        format!("agent-{suffix}")
+    } else {
+        format!("{name_part}-{suffix}")
+    }
 }
 
 fn build_metadata(
     pod_name: &str,
     agent_id_hex: &str,
-    user_id_hex: &str,
+    agent_name: &str,
+    pod_id: &uuid::Uuid,
     config: &SchedulerConfig,
 ) -> ObjectMeta {
-    // Kubernetes labels have a max length of 63 characters.
-    // Truncate hex IDs (64 chars) to fit, store full IDs in annotations.
-    let agent_id_label = truncate_for_label(agent_id_hex);
-    let user_id_label = truncate_for_label(user_id_hex);
-
     let mut labels = BTreeMap::new();
     labels.insert("app".to_string(), "swarm-agent".to_string());
-    labels.insert("swarm.io/agent-id".to_string(), agent_id_label);
-    labels.insert("swarm.io/user-id".to_string(), user_id_label);
+    labels.insert(
+        "swarm.io/agent-id".to_string(),
+        agent_id_hex.to_string(),
+    );
 
     let mut annotations = BTreeMap::new();
+    annotations.insert(
+        "swarm.io/agent-name".to_string(),
+        agent_name.to_string(),
+    );
+    annotations.insert(
+        "swarm.io/pod-id".to_string(),
+        pod_id.to_string(),
+    );
     annotations.insert(
         "swarm.io/created-at".to_string(),
         chrono::Utc::now().to_rfc3339(),
     );
-    // Store full IDs in annotations (no length limit)
-    annotations.insert(
-        "swarm.io/agent-id-full".to_string(),
-        agent_id_hex.to_string(),
-    );
-    annotations.insert("swarm.io/user-id-full".to_string(), user_id_hex.to_string());
 
     ObjectMeta {
         name: Some(pod_name.to_string()),
@@ -87,15 +128,6 @@ fn build_metadata(
         labels: Some(labels),
         annotations: Some(annotations),
         ..Default::default()
-    }
-}
-
-/// Truncate a string to fit Kubernetes label value limit (63 chars).
-fn truncate_for_label(s: &str) -> String {
-    if s.len() <= 63 {
-        s.to_string()
-    } else {
-        s[..63].to_string()
     }
 }
 
@@ -307,12 +339,10 @@ fn build_security_context() -> PodSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_swarm_core::UserId;
     use aura_swarm_store::IsolationLevel;
 
     fn test_agent_id() -> AgentId {
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-        AgentId::generate(&user_id, "test-agent")
+        AgentId::generate()
     }
 
     fn test_spec() -> AgentSpec {
@@ -325,22 +355,55 @@ mod tests {
     }
 
     #[test]
-    fn pod_name_format() {
-        let agent_id = test_agent_id();
-        let name = pod_name_for_agent(&agent_id);
+    fn pod_name_uses_agent_name_and_suffix() {
+        let pod_id = uuid::Uuid::new_v4();
+        let name = build_pod_name("my-agent", &pod_id);
+        let suffix = &pod_id.simple().to_string()[..8];
 
+        assert!(name.starts_with("my-agent-"));
+        assert!(name.ends_with(suffix));
+        assert!(name.len() <= 63);
+    }
+
+    #[test]
+    fn pod_name_sanitizes_special_chars() {
+        let pod_id = uuid::Uuid::new_v4();
+        let name = build_pod_name("My Agent!@#", &pod_id);
+
+        assert!(name.starts_with("my-agent-"));
+        assert!(!name.contains('!'));
+        assert!(!name.contains('@'));
+    }
+
+    #[test]
+    fn pod_name_collapses_hyphens() {
+        let pod_id = uuid::Uuid::new_v4();
+        let name = build_pod_name("a---b", &pod_id);
+        assert!(name.starts_with("a-b-"));
+    }
+
+    #[test]
+    fn pod_name_falls_back_for_empty() {
+        let pod_id = uuid::Uuid::new_v4();
+        let name = build_pod_name("", &pod_id);
         assert!(name.starts_with("agent-"));
-        assert_eq!(name.len(), 6 + 16); // "agent-" + 16 hex chars
+    }
+
+    #[test]
+    fn pod_name_caps_at_63_chars() {
+        let pod_id = uuid::Uuid::new_v4();
+        let long_name = "a".repeat(100);
+        let name = build_pod_name(&long_name, &pod_id);
+        assert!(name.len() <= 63);
     }
 
     #[test]
     fn build_pod_has_required_fields() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
 
         // Metadata
         let meta = &pod.metadata;
@@ -350,7 +413,14 @@ mod tests {
         let labels = meta.labels.as_ref().unwrap();
         assert_eq!(labels.get("app"), Some(&"swarm-agent".to_string()));
         assert!(labels.contains_key("swarm.io/agent-id"));
-        assert!(labels.contains_key("swarm.io/user-id"));
+
+        let annotations = meta.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations.get("swarm.io/agent-name"),
+            Some(&"test-agent".to_string())
+        );
+        assert!(annotations.contains_key("swarm.io/pod-id"));
+        assert!(annotations.contains_key("swarm.io/created-at"));
 
         // Spec
         let pod_spec = pod.spec.as_ref().unwrap();
@@ -382,7 +452,6 @@ mod tests {
     #[test]
     fn build_pod_uses_spec_resources() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
             cpu_millicores: 1000,
             memory_mb: 2048,
@@ -391,7 +460,7 @@ mod tests {
         };
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let resources = container.resources.as_ref().unwrap();
 
@@ -410,14 +479,13 @@ mod tests {
     #[test]
     fn build_pod_uses_default_isolation_when_none_specified() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
-            isolation: None, // Should use scheduler default (MicroVM)
+            isolation: None,
             ..test_spec()
         };
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-fc"));
@@ -426,46 +494,41 @@ mod tests {
     #[test]
     fn build_pod_uses_agent_isolation_when_specified() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
-            isolation: Some(IsolationLevel::Container), // Override to container
+            isolation: Some(IsolationLevel::Container),
             ..test_spec()
         };
-        let config = SchedulerConfig::default(); // Default is MicroVM
+        let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
-        // Container isolation uses default runtime (no RuntimeClass specified)
         assert_eq!(pod_spec.runtime_class_name, None);
     }
 
     #[test]
     fn build_pod_respects_scheduler_default_isolation() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = AgentSpec {
-            isolation: None, // Use scheduler default
+            isolation: None,
             ..test_spec()
         };
         let mut config = SchedulerConfig::default();
-        config.default_isolation = IsolationLevel::Container; // Change default
+        config.default_isolation = IsolationLevel::Container;
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
-        // Container isolation uses default runtime (no RuntimeClass specified)
         assert_eq!(pod_spec.runtime_class_name, None);
     }
 
     #[test]
     fn build_pod_injects_llm_api_keys_from_secret() {
         let agent_id = test_agent_id();
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
         let config = SchedulerConfig::default();
 
-        let pod = build_pod(&agent_id, &user_id.to_string(), &spec, &config);
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let env = container.env.as_ref().unwrap();
 

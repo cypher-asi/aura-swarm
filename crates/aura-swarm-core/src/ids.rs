@@ -30,17 +30,10 @@ impl AgentId {
         Self(uuid::Uuid::from_bytes(bytes))
     }
 
-    /// Generate a new unique `AgentId` using HKDF.
-    ///
-    /// The ID is derived from the user ID, agent name, and current timestamp.
+    /// Generate a new unique `AgentId` as a random UUID v4.
     #[must_use]
-    pub fn generate(user_id: &UserId, name: &str) -> Self {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-
-        Self::generate_with_timestamp(user_id, name, timestamp)
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4())
     }
 
     /// Generate a deterministic `AgentId` for testing.
@@ -338,10 +331,8 @@ mod tests {
 
     #[test]
     fn agent_id_unique() {
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-        let id1 = AgentId::generate(&user_id, "test-agent");
-        let id2 = AgentId::generate(&user_id, "test-agent");
-        // Due to timestamp, these should be different (with high probability)
+        let id1 = AgentId::generate();
+        let id2 = AgentId::generate();
         assert_ne!(id1, id2);
     }
 

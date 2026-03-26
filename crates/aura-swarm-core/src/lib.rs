@@ -14,7 +14,7 @@
 //! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //!
 //! // Generate an agent ID
-//! let agent_id = AgentId::generate(&user_id, "my-agent");
+//! let agent_id = AgentId::generate();
 //!
 //! // Generate a session ID
 //! let session_id = SessionId::generate();

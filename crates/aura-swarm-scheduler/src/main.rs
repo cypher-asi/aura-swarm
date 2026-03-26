@@ -78,6 +78,8 @@ async fn ready_handler(State(_state): State<AppState>) -> impl IntoResponse {
 struct ScheduleRequest {
     /// The user ID (hex-encoded) that owns this agent.
     user_id: String,
+    /// Human-readable agent name for pod naming and display.
+    agent_name: String,
     /// Resource specification for the agent.
     spec: AgentSpec,
 }
@@ -119,7 +121,7 @@ async fn schedule_handler(
 
     match state
         .scheduler
-        .schedule_agent(&agent_id, &req.user_id, &req.spec)
+        .schedule_agent(&agent_id, &req.user_id, &req.agent_name, &req.spec)
         .await
     {
         Ok(()) => {

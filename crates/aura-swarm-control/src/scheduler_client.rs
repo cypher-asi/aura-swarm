@@ -27,6 +27,7 @@ pub trait SchedulerClient: Send + Sync {
         &self,
         agent_id: &AgentId,
         user_id_hex: &str,
+        agent_name: &str,
         spec: &AgentSpec,
     ) -> Result<()>;
 
@@ -120,6 +121,7 @@ impl HttpSchedulerClient {
 #[derive(Debug, Serialize)]
 struct ScheduleRequest<'a> {
     user_id: &'a str,
+    agent_name: &'a str,
     spec: &'a AgentSpec,
 }
 
@@ -140,12 +142,14 @@ impl SchedulerClient for HttpSchedulerClient {
         &self,
         agent_id: &AgentId,
         user_id_hex: &str,
+        agent_name: &str,
         spec: &AgentSpec,
     ) -> Result<()> {
         let url = format!("{}/v1/agents/{}/schedule", self.base_url, agent_id.to_hex());
 
         let request = ScheduleRequest {
             user_id: user_id_hex,
+            agent_name,
             spec,
         };
 
@@ -290,6 +294,7 @@ impl SchedulerClient for NoopSchedulerClient {
         &self,
         agent_id: &AgentId,
         _user_id_hex: &str,
+        _agent_name: &str,
         _spec: &AgentSpec,
     ) -> Result<()> {
         tracing::warn!(

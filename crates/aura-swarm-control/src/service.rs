@@ -328,7 +328,12 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
     async fn schedule_agent_pod(&self, agent: &Agent) -> Result<()> {
         if let Some(scheduler) = &self.scheduler {
             scheduler
-                .schedule_agent(&agent.agent_id, &agent.user_id.to_string(), &agent.spec)
+                .schedule_agent(
+                    &agent.agent_id,
+                    &agent.user_id.to_string(),
+                    &agent.name,
+                    &agent.spec,
+                )
                 .await?;
             tracing::info!(
                 agent_id = %agent.agent_id,
@@ -417,7 +422,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             let spec = request.spec.unwrap_or_default();
             let agent_id = request
                 .agent_id
-                .unwrap_or_else(|| AgentId::generate(&uid, &request.name));
+                .unwrap_or_else(AgentId::generate);
 
             let agent = Agent {
                 agent_id,

@@ -20,7 +20,7 @@ use aura_swarm_store::{AgentSpec, AgentState};
 
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
-use crate::pod::{build_pod, pod_name_for_agent};
+use crate::pod::build_pod;
 use crate::types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
 use crate::{Result, SchedulerError};
 
@@ -36,6 +36,7 @@ pub trait Scheduler: Send + Sync {
         &self,
         agent_id: &AgentId,
         user_id_hex: &str,
+        agent_name: &str,
         spec: &AgentSpec,
     ) -> Result<()>;
 
@@ -178,6 +179,23 @@ impl K8sScheduler {
     /// Get the events API client for the configured namespace.
     fn events_api(&self) -> Api<Event> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
+    /// Find a pod belonging to an agent by label selector.
+    async fn find_pod_by_agent(&self, agent_id: &AgentId) -> Result<Option<Pod>> {
+        let pods = self.pods_api();
+        let label = format!("swarm.io/agent-id={}", agent_id.to_hex());
+        let params = ListParams::default().labels(&label);
+        let list = pods.list(&params).await?;
+        Ok(list.items.into_iter().next())
+    }
+
+    /// Find the pod name for an agent by label selector.
+    async fn find_pod_name_by_agent(&self, agent_id: &AgentId) -> Result<Option<String>> {
+        Ok(self
+            .find_pod_by_agent(agent_id)
+            .await?
+            .and_then(|p| p.metadata.name))
     }
 
     /// Run the reconciliation loop, watching for pod changes and notifying the gateway.
@@ -550,19 +568,11 @@ impl K8sScheduler {
     }
 
     fn extract_agent_id(pod: &Pod) -> Option<AgentId> {
-        // Try to get full agent ID from annotation first (preferred, no truncation)
-        // Fall back to label for backwards compatibility
         let agent_id_hex = pod
             .metadata
-            .annotations
+            .labels
             .as_ref()
-            .and_then(|a| a.get("swarm.io/agent-id-full"))
-            .or_else(|| {
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("swarm.io/agent-id"))
-            })?;
+            .and_then(|l| l.get("swarm.io/agent-id"))?;
 
         match AgentId::from_hex(agent_id_hex) {
             Ok(id) => Some(id),
@@ -623,6 +633,7 @@ impl Scheduler for K8sScheduler {
         &self,
         agent_id: &AgentId,
         user_id_hex: &str,
+        agent_name: &str,
         spec: &AgentSpec,
     ) -> Result<()> {
         // Validate resources
@@ -630,20 +641,19 @@ impl Scheduler for K8sScheduler {
             .validate_resources(spec.cpu_millicores, spec.memory_mb)?;
 
         let pods = self.pods_api();
-        let pod_name = pod_name_for_agent(agent_id);
 
-        // Check if pod already exists
-        if pods.get_opt(&pod_name).await?.is_some() {
+        // Check if a pod for this agent already exists (by label)
+        if self.find_pod_name_by_agent(agent_id).await?.is_some() {
             warn!(
                 agent_id = %agent_id,
-                pod_name,
-                "Pod already exists, skipping creation"
+                "Pod already exists for agent, skipping creation"
             );
             return Ok(());
         }
 
         // Build and create the pod
-        let pod = build_pod(agent_id, user_id_hex, spec, &self.config);
+        let pod = build_pod(agent_id, user_id_hex, agent_name, spec, &self.config);
+        let pod_name = pod.metadata.name.clone().unwrap_or_default();
         pods.create(&PostParams::default(), &pod).await?;
 
         // Register with billing reporter if configured
@@ -673,7 +683,6 @@ impl Scheduler for K8sScheduler {
 
     async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
         let pods = self.pods_api();
-        let pod_name = pod_name_for_agent(agent_id);
 
         // Unregister from billing reporter if configured
         if let Some(reporter) = &self.billing_reporter {
@@ -686,6 +695,11 @@ impl Scheduler for K8sScheduler {
 
         self.endpoint_cache.remove(agent_id);
         self.state_cache.remove(agent_id);
+
+        let Some(pod_name) = self.find_pod_name_by_agent(agent_id).await? else {
+            warn!(agent_id = %agent_id, "Pod not found for agent, already terminated");
+            return Ok(());
+        };
 
         match pods.delete(&pod_name, &DeleteParams::default()).await {
             Ok(_) => {
@@ -702,7 +716,11 @@ impl Scheduler for K8sScheduler {
 
     async fn get_pod_status(&self, agent_id: &AgentId) -> Result<PodStatus> {
         let pods = self.pods_api();
-        let pod_name = pod_name_for_agent(agent_id);
+
+        let pod_name = self
+            .find_pod_name_by_agent(agent_id)
+            .await?
+            .ok_or_else(|| SchedulerError::PodNotFound(agent_id.to_hex()))?;
 
         match pods.get_opt(&pod_name).await? {
             Some(pod) => Ok(Self::extract_pod_status(&pod)),
@@ -716,17 +734,13 @@ impl Scheduler for K8sScheduler {
             return Ok(Some(endpoint));
         }
 
-        // Fetch from K8s
-        let pods = self.pods_api();
-        let pod_name = pod_name_for_agent(agent_id);
+        // Fetch from K8s via label selector
+        let pod = self.find_pod_by_agent(agent_id).await?;
 
-        if let Some(pod) = pods.get_opt(&pod_name).await? {
+        if let Some(pod) = pod {
             if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_ref()) {
                 let endpoint = format!("{ip}:8080");
-
-                // Update cache
                 self.endpoint_cache.insert(*agent_id, endpoint.clone());
-
                 return Ok(Some(endpoint));
             }
         }
@@ -804,8 +818,7 @@ mod tests {
     use aura_swarm_core::UserId;
 
     fn test_agent_id() -> AgentId {
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-        AgentId::generate(&user_id, "test-agent")
+        AgentId::generate()
     }
 
     fn test_spec() -> AgentSpec {
@@ -821,7 +834,7 @@ mod tests {
 
         // Schedule
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec)
             .await
             .unwrap();
         assert_eq!(scheduler.pod_count(), 1);
@@ -848,11 +861,11 @@ mod tests {
 
         // Schedule twice
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec)
             .await
             .unwrap();
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec)
             .await
             .unwrap();
 
@@ -868,7 +881,7 @@ mod tests {
         let spec = test_spec();
 
         scheduler
-            .schedule_agent(&agent_id, &user_id.to_string(), &spec)
+            .schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec)
             .await
             .unwrap();
 
@@ -893,15 +906,15 @@ mod tests {
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
         let spec = test_spec();
 
-        let agent1 = AgentId::generate(&user_id, "agent-1");
-        let agent2 = AgentId::generate(&user_id, "agent-2");
+        let agent1 = AgentId::generate();
+        let agent2 = AgentId::generate();
 
         scheduler
-            .schedule_agent(&agent1, &user_id.to_string(), &spec)
+            .schedule_agent(&agent1, &user_id.to_string(), "agent-1", &spec)
             .await
             .unwrap();
         scheduler
-            .schedule_agent(&agent2, &user_id.to_string(), &spec)
+            .schedule_agent(&agent2, &user_id.to_string(), "agent-2", &spec)
             .await
             .unwrap();
 

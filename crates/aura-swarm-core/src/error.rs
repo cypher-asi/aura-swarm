@@ -35,8 +35,7 @@ mod tests {
 
     #[test]
     fn display_agent_not_found() {
-        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
-        let agent_id = AgentId::generate(&user_id, "test");
+        let agent_id = AgentId::generate();
         let err = CoreError::AgentNotFound(agent_id);
         assert!(err.to_string().contains("not found"));
     }
