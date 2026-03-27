@@ -19,18 +19,27 @@ set -euo pipefail
 #------------------------------------------------------------------------------
 
 RESET_DATA=false
+RECREATE_AGENTS=true
 
 for arg in "$@"; do
     case $arg in
         --reset-data)
             RESET_DATA=true
             ;;
+        --recreate-agents)
+            RECREATE_AGENTS=true
+            ;;
+        --no-recreate-agents)
+            RECREATE_AGENTS=false
+            ;;
         --help|-h)
-            echo "Usage: $0 [--reset-data]"
+            echo "Usage: $0 [--reset-data] [--recreate-agents|--no-recreate-agents]"
             echo ""
             echo "Options:"
             echo "  --reset-data  Delete gateway and control plane databases before deploy"
             echo "                (wipes all agent records, sessions, and user data)"
+            echo "  --recreate-agents     Recreate running swarm-agent pods after deploy (default)"
+            echo "  --no-recreate-agents  Skip post-deploy swarm-agent convergence"
             exit 0
             ;;
         *)
@@ -76,6 +85,7 @@ ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 echo "  EFS ID: ${EFS_ID}"
 echo "  ECR Registry: ${ECR_REGISTRY}"
+echo "  Recreate running agents after deploy: ${RECREATE_AGENTS}"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -142,8 +152,36 @@ sed -i "s/EFS_FILESYSTEM_ID/${EFS_ID}/g" "${DEPLOY_TMP_DIR}/01-storage-class.yam
 # Update ConfigMap with image URLs
 RUNTIME_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-runtime:${IMAGE_TAG}"
 HARNESS_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-harness:${IMAGE_TAG}"
+HARNESS_STATE_FILE="${SCRIPT_DIR}/.last-harness-image.env"
+PINNED_HARNESS_IMAGE="${AURA_HARNESS_IMAGE:-}"
+
+if [[ -z "${PINNED_HARNESS_IMAGE}" && -f "${HARNESS_STATE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${HARNESS_STATE_FILE}"
+    PINNED_HARNESS_IMAGE="${AURA_HARNESS_IMAGE:-}"
+fi
+
+if [[ -z "${PINNED_HARNESS_IMAGE}" ]]; then
+    echo "Resolving immutable harness digest for deploy..."
+    HARNESS_DIGEST=$(aws ecr describe-images \
+        --repository-name "${RESOURCE_PREFIX}-harness" \
+        --image-ids imageTag="${IMAGE_TAG}" \
+        --query 'imageDetails[0].imageDigest' \
+        --output text 2>/dev/null || echo "")
+    if [[ -n "${HARNESS_DIGEST}" && "${HARNESS_DIGEST}" != "None" ]]; then
+        PINNED_HARNESS_IMAGE="${ECR_REGISTRY}/${RESOURCE_PREFIX}-harness@${HARNESS_DIGEST}"
+    fi
+fi
+
+if [[ -z "${PINNED_HARNESS_IMAGE}" ]]; then
+    echo -e "${YELLOW}⚠${NC} Could not resolve harness digest; using mutable tag reference"
+    PINNED_HARNESS_IMAGE="${HARNESS_IMAGE}"
+else
+    echo -e "${GREEN}✓${NC} Using pinned harness image: ${PINNED_HARNESS_IMAGE}"
+fi
+
 sed -i "s|REPLACE_WITH_ECR_REGISTRY/RESOURCE_PREFIX-runtime:v0.1.0|${RUNTIME_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
-sed -i "s|ECR_REGISTRY/RESOURCE_PREFIX-harness:IMAGE_TAG|${HARNESS_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
+sed -i "s|ECR_REGISTRY/RESOURCE_PREFIX-harness:IMAGE_TAG|${PINNED_HARNESS_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
 
 # Inject secrets into the secrets manifest (use a temp file to avoid partial writes)
 SECRETS_YAML="${DEPLOY_TMP_DIR}/03-secrets.yaml"
@@ -345,6 +383,64 @@ echo ""
 kubectl rollout status deployment/aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
 kubectl rollout status deployment/aura-swarm-control -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
 kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
+
+echo ""
+
+#------------------------------------------------------------------------------
+# Recreate running agent pods to converge to pinned harness digest (default on)
+#------------------------------------------------------------------------------
+
+if [[ "${RECREATE_AGENTS}" == "true" ]]; then
+    echo "Converging running swarm-agent pods by recreation..."
+    mapfile -t RUNNING_AGENT_PODS < <(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+    if [[ ${#RUNNING_AGENT_PODS[@]} -eq 0 ]]; then
+        echo "No running swarm-agent pods found; nothing to recreate."
+    else
+        echo "Recreating ${#RUNNING_AGENT_PODS[@]} running agent pod(s)..."
+        kubectl delete pod -n "${K8S_NAMESPACE_AGENTS}" "${RUNNING_AGENT_PODS[@]}" --wait=false
+
+        echo "Waiting for replacement swarm-agent pods to appear..."
+        AGENT_APPEAR_TIMEOUT=60
+        AGENT_APPEAR_ELAPSED=0
+        AGENT_APPEARED=false
+        while [[ "${AGENT_APPEAR_ELAPSED}" -lt "${AGENT_APPEAR_TIMEOUT}" ]]; do
+            AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+                --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+            if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
+                AGENT_APPEARED=true
+                break
+            fi
+            sleep 5
+            AGENT_APPEAR_ELAPSED=$((AGENT_APPEAR_ELAPSED + 5))
+        done
+
+        if [[ "${AGENT_APPEARED}" != "true" ]]; then
+            echo -e "${RED}✗${NC} Agent convergence failed: no replacement pods appeared."
+            echo "Rollback guidance:"
+            echo "  - Inspect controller state: kubectl get pods -n ${K8S_NAMESPACE_SYSTEM} -o wide"
+            echo "  - Check scheduler logs:     kubectl logs -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-scheduler --tail=50"
+            echo "  - Re-run deploy with explicit convergence: ./08-deploy-k8s.sh --recreate-agents"
+            exit 1
+        fi
+
+        echo "Waiting for replacement swarm-agent pods to become Ready (timeout 300s)..."
+        if ! kubectl wait --for=condition=Ready pod -l app=swarm-agent \
+            -n "${K8S_NAMESPACE_AGENTS}" --timeout=300s >/dev/null; then
+            echo -e "${RED}✗${NC} Agent convergence failed: replacement pods did not become Ready in time."
+            echo "Rollback guidance:"
+            echo "  - Inspect agent pod status: kubectl get pods -n ${K8S_NAMESPACE_AGENTS} -l app=swarm-agent -o wide"
+            echo "  - Check recent events:      kubectl get events -n ${K8S_NAMESPACE_AGENTS} --sort-by='.lastTimestamp' | tail -20"
+            echo "  - Re-run deploy with explicit convergence: ./08-deploy-k8s.sh --recreate-agents"
+            exit 1
+        fi
+        echo -e "${GREEN}✓${NC} Agent pods recreated and Ready"
+    fi
+else
+    echo -e "${YELLOW}⚠${NC} Skipping post-deploy agent recreation (--no-recreate-agents)"
+fi
 
 echo ""
 echo -e "${GREEN}=============================================="

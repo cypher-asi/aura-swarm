@@ -12,6 +12,7 @@ deploy/terraform/terraform.tfstate
 deploy/terraform/terraform.tfstate.backup
 deploy/terraform/.terraform.tfstate.lock.info
 deploy/terraform/terraform.tfvars
+deploy/.last-harness-image.env
 
 # IDE
 .idea/

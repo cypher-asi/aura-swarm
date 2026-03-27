@@ -31,6 +31,64 @@ echo "=============================================="
 echo ""
 
 #------------------------------------------------------------------------------
+# Check swarm-agent harness digest convergence
+#------------------------------------------------------------------------------
+
+echo -e "${CYAN}Swarm Agent Harness Digest${NC}"
+
+EXPECTED_HARNESS_IMAGE=$(kubectl get configmap aura-swarm-config -n "${K8S_NAMESPACE_SYSTEM}" \
+    -o jsonpath='{.data.AURA_HARNESS_IMAGE}' 2>/dev/null || echo "")
+
+EXPECTED_DIGEST=""
+if [[ "${EXPECTED_HARNESS_IMAGE}" =~ sha256:[a-f0-9]{64} ]]; then
+    EXPECTED_DIGEST="${BASH_REMATCH[0]}"
+fi
+
+AGENT_IMAGE_ROWS=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.containerStatuses[0].imageID}{"\n"}{end}' 2>/dev/null || echo "")
+
+if [[ -z "${AGENT_IMAGE_ROWS}" ]]; then
+    echo -e "${YELLOW}⚠${NC} No swarm-agent pods found; digest convergence check skipped"
+    ((WARNINGS++))
+else
+    declare -A DIGEST_COUNTS=()
+    while IFS='|' read -r pod_name image_id; do
+        [[ -z "${pod_name}" ]] && continue
+        if [[ "${image_id}" =~ sha256:[a-f0-9]{64} ]]; then
+            digest="${BASH_REMATCH[0]}"
+            DIGEST_COUNTS["$digest"]=$(( ${DIGEST_COUNTS["$digest"]:-0} + 1 ))
+        else
+            echo -e "${YELLOW}⚠${NC} ${pod_name}: could not parse digest from imageID (${image_id:-missing})"
+            ((WARNINGS++))
+        fi
+    done <<< "${AGENT_IMAGE_ROWS}"
+
+    DIGEST_TOTAL=${#DIGEST_COUNTS[@]}
+    if [[ "${DIGEST_TOTAL}" -eq 1 ]]; then
+        for digest in "${!DIGEST_COUNTS[@]}"; do
+            echo -e "${GREEN}✓${NC} All swarm-agent pods use digest: ${digest}"
+            if [[ -n "${EXPECTED_DIGEST}" && "${EXPECTED_DIGEST}" != "${digest}" ]]; then
+                echo -e "${RED}✗${NC} ConfigMap digest (${EXPECTED_DIGEST}) does not match running pods"
+                echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
+                ((ERRORS++))
+            fi
+        done
+    elif [[ "${DIGEST_TOTAL}" -gt 1 ]]; then
+        echo -e "${RED}✗${NC} Mixed swarm-agent digests detected (${DIGEST_TOTAL} unique)"
+        for digest in "${!DIGEST_COUNTS[@]}"; do
+            echo "    ${digest} (${DIGEST_COUNTS[$digest]} pod(s))"
+        done
+        echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
+        ((ERRORS++))
+    else
+        echo -e "${YELLOW}⚠${NC} Could not parse any swarm-agent image digests"
+        ((WARNINGS++))
+    fi
+fi
+
+echo ""
+
+#------------------------------------------------------------------------------
 # Check EFS CSI driver
 #------------------------------------------------------------------------------
 
