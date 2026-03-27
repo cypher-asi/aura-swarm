@@ -23,14 +23,17 @@ use crate::state::GatewayState;
 pub struct AuthUser {
     /// The zOS user ID.
     pub user_id: UserId,
+    /// The raw Bearer token, forwarded to agent pods.
+    pub token: String,
 }
 
 impl AuthUser {
-    /// Create an `AuthUser` from validated claims.
+    /// Create an `AuthUser` from validated claims and the raw token.
     #[must_use]
-    pub fn from_claims(claims: &ValidatedClaims) -> Self {
+    pub fn from_claims(claims: &ValidatedClaims, token: &str) -> Self {
         Self {
             user_id: claims.user_id,
+            token: token.to_string(),
         }
     }
 }
@@ -73,7 +76,7 @@ where
             // Validate the token
             let claims = state.jwt_validator.validate(token).await?;
 
-            Ok(AuthUser::from_claims(&claims))
+            Ok(AuthUser::from_claims(&claims, token))
         })
     }
 }
@@ -94,7 +97,8 @@ mod tests {
             expires_at: Utc::now() + Duration::hours(1),
         };
 
-        let user = AuthUser::from_claims(&claims);
+        let user = AuthUser::from_claims(&claims, "test-token");
         assert_eq!(user.user_id, user_id);
+        assert_eq!(user.token, "test-token");
     }
 }

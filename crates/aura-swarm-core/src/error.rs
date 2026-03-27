@@ -31,7 +31,6 @@ pub enum CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::UserId;
 
     #[test]
     fn display_agent_not_found() {

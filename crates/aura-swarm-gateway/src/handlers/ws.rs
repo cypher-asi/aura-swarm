@@ -11,6 +11,7 @@ use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::Response;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -63,6 +64,7 @@ where
     let agent_id_str = session.agent_id.to_string();
     let session_id_str = session_id.to_string();
     let user_id_str = user.user_id.to_string();
+    let token = user.token;
 
     tracing::info!(
         session_id = %session_id_str,
@@ -81,6 +83,7 @@ where
             session_id_str,
             agent_id_str,
             user_id_str,
+            token,
             timeout,
             control,
         )
@@ -99,12 +102,13 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     session_id_str: String,
     agent_id_str: String,
     user_id_str: String,
+    token: String,
     timeout: std::time::Duration,
     control: Arc<C>,
 ) {
     let agent_url = format!("ws://{agent_endpoint}/stream");
     let Some(agent_socket) =
-        connect_to_agent(&agent_url, timeout, &session_id_str, &agent_id_str).await
+        connect_to_agent(&agent_url, &token, timeout, &session_id_str, &agent_id_str).await
     else {
         return;
     };
@@ -151,14 +155,28 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     tracing::info!(session_id = %session_id_str, "WebSocket proxy ended");
 }
 
-/// Connect to the agent's WebSocket endpoint with timeout.
+/// Connect to the agent's WebSocket endpoint with timeout, forwarding the
+/// client JWT so the harness can use it for LLM proxy and domain tool calls.
 async fn connect_to_agent(
     url: &str,
+    token: &str,
     timeout: std::time::Duration,
     session_id: &str,
     agent_id: &str,
 ) -> Option<tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-    match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(url)).await {
+    let mut request = match url.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(session_id = %session_id, error = %e, "Invalid agent URL");
+            return None;
+        }
+    };
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}").parse().expect("valid header value"),
+    );
+
+    match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request)).await {
         Ok(Ok((socket, _))) => Some(socket),
         Ok(Err(e)) => {
             tracing::error!(

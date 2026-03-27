@@ -12,6 +12,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -35,7 +36,7 @@ pub(crate) async fn terminal_ws<C, V>(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
@@ -51,9 +52,10 @@ where
 
     let timeout = state.config.websocket_timeout();
     let agent_id_str = agent_id.to_string();
+    let token = user.token;
 
     Ok(ws.on_upgrade(move |socket| {
-        proxy_terminal(socket, endpoint, agent_id_str, timeout)
+        proxy_terminal(socket, endpoint, agent_id_str, token, timeout)
     }))
 }
 
@@ -61,13 +63,26 @@ async fn proxy_terminal(
     client_socket: WebSocket,
     agent_endpoint: String,
     agent_id_str: String,
+    token: String,
     timeout: std::time::Duration,
 ) {
     let agent_url = format!("ws://{agent_endpoint}/ws/terminal");
 
+    let mut request = match agent_url.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(agent_id = %agent_id_str, error = %e, "Invalid agent terminal URL");
+            return;
+        }
+    };
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}").parse().expect("valid header value"),
+    );
+
     let agent_socket = match tokio::time::timeout(
         timeout,
-        tokio_tungstenite::connect_async(&agent_url),
+        tokio_tungstenite::connect_async(request),
     )
     .await
     {
