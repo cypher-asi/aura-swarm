@@ -541,7 +541,7 @@ impl K8sScheduler {
         }
 
         let url = format!(
-            "{}/internal/agents/{}/status",
+            "{}/v1/agents/{}/status",
             self.config.gateway_url,
             agent_id.to_hex()
         );
@@ -551,6 +551,7 @@ impl K8sScheduler {
         let response = self
             .http_client
             .patch(&url)
+            .bearer_auth(&self.config.gateway_token)
             .json(&body)
             .send()
             .await

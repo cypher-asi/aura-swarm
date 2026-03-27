@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
-use crate::handlers::{agents, health, internal, sessions, terminal, ws};
+use crate::handlers::{agents, health, sessions, terminal, ws};
 use crate::state::GatewayState;
 
 /// Create the gateway router with all routes and middleware.
@@ -37,6 +37,7 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/wake` - Wake agent
 /// - `GET /v1/agents/:agent_id/logs` - Get agent logs
 /// - `GET /v1/agents/:agent_id/status` - Get agent status
+/// - `PATCH /v1/agents/:agent_id/status` - Update agent status
 /// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
 ///
 /// ## Terminal (authenticated, proxied to agent pod)
@@ -48,10 +49,6 @@ use crate::state::GatewayState;
 /// - `GET /v1/sessions/:session_id` - Get session
 /// - `DELETE /v1/sessions/:session_id` - Close session
 /// - `GET /v1/sessions/:session_id/ws` - WebSocket connection
-///
-/// ## Internal (no auth, cluster-only)
-/// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
-/// - `GET /internal/health` - Internal health check
 pub fn create_router<C, V>(state: GatewayState<C, V>) -> Router
 where
     C: ControlPlane + 'static,
@@ -105,7 +102,7 @@ where
         .route("/v1/agents/:agent_id/logs", get(agents::get_logs::<C, V>))
         .route(
             "/v1/agents/:agent_id/status",
-            get(agents::get_status::<C, V>),
+            get(agents::get_status::<C, V>).patch(agents::update_agent_status::<C, V>),
         )
         .route(
             "/v1/agents/:agent_id/state",
@@ -130,12 +127,6 @@ where
             "/v1/sessions/:session_id/ws",
             get(ws::websocket_handler::<C, V>),
         )
-        // Internal endpoints (no auth required - protected by network policies)
-        .route(
-            "/internal/agents/:agent_id/status",
-            patch(internal::update_agent_status::<C, V>),
-        )
-        .route("/internal/health", get(internal::internal_health))
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

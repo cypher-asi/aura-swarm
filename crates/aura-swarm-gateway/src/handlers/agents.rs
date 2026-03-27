@@ -92,6 +92,21 @@ pub(crate) struct LifecycleResponse {
     pub(crate) status: AgentState,
 }
 
+/// Request body for updating agent status (scheduler callback).
+#[derive(Debug, Deserialize)]
+pub(crate) struct StatusUpdateRequest {
+    pub(crate) status: AgentState,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
+/// Response for status update.
+#[derive(Debug, Serialize)]
+pub(crate) struct StatusUpdateResponse {
+    pub(crate) success: bool,
+    pub(crate) status: AgentState,
+}
+
 /// Query parameters for log retrieval.
 #[derive(Debug, Deserialize)]
 pub(crate) struct LogQuery {
@@ -467,6 +482,33 @@ where
             cpu_percent: 0.0,
             memory_mb: 0,
         },
+    }))
+}
+
+/// Update agent status (scheduler callback).
+///
+/// # Errors
+///
+/// Returns an error if the agent ID is invalid or the store update fails.
+pub(crate) async fn update_agent_status<C, V>(
+    _user: AuthUser,
+    State(state): State<Arc<GatewayState<C, V>>>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<StatusUpdateRequest>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agent_id = parse_agent_id(&agent_id)?;
+    state
+        .control
+        .update_agent_status_internal(&agent_id, body.status, body.message.clone())
+        .await?;
+
+    Ok(Json(StatusUpdateResponse {
+        success: true,
+        status: body.status,
     }))
 }
 
