@@ -12,6 +12,7 @@ use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use aura_swarm_auth::JwtValidator;
@@ -198,19 +199,18 @@ async fn handle_automaton_ws_proxy(
 ) {
     let agent_url = format!("ws://{agent_endpoint}/stream/automaton/{automaton_id}");
 
-    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&agent_url)
-        .header("Host", &agent_endpoint);
-    if let Some(ref auth) = auth_header {
-        request = request.header("Authorization", auth);
-    }
-    let request = match request.body(()) {
+    let mut request = match agent_url.into_client_request() {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "Failed to build WS request for automaton proxy");
             return;
         }
     };
+    if let Some(ref auth) = auth_header {
+        if let Ok(val) = auth.parse() {
+            request.headers_mut().insert("Authorization", val);
+        }
+    }
 
     let agent_socket = match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request))
         .await
