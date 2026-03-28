@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
-use crate::handlers::{agents, files, health, internal, sessions, terminal, ws};
+use crate::handlers::{agents, automaton, files, health, internal, sessions, terminal, ws};
 use crate::state::GatewayState;
 
 /// Create the gateway router with all routes and middleware.
@@ -52,6 +52,13 @@ use crate::state::GatewayState;
 /// - `GET /v1/sessions/:session_id` - Get session
 /// - `DELETE /v1/sessions/:session_id` - Close session
 /// - `GET /v1/sessions/:session_id/ws` - WebSocket connection
+///
+/// ## Automaton proxy (authenticated, dev-loop / task runner)
+/// - `POST /v1/agents/:agent_id/automaton/start` - Start automaton
+/// - `GET /v1/agents/:agent_id/automaton/:automaton_id/status` - Get status
+/// - `POST /v1/agents/:agent_id/automaton/:automaton_id/pause` - Pause
+/// - `POST /v1/agents/:agent_id/automaton/:automaton_id/stop` - Stop
+/// - `GET /v1/agents/:agent_id/stream/automaton/:automaton_id` - Event stream WS
 ///
 /// ## Internal (no auth, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
@@ -142,6 +149,27 @@ where
         .route(
             "/v1/sessions/:session_id/ws",
             get(ws::websocket_handler::<C, V>),
+        )
+        // Automaton proxy (dev loop / task runner on agent pods)
+        .route(
+            "/v1/agents/:agent_id/automaton/start",
+            post(automaton::automaton_start::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/automaton/:automaton_id/status",
+            get(automaton::automaton_status::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/automaton/:automaton_id/pause",
+            post(automaton::automaton_pause::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/automaton/:automaton_id/stop",
+            post(automaton::automaton_stop::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/stream/automaton/:automaton_id",
+            get(automaton::automaton_events_ws::<C, V>),
         )
         // Internal endpoints (no auth required - protected by network policies)
         .route(
