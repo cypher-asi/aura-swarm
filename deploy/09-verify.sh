@@ -5,8 +5,7 @@
 # - EFS CSI driver running
 # - All PVCs bound (gateway-data, control-data, agent-state)
 # - All pods running
-# - Gateway responding on LoadBalancer
-# - Health endpoints returning 200
+# - Gateway ELB reachable (hits /health via curl from operator machine)
 #
 # On failure, prints targeted diagnostics (pod events, PVC events, CSI logs)
 # so the operator can identify the root cause without manual kubectl triage.
@@ -49,7 +48,7 @@ AGENT_IMAGE_ROWS=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-ag
 
 if [[ -z "${AGENT_IMAGE_ROWS}" ]]; then
     echo -e "${YELLOW}⚠${NC} No swarm-agent pods found; digest convergence check skipped"
-    ((WARNINGS++))
+    ((WARNINGS++)) || true
 else
     declare -A DIGEST_COUNTS=()
     while IFS='|' read -r pod_name image_id; do
@@ -59,7 +58,7 @@ else
             DIGEST_COUNTS["$digest"]=$(( ${DIGEST_COUNTS["$digest"]:-0} + 1 ))
         else
             echo -e "${YELLOW}⚠${NC} ${pod_name}: could not parse digest from imageID (${image_id:-missing})"
-            ((WARNINGS++))
+            ((WARNINGS++)) || true
         fi
     done <<< "${AGENT_IMAGE_ROWS}"
 
@@ -70,7 +69,7 @@ else
             if [[ -n "${EXPECTED_DIGEST}" && "${EXPECTED_DIGEST}" != "${digest}" ]]; then
                 echo -e "${RED}✗${NC} ConfigMap digest (${EXPECTED_DIGEST}) does not match running pods"
                 echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
-                ((ERRORS++))
+                ((ERRORS++)) || true
             fi
         done
     elif [[ "${DIGEST_TOTAL}" -gt 1 ]]; then
@@ -79,10 +78,10 @@ else
             echo "    ${digest} (${DIGEST_COUNTS[$digest]} pod(s))"
         done
         echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
-        ((ERRORS++))
+        ((ERRORS++)) || true
     else
         echo -e "${YELLOW}⚠${NC} Could not parse any swarm-agent image digests"
-        ((WARNINGS++))
+        ((WARNINGS++)) || true
     fi
 fi
 
@@ -100,7 +99,7 @@ EFS_CSI_RUNNING=$(kubectl get pods -n kube-system -l app=efs-csi-controller --no
 if [[ "$EFS_CSI_TOTAL" -eq 0 ]]; then
     echo -e "${RED}✗${NC} EFS CSI controller: not installed"
     echo "    Fix: run ./05-configure-eks.sh"
-    ((ERRORS++))
+    ((ERRORS++)) || true
 elif [[ "$EFS_CSI_RUNNING" -eq "$EFS_CSI_TOTAL" ]]; then
     echo -e "${GREEN}✓${NC} EFS CSI controller: ${EFS_CSI_RUNNING}/${EFS_CSI_TOTAL} Running"
 else
@@ -108,7 +107,7 @@ else
     kubectl get pods -n kube-system -l app=efs-csi-controller --no-headers 2>/dev/null | while read -r line; do
         echo "    $line"
     done
-    ((WARNINGS++))
+    ((WARNINGS++)) || true
 fi
 
 echo ""
@@ -131,7 +130,7 @@ check_pvc() {
         return 0
     else
         echo -e "${RED}✗${NC} ${pvc_name}: ${status}"
-        ((ERRORS++))
+        ((ERRORS++)) || true
 
         # Show the most recent provisioning event to explain why
         LAST_EVENT=$(kubectl get events -n "$namespace" \
@@ -186,11 +185,11 @@ check_pod() {
         return 0
     elif [[ "$phase" == "Running" ]]; then
         echo -e "${YELLOW}⚠${NC} ${name}: Running but not Ready"
-        ((WARNINGS++))
+        ((WARNINGS++)) || true
         return 0
     else
         echo -e "${RED}✗${NC} ${name}: ${phase:-Not found}"
-        ((ERRORS++))
+        ((ERRORS++)) || true
 
         # Show why the pod is stuck
         if [[ "$phase" == "Pending" ]]; then
@@ -241,52 +240,53 @@ if [[ -n "$GATEWAY_LB" ]]; then
     echo -e "${GREEN}✓${NC} Gateway LoadBalancer: ${GATEWAY_LB}"
 else
     echo -e "${YELLOW}⚠${NC} Gateway LoadBalancer: Pending (may take a few minutes)"
-    ((WARNINGS++))
+    ((WARNINGS++)) || true
 fi
 
 echo ""
 
 #------------------------------------------------------------------------------
-# Health checks (internal via kubectl exec)
+# Health checks via ELB
 #------------------------------------------------------------------------------
 
 echo -e "${CYAN}Health Endpoints${NC}"
 
-check_health() {
-    local service=$1
-    local port=$2
+if [[ -n "$GATEWAY_LB" ]]; then
+    GATEWAY_URL="http://${GATEWAY_LB}"
 
-    # Skip health check if the pod isn't running
-    local phase
-    phase=$(kubectl get pods -n "${K8S_NAMESPACE_SYSTEM}" -l "app=${service}" \
-        -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
-    if [[ "$phase" != "Running" ]]; then
-        echo -e "${YELLOW}⚠${NC} ${service} /health: skipped (pod is ${phase:-missing})"
-        return 0
-    fi
+    # Retry a few times -- the NLB may still be warming up
+    MAX_RETRIES=3
+    RETRY_DELAY=5
+    HEALTH_OK=false
 
-    local health_status
-    health_status=$(kubectl exec -n "${K8S_NAMESPACE_SYSTEM}" "deploy/${service}" \
-        -- wget -q -O - "http://localhost:${port}/health" 2>/dev/null || echo "")
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
+            "${GATEWAY_URL}/health" 2>/dev/null || echo "000")
 
-    if [[ -n "$health_status" ]]; then
-        echo -e "${GREEN}✓${NC} ${service} /health: OK"
-        return 0
-    fi
+        if [[ "$HTTP_CODE" == "200" ]]; then
+            HEALTH_OK=true
+            break
+        fi
 
-    health_status=$(kubectl exec -n "${K8S_NAMESPACE_SYSTEM}" "deploy/${service}" \
-        -- curl -sf "http://localhost:${port}/health" 2>/dev/null || echo "")
+        if [[ $attempt -lt $MAX_RETRIES ]]; then
+            echo -e "${YELLOW}⚠${NC} ELB /health returned ${HTTP_CODE}, retrying in ${RETRY_DELAY}s (${attempt}/${MAX_RETRIES})..."
+            sleep "$RETRY_DELAY"
+        fi
+    done
 
-    if [[ -n "$health_status" ]]; then
-        echo -e "${GREEN}✓${NC} ${service} /health: OK"
+    if [[ "$HEALTH_OK" == "true" ]]; then
+        echo -e "${GREEN}✓${NC} Gateway ELB /health: 200 OK"
     else
-        echo -e "${YELLOW}⚠${NC} ${service} /health: no response (service may still be starting)"
-        ((WARNINGS++))
+        echo -e "${RED}✗${NC} Gateway ELB /health: HTTP ${HTTP_CODE} after ${MAX_RETRIES} attempts"
+        echo "    URL tested: ${GATEWAY_URL}/health"
+        echo "    The ELB may still be provisioning, or the gateway may not be healthy."
+        echo "    Debug: curl -v ${GATEWAY_URL}/health"
+        ((ERRORS++)) || true
     fi
-}
-
-check_health "aura-swarm-gateway" 8080
-check_health "aura-swarm-control" 8080
+else
+    echo -e "${YELLOW}⚠${NC} Skipping ELB health check (LoadBalancer address not available yet)"
+    ((WARNINGS++)) || true
+fi
 
 echo ""
 
@@ -316,11 +316,6 @@ kubectl get pvc -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null || true
 kubectl get pvc -n "${K8S_NAMESPACE_AGENTS}" 2>/dev/null || true
 echo ""
 
-if [[ -n "${GATEWAY_LB:-}" ]]; then
-    echo "Gateway URL: http://${GATEWAY_LB}"
-    echo ""
-fi
-
 #------------------------------------------------------------------------------
 # Summary
 #------------------------------------------------------------------------------
@@ -331,11 +326,6 @@ if [[ $ERRORS -eq 0 && $WARNINGS -eq 0 ]]; then
     echo -e "${GREEN}All verifications passed!${NC}"
     echo ""
     echo "Deployment completed successfully."
-    if [[ -n "${GATEWAY_LB:-}" ]]; then
-        echo ""
-        echo "Access the API at: http://${GATEWAY_LB}"
-        echo "  curl http://${GATEWAY_LB}/health"
-    fi
 elif [[ $ERRORS -eq 0 ]]; then
     echo -e "${YELLOW}Passed with ${WARNINGS} warning(s)${NC}"
     echo ""
@@ -351,5 +341,22 @@ else
     echo "  kubectl logs  -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-control"
     echo ""
     echo "Quick fix: ./fix-pending-pods.sh  (repairs IRSA trust policy + reprovisions PVCs)"
+fi
+
+echo ""
+
+if [[ -n "${GATEWAY_LB:-}" ]]; then
+    echo -e "${CYAN}=============================================="
+    echo "  Gateway ELB Address"
+    echo "==============================================${NC}"
+    echo ""
+    echo "  http://${GATEWAY_LB}"
+    echo ""
+    echo "  Test:     curl http://${GATEWAY_LB}/health"
+    echo "  WebSocket: ws://${GATEWAY_LB}/ws"
+    echo ""
+fi
+
+if [[ $ERRORS -gt 0 ]]; then
     exit 1
 fi

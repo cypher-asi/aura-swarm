@@ -60,7 +60,7 @@ check_command() {
         if [[ -n "$install_hint" ]]; then
             echo "  Install: $install_hint"
         fi
-        ((ERRORS++))
+        ((ERRORS++)) || true
         return 1
     fi
 }
@@ -87,7 +87,7 @@ check_aws_auth() {
         echo "    - Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or"
         echo "    - Configure AWS CLI profile with 'aws configure', or"
         echo "    - Set AWS_PROFILE to use a named profile"
-        ((ERRORS++))
+        ((ERRORS++)) || true
         return 1
     fi
 }
@@ -114,7 +114,7 @@ check_aws_region() {
     if [[ -z "${AWS_REGION:-}" ]]; then
         echo -e "${RED}✗${NC} AWS_REGION is not set"
         echo "  Set AWS_REGION in config.env or export it before running"
-        ((ERRORS++))
+        ((ERRORS++)) || true
         return 1
     fi
     
@@ -124,7 +124,7 @@ check_aws_region() {
         return 0
     else
         echo -e "${RED}✗${NC} AWS region '${AWS_REGION}' is not valid or not accessible"
-        ((ERRORS++))
+        ((ERRORS++)) || true
         return 1
     fi
 }

@@ -374,6 +374,14 @@ fi
 echo ""
 
 #------------------------------------------------------------------------------
+# Restart scheduler so it picks up the updated ConfigMap env vars
+# (AURA_HARNESS_IMAGE is injected at pod creation, not live-reloaded)
+#------------------------------------------------------------------------------
+
+echo "Restarting scheduler to pick up updated ConfigMap..."
+kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}"
+
+#------------------------------------------------------------------------------
 # Wait for deployments
 #------------------------------------------------------------------------------
 

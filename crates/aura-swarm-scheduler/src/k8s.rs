@@ -537,16 +537,19 @@ impl K8sScheduler {
         struct StatusUpdate {
             status: AgentState,
             #[serde(skip_serializing_if = "Option::is_none")]
-            message: Option<String>,
+            error_message: Option<String>,
         }
 
         let url = format!(
-            "{}/v1/agents/{}/status",
+            "{}/internal/agents/{}/status",
             self.config.gateway_url,
             agent_id.to_hex()
         );
 
-        let body = StatusUpdate { status, message };
+        let body = StatusUpdate {
+            status,
+            error_message: message,
+        };
 
         let response = self
             .http_client
