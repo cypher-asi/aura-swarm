@@ -6,8 +6,9 @@
 use aura_swarm_core::AgentId;
 use aura_swarm_store::AgentSpec;
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, HTTPGetAction, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, Probe, ResourceRequirements, Volume, VolumeMount,
+    Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
+    ResourceRequirements, SecretKeySelector, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -182,6 +183,9 @@ fn build_container(
     }
 }
 
+/// Name of the Kubernetes secret containing LLM API keys.
+const LLM_SECRETS_NAME: &str = "aura-swarm-secrets";
+
 fn build_env_vars(
     agent_id_hex: &str,
     user_id_hex: &str,
@@ -248,7 +252,28 @@ fn build_env_vars(
             value: Some("true".to_string()),
             ..Default::default()
         },
+        EnvVar {
+            name: "AURA_PROJECT_BASE".to_string(),
+            value: Some("/home/aura".to_string()),
+            ..Default::default()
+        },
     ]
+}
+
+/// Build an environment variable that references a Kubernetes secret.
+fn build_secret_env_var(env_name: &str, secret_name: &str, secret_key: &str) -> EnvVar {
+    EnvVar {
+        name: env_name.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret_name.to_string(),
+                key: secret_key.to_string(),
+                optional: Some(true), // Don't fail pod startup if key is missing
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 fn build_resources(spec: &AgentSpec) -> ResourceRequirements {
