@@ -168,6 +168,10 @@ where
             post(automaton::automaton_stop::<C, V>),
         )
         .route(
+            "/v1/agents/:agent_id/workspace/resolve",
+            get(automaton::workspace_resolve::<C, V>),
+        )
+        .route(
             "/v1/agents/:agent_id/stream/automaton/:automaton_id",
             get(automaton::automaton_events_ws::<C, V>),
         )

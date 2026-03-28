@@ -159,6 +159,41 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Workspace resolve proxy
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/agents/:agent_id/workspace/resolve?project_name=...`
+pub(crate) async fn workspace_resolve<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    Path(agent_id): Path<String>,
+    _user: AuthUser,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agent_id = parse_agent_id(&agent_id)?;
+    let endpoint = resolve_endpoint(&state, &agent_id).await?;
+    let project_name = params.get("project_name").cloned().unwrap_or_default();
+    let url = format!("http://{endpoint}/workspace/resolve");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[("project_name", &project_name)])
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(url = %url, error = %e, "workspace resolve proxy failed");
+            ApiError::AgentUnavailable
+        })?;
+    let status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = resp.text().await.unwrap_or_default();
+    Ok((status, [("content-type", "application/json")], body).into_response())
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket proxy handler (automaton event stream)
 // ---------------------------------------------------------------------------
 
