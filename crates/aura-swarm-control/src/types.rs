@@ -138,7 +138,7 @@ pub struct ControlConfig {
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
-            max_agents_per_user: 10,
+            max_agents_per_user: 100,
             idle_timeout_seconds: 300,          // 5 minutes
             hibernate_after_idle_seconds: 1800, // 30 minutes
             heartbeat_interval_seconds: 30,
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn control_config_defaults() {
         let config = ControlConfig::default();
-        assert_eq!(config.max_agents_per_user, 10);
+        assert_eq!(config.max_agents_per_user, 100);
         assert_eq!(config.idle_timeout_seconds, 300);
     }
 }
