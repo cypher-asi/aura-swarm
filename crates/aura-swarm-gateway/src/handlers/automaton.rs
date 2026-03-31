@@ -56,7 +56,10 @@ where
 
 async fn proxy_post(endpoint: &str, path: &str, body: Bytes) -> Result<Response, ApiError> {
     let url = format!("http://{endpoint}{path}");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .post(&url)
         .header("content-type", "application/json")
         .body(body)
@@ -77,7 +80,10 @@ async fn proxy_post(endpoint: &str, path: &str, body: Bytes) -> Result<Response,
 
 async fn proxy_get(endpoint: &str, path: &str) -> Result<Response, ApiError> {
     let url = format!("http://{endpoint}{path}");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .send()
@@ -197,7 +203,10 @@ where
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     let project_name = params.get("project_name").cloned().unwrap_or_default();
     let url = format!("http://{endpoint}/workspace/resolve");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .query(&[("project_name", &project_name)])
         .timeout(std::time::Duration::from_secs(15))

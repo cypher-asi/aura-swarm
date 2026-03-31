@@ -62,7 +62,10 @@ where
     let depth = body.depth.min(20);
     let url = format!("http://{endpoint}/api/files");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let resp = client
         .get(&url)
         .query(&[("path", &body.path), ("depth", &depth.to_string())])
@@ -106,7 +109,10 @@ where
 
     let url = format!("http://{endpoint}/api/read-file");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let resp = client
         .get(&url)
         .query(&[("path", &body.path)])
