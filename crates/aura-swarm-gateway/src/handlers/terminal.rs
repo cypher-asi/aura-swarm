@@ -43,6 +43,7 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
 
     let endpoint = state
         .control
