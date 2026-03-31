@@ -27,6 +27,18 @@ fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
+fn validate_automaton_id(id: &str) -> Result<&str, ApiError> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::BadRequest(format!("invalid automaton ID: {id}")));
+    }
+    Ok(id)
+}
+
 async fn resolve_endpoint<C, V>(
     state: &GatewayState<C, V>,
     agent_id: &AgentId,
@@ -116,6 +128,7 @@ where
 {
     let agent_id = parse_agent_id(&agent_id)?;
     let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_get(&endpoint, &format!("/automaton/{automaton_id}/status")).await
 }
@@ -132,6 +145,7 @@ where
 {
     let agent_id = parse_agent_id(&agent_id)?;
     let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_post(
         &endpoint,
@@ -153,6 +167,7 @@ where
 {
     let agent_id = parse_agent_id(&agent_id)?;
     let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_post(
         &endpoint,
@@ -216,6 +231,7 @@ where
 {
     let agent_id = parse_agent_id(&agent_id)?;
     let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?.to_string();
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     let timeout = state.config.websocket_timeout();
 
