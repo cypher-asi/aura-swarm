@@ -32,6 +32,11 @@ pub struct GatewayConfig {
     /// Request timeout in seconds.
     #[serde(default = "GatewayConfig::default_request_timeout")]
     pub request_timeout_seconds: u64,
+
+    /// Bearer token for internal endpoints (scheduler callbacks).
+    /// When set, internal endpoints require this token in the Authorization header.
+    #[serde(default)]
+    pub internal_token: Option<String>,
 }
 
 impl GatewayConfig {
@@ -77,6 +82,7 @@ impl Default for GatewayConfig {
             websocket_timeout_seconds: Self::default_ws_timeout(),
             max_body_bytes: Self::default_max_body(),
             request_timeout_seconds: Self::default_request_timeout(),
+            internal_token: std::env::var("INTERNAL_TOKEN").ok().filter(|s| !s.is_empty()),
         }
     }
 }
