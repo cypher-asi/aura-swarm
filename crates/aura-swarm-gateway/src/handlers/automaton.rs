@@ -343,3 +343,34 @@ async fn handle_automaton_ws_proxy(
 
     tracing::info!(%automaton_id, "Automaton WS proxy ended");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_automaton_id() {
+        assert!(validate_automaton_id("abc-123_def").is_ok());
+        assert!(validate_automaton_id("a1b2c3").is_ok());
+    }
+
+    #[test]
+    fn blocks_path_traversal() {
+        assert!(validate_automaton_id("../../secret").is_err());
+        assert!(validate_automaton_id("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn blocks_special_chars() {
+        assert!(validate_automaton_id("id;rm -rf /").is_err());
+        assert!(validate_automaton_id("id&cmd").is_err());
+        assert!(validate_automaton_id("id/path").is_err());
+    }
+
+    #[test]
+    fn blocks_empty_and_long() {
+        assert!(validate_automaton_id("").is_err());
+        assert!(validate_automaton_id(&"a".repeat(65)).is_err());
+        assert!(validate_automaton_id(&"a".repeat(64)).is_ok());
+    }
+}
