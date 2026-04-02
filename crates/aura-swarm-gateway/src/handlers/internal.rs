@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
@@ -58,4 +58,42 @@ where
 /// Internal health check for cluster probes (no auth required).
 pub(crate) async fn internal_health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Compact representation of an active agent for the scheduler reconciler.
+#[derive(Debug, Serialize)]
+pub(crate) struct ActiveAgentEntry {
+    pub agent_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub status: AgentState,
+    pub spec: aura_swarm_store::AgentSpec,
+}
+
+/// `GET /internal/agents/active`
+///
+/// Returns agents in Provisioning / Running / Idle states so the scheduler
+/// can reconcile desired vs actual pod state. No auth required -- protected
+/// by network policies restricting access to cluster-internal traffic.
+pub(crate) async fn list_active_agents<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agents = state.control.list_active_agents().await?;
+
+    let entries: Vec<ActiveAgentEntry> = agents
+        .into_iter()
+        .map(|a| ActiveAgentEntry {
+            agent_id: a.agent_id.to_hex(),
+            user_id: a.user_id.to_string(),
+            name: a.name,
+            status: a.status,
+            spec: a.spec,
+        })
+        .collect();
+
+    Ok(Json(entries))
 }

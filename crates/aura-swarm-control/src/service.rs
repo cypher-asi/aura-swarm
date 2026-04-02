@@ -175,6 +175,13 @@ pub trait ControlPlane: Send + Sync {
         status: AgentState,
         error_message: Option<String>,
     ) -> Result<()>;
+
+    /// List agents that should have running pods.
+    ///
+    /// Returns all agents in Provisioning, Running, or Idle states. Used by
+    /// the scheduler's desired-state reconciliation loop to detect missing
+    /// or stale pods.
+    async fn list_active_agents(&self) -> Result<Vec<Agent>>;
 }
 
 /// The main control plane service implementation.
@@ -870,6 +877,16 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         }
 
         Ok(())
+    }
+
+    async fn list_active_agents(&self) -> Result<Vec<Agent>> {
+        blocking_store(&self.store, move |s| {
+            let mut agents = s.list_agents_by_status(AgentState::Provisioning)?;
+            agents.extend(s.list_agents_by_status(AgentState::Running)?);
+            agents.extend(s.list_agents_by_status(AgentState::Idle)?);
+            Ok(agents)
+        })
+        .await
     }
 }
 

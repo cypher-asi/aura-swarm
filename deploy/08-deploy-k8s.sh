@@ -19,7 +19,7 @@ set -euo pipefail
 #------------------------------------------------------------------------------
 
 RESET_DATA=false
-RECREATE_AGENTS=true
+RECREATE_AGENTS=false
 
 for arg in "$@"; do
     case $arg in
@@ -395,11 +395,18 @@ kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTE
 echo ""
 
 #------------------------------------------------------------------------------
-# Recreate running agent pods to converge to pinned harness digest (default on)
+# Agent pod convergence
 #------------------------------------------------------------------------------
+# The scheduler now has a desired-state reconciler that automatically detects
+# missing pods and image drift. After the scheduler restarts (above) with the
+# updated AURA_HARNESS_IMAGE, it will:
+#   1. Recreate pods for any agents that should be running but lack a pod
+#   2. Rolling-replace pods whose image differs from the configured image
+#
+# Use --recreate-agents only if you need to force immediate convergence.
 
 if [[ "${RECREATE_AGENTS}" == "true" ]]; then
-    echo "Converging running swarm-agent pods by recreation..."
+    echo "Force-restarting swarm-agent pods (--recreate-agents)..."
     mapfile -t RUNNING_AGENT_PODS < <(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
         --field-selector=status.phase=Running \
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
@@ -407,11 +414,11 @@ if [[ "${RECREATE_AGENTS}" == "true" ]]; then
     if [[ ${#RUNNING_AGENT_PODS[@]} -eq 0 ]]; then
         echo "No running swarm-agent pods found; nothing to recreate."
     else
-        echo "Recreating ${#RUNNING_AGENT_PODS[@]} running agent pod(s)..."
+        echo "Deleting ${#RUNNING_AGENT_PODS[@]} agent pod(s); scheduler reconciler will recreate them..."
         kubectl delete pod -n "${K8S_NAMESPACE_AGENTS}" "${RUNNING_AGENT_PODS[@]}" --wait=false
 
-        echo "Waiting for replacement swarm-agent pods to appear..."
-        AGENT_APPEAR_TIMEOUT=60
+        echo "Waiting for scheduler to recreate agent pods (up to 120s)..."
+        AGENT_APPEAR_TIMEOUT=120
         AGENT_APPEAR_ELAPSED=0
         AGENT_APPEARED=false
         while [[ "${AGENT_APPEAR_ELAPSED}" -lt "${AGENT_APPEAR_TIMEOUT}" ]]; do
@@ -426,28 +433,20 @@ if [[ "${RECREATE_AGENTS}" == "true" ]]; then
         done
 
         if [[ "${AGENT_APPEARED}" != "true" ]]; then
-            echo -e "${RED}✗${NC} Agent convergence failed: no replacement pods appeared."
-            echo "Rollback guidance:"
-            echo "  - Inspect controller state: kubectl get pods -n ${K8S_NAMESPACE_SYSTEM} -o wide"
-            echo "  - Check scheduler logs:     kubectl logs -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-scheduler --tail=50"
-            echo "  - Re-run deploy with explicit convergence: ./08-deploy-k8s.sh --recreate-agents"
-            exit 1
+            echo -e "${YELLOW}⚠${NC} No replacement pods appeared within ${AGENT_APPEAR_TIMEOUT}s."
+            echo "  The scheduler reconciler will continue trying in the background."
+            echo "  Check: kubectl logs -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-scheduler --tail=50"
+        else
+            echo -e "${GREEN}✓${NC} Agent pods are being recreated by the scheduler"
         fi
-
-        echo "Waiting for replacement swarm-agent pods to become Ready (timeout 300s)..."
-        if ! kubectl wait --for=condition=Ready pod -l app=swarm-agent \
-            -n "${K8S_NAMESPACE_AGENTS}" --timeout=300s >/dev/null; then
-            echo -e "${RED}✗${NC} Agent convergence failed: replacement pods did not become Ready in time."
-            echo "Rollback guidance:"
-            echo "  - Inspect agent pod status: kubectl get pods -n ${K8S_NAMESPACE_AGENTS} -l app=swarm-agent -o wide"
-            echo "  - Check recent events:      kubectl get events -n ${K8S_NAMESPACE_AGENTS} --sort-by='.lastTimestamp' | tail -20"
-            echo "  - Re-run deploy with explicit convergence: ./08-deploy-k8s.sh --recreate-agents"
-            exit 1
-        fi
-        echo -e "${GREEN}✓${NC} Agent pods recreated and Ready"
     fi
 else
-    echo -e "${YELLOW}⚠${NC} Skipping post-deploy agent recreation (--no-recreate-agents)"
+    AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+        --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+    if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
+        echo -e "${GREEN}✓${NC} ${AGENT_POD_COUNT} agent pod(s) running. The scheduler reconciler"
+        echo "  will automatically rolling-replace pods with stale images (~30s cycle)."
+    fi
 fi
 
 echo ""

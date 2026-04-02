@@ -90,6 +90,22 @@ pub struct PodInfo {
     pub status: PodStatus,
 }
 
+/// An active agent as reported by the gateway's internal API.
+///
+/// Used by the desired-state reconciler to determine which agents
+/// should have running pods.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActiveAgentInfo {
+    /// Agent ID (hex string).
+    pub agent_id: String,
+    /// Owner user ID (hex string).
+    pub user_id: String,
+    /// Human-readable agent name.
+    pub name: String,
+    /// Agent resource spec.
+    pub spec: aura_swarm_store::AgentSpec,
+}
+
 /// Configuration for the Kubernetes scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {

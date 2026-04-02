@@ -317,79 +317,31 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
         echo "No platform services were built, skipping refresh."
     fi
     
-    # Gracefully restart agent pods if harness was rebuilt
+    # Converge agent pods if harness was rebuilt
     if [[ "$BUILD_HARNESS" == "true" ]]; then
         echo ""
         echo "=============================================="
-        echo "  Restarting Agent Pods (graceful)"
+        echo "  Agent Pod Convergence"
         echo "=============================================="
         echo ""
         
-        source "${SCRIPT_DIR}/_helpers.sh" 2>/dev/null || true
+        # Restart the scheduler so it picks up the new AURA_HARNESS_IMAGE.
+        # Its desired-state reconciler will detect image drift on existing
+        # agent pods and rolling-replace them automatically.
+        echo "Restarting scheduler to pick up new harness image..."
+        kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" || true
+        kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
         
-        CLEANUP_PF=false
+        AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+            --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
         
-        LB_HOSTNAME=$(kubectl get svc aura-swarm-gateway-lb -n "${K8S_NAMESPACE_SYSTEM}" \
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-        
-        if [[ -n "$LB_HOSTNAME" ]]; then
-            GATEWAY_URL="http://${LB_HOSTNAME}"
+        if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
+            echo ""
+            echo -e "${GREEN}✓${NC} ${AGENT_POD_COUNT} agent pod(s) running. The scheduler reconciler"
+            echo "  will rolling-replace pods with the old harness image (~30s cycle)."
         else
-            echo -e "${YELLOW}⚠${NC} Could not determine gateway URL via LoadBalancer."
-            echo "  Falling back to kubectl port-forward..."
             echo ""
-            
-            kubectl port-forward svc/aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" 18080:8080 &>/dev/null &
-            PF_PID=$!
-            sleep 3
-            
-            if kill -0 "$PF_PID" 2>/dev/null; then
-                GATEWAY_URL="http://localhost:18080"
-                echo "Port-forward established (PID ${PF_PID})"
-                CLEANUP_PF=true
-            else
-                GATEWAY_URL=""
-                echo -e "${RED}✗${NC} Port-forward failed."
-                echo "  Restart agents manually: curl -X POST http://<gateway>/v1/agents/<id>/restart"
-            fi
-        fi
-        
-        if [[ -n "$GATEWAY_URL" ]]; then
-            echo "Gateway URL: ${GATEWAY_URL}"
-            echo ""
-            
-            # List running agent pods and extract agent IDs
-            AGENT_IDS=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
-                --no-headers -o jsonpath='{range .items[*]}{.metadata.annotations.swarm\.io/agent-id-full}{"\n"}{end}' 2>/dev/null || echo "")
-            
-            if [[ -z "$AGENT_IDS" ]]; then
-                echo "No running agent pods found."
-            else
-                AGENT_COUNT=$(echo "$AGENT_IDS" | grep -c . || echo "0")
-                echo "Found ${AGENT_COUNT} running agent(s). Restarting via gateway API..."
-                echo ""
-                
-                for AGENT_ID in $AGENT_IDS; do
-                    [[ -z "$AGENT_ID" ]] && continue
-                    echo -n "  Restarting agent ${AGENT_ID:0:16}... "
-                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                        -X POST "${GATEWAY_URL}/v1/agents/${AGENT_ID}/restart" \
-                        -H "Content-Type: application/json" 2>/dev/null || echo "000")
-                    
-                    if [[ "$HTTP_CODE" == "200" ]]; then
-                        echo -e "${GREEN}✓${NC}"
-                    else
-                        echo -e "${YELLOW}⚠ HTTP ${HTTP_CODE}${NC}"
-                    fi
-                done
-                
-                echo ""
-                echo -e "${GREEN}✓${NC} Agent restart requests sent. Pods will be recreated with the new harness image."
-            fi
-            
-            if [[ "$CLEANUP_PF" == "true" ]]; then
-                kill "$PF_PID" 2>/dev/null || true
-            fi
+            echo "No running agent pods. New agents will use the updated harness image."
         fi
     fi
 else

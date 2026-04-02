@@ -62,6 +62,7 @@ use crate::state::GatewayState;
 ///
 /// ## Internal (no auth, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
+/// - `GET /internal/agents/active` - List agents expected to have pods (scheduler reconciler)
 /// - `GET /internal/health` - Internal health check
 pub fn create_router<C, V>(state: GatewayState<C, V>) -> Router
 where
@@ -179,6 +180,10 @@ where
         .route(
             "/internal/agents/:agent_id/status",
             patch(internal::update_agent_status::<C, V>),
+        )
+        .route(
+            "/internal/agents/active",
+            get(internal::list_active_agents::<C, V>),
         )
         .route("/internal/health", get(internal::internal_health))
         // Middleware

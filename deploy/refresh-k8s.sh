@@ -114,54 +114,33 @@ if [[ $PROBLEM_PODS -gt 0 ]]; then
 fi
 
 #------------------------------------------------------------------------------
-# Restart agent pods (if requested)
+# Converge agent pods (if requested)
 #------------------------------------------------------------------------------
 
 if [[ "$REFRESH_AGENTS" == "true" ]]; then
     echo ""
     echo "=============================================="
-    echo "  Restarting Agent Pods (graceful)"
+    echo "  Agent Pod Convergence"
     echo "=============================================="
     echo ""
     
-    GATEWAY_URL=$(kubectl get svc aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" \
-        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    # Restart the scheduler so its desired-state reconciler picks up the
+    # new AURA_HARNESS_IMAGE from the ConfigMap. It will then detect image
+    # drift on existing agent pods and rolling-replace them automatically.
+    echo "Restarting scheduler to trigger agent pod convergence..."
+    kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" || true
+    kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
     
-    if [[ -z "$GATEWAY_URL" ]]; then
-        echo -e "${YELLOW}⚠${NC} Could not determine gateway URL."
-        echo "  Agents will pick up the new image on next manual restart."
-    else
-        GATEWAY_URL="http://${GATEWAY_URL}"
-        echo "Gateway URL: ${GATEWAY_URL}"
+    AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+        --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+    
+    if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
         echo ""
-        
-        AGENT_IDS=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
-            --no-headers -o jsonpath='{range .items[*]}{.metadata.annotations.swarm\.io/agent-id-full}{"\n"}{end}' 2>/dev/null || echo "")
-        
-        if [[ -z "$AGENT_IDS" ]]; then
-            echo "No running agent pods found in ${K8S_NAMESPACE_AGENTS}."
-        else
-            AGENT_COUNT=$(echo "$AGENT_IDS" | grep -c . || echo "0")
-            echo "Found ${AGENT_COUNT} running agent(s). Restarting via gateway API..."
-            echo ""
-            
-            for AGENT_ID in $AGENT_IDS; do
-                [[ -z "$AGENT_ID" ]] && continue
-                echo -n "  Restarting agent ${AGENT_ID:0:16}... "
-                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                    -X POST "${GATEWAY_URL}/v1/agents/${AGENT_ID}/restart" \
-                    -H "Content-Type: application/json" 2>/dev/null || echo "000")
-                
-                if [[ "$HTTP_CODE" == "200" ]]; then
-                    echo -e "${GREEN}✓${NC}"
-                else
-                    echo -e "${YELLOW}⚠ HTTP ${HTTP_CODE}${NC}"
-                fi
-            done
-            
-            echo ""
-            echo -e "${GREEN}✓${NC} Agent restart requests sent. Pods will be recreated with the new image."
-        fi
+        echo -e "${GREEN}✓${NC} ${AGENT_POD_COUNT} agent pod(s) running. The scheduler reconciler"
+        echo "  will rolling-replace pods with stale images (~30s cycle)."
+    else
+        echo ""
+        echo "No running agent pods. New agents will use the updated image."
     fi
 fi
 

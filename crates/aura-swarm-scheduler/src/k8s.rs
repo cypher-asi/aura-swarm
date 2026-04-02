@@ -3,6 +3,7 @@
 //! This module provides the `K8sScheduler` which manages agent pods in a
 //! Kubernetes cluster using the Kata Containers runtime for microVM isolation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use aura_swarm_store::{AgentSpec, AgentState};
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
 use crate::pod::build_pod;
-use crate::types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
+use crate::types::{ActiveAgentInfo, PodInfo, PodPhase, PodStatus, SchedulerConfig};
 use crate::{Result, SchedulerError};
 
 /// The `Scheduler` trait defines the interface for pod lifecycle management.
@@ -205,8 +206,11 @@ impl K8sScheduler {
     ///
     /// Status updates are sent to the gateway's internal endpoint via HTTP.
     pub async fn run_reconciler(&self) {
-        // Run both pod watcher and event watcher concurrently
-        tokio::join!(self.run_pod_watcher(), self.run_event_watcher());
+        tokio::join!(
+            self.run_pod_watcher(),
+            self.run_event_watcher(),
+            self.run_desired_state_reconciler(),
+        );
     }
 
     /// Watch for pod changes.
@@ -236,7 +240,8 @@ impl K8sScheduler {
                     info!("Watcher initialized, starting reconciliation");
                 }
                 Ok(watcher::Event::InitDone) => {
-                    info!("Initial reconciliation complete");
+                    info!("Initial pod watch complete, triggering desired-state sync");
+                    self.reconcile_desired_state_once().await;
                 }
                 Err(e) => {
                     error!(error = %e, "Watcher error, will retry");
@@ -351,6 +356,173 @@ impl K8sScheduler {
                 }
             }
         }
+    }
+
+    /// Periodically reconcile desired agent state against actual pods.
+    ///
+    /// Runs every 30 seconds. For each cycle it queries the gateway for agents
+    /// that should be running, lists actual pods, and:
+    /// - Creates pods for agents that are missing one
+    /// - Deletes (one at a time) pods running a stale container image so the
+    ///   next cycle recreates them with the current image
+    async fn run_desired_state_reconciler(&self) {
+        // Give the pod watcher time to populate before the first periodic tick;
+        // the initial sync is already handled via InitDone.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            self.reconcile_desired_state_once().await;
+        }
+    }
+
+    /// Run a single desired-state reconciliation pass.
+    async fn reconcile_desired_state_once(&self) {
+        let active_agents = match self.fetch_active_agents().await {
+            Ok(agents) => agents,
+            Err(e) => {
+                warn!(error = %e, "Desired-state reconciler: failed to fetch active agents from gateway");
+                return;
+            }
+        };
+
+        if active_agents.is_empty() {
+            debug!("Desired-state reconciler: no active agents reported by gateway");
+            return;
+        }
+
+        let pods = self.pods_api();
+        let params = ListParams::default().labels("app=swarm-agent");
+        let pod_list = match pods.list(&params).await {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(error = %e, "Desired-state reconciler: failed to list pods");
+                return;
+            }
+        };
+
+        // Build a map of agent_id_hex -> pod for currently existing pods
+        let mut pod_by_agent: HashMap<String, Pod> = HashMap::new();
+        for pod in pod_list.items {
+            if let Some(agent_id) = Self::extract_agent_id(&pod) {
+                pod_by_agent.insert(agent_id.to_hex(), pod);
+            }
+        }
+
+        let mut created = 0u32;
+        let mut stale_deleted = false;
+
+        for agent_info in &active_agents {
+            let agent_id = match AgentId::from_hex(&agent_info.agent_id) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            match pod_by_agent.get(&agent_info.agent_id) {
+                None => {
+                    // Pod is missing -- recreate it
+                    info!(
+                        agent_id = %agent_info.agent_id,
+                        name = %agent_info.name,
+                        "Desired-state reconciler: recreating missing pod"
+                    );
+                    if let Err(e) = self
+                        .schedule_agent(
+                            &agent_id,
+                            &agent_info.user_id,
+                            &agent_info.name,
+                            &agent_info.spec,
+                        )
+                        .await
+                    {
+                        error!(
+                            agent_id = %agent_info.agent_id,
+                            error = %e,
+                            "Desired-state reconciler: failed to recreate pod"
+                        );
+                    } else {
+                        created += 1;
+                    }
+                }
+                Some(pod) => {
+                    // Pod exists -- check for image drift (rolling, one at a time)
+                    if !stale_deleted {
+                        if let Some(true) = self.pod_has_stale_image(pod) {
+                            let pod_name = pod
+                                .metadata
+                                .name
+                                .as_deref()
+                                .unwrap_or("unknown");
+                            info!(
+                                agent_id = %agent_info.agent_id,
+                                pod_name,
+                                expected_image = %self.config.image,
+                                "Desired-state reconciler: deleting pod with stale image"
+                            );
+                            if let Err(e) = self.terminate_agent(&agent_id).await {
+                                error!(
+                                    agent_id = %agent_info.agent_id,
+                                    error = %e,
+                                    "Desired-state reconciler: failed to delete stale pod"
+                                );
+                            } else {
+                                stale_deleted = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if created > 0 || stale_deleted {
+            info!(
+                created,
+                stale_deleted,
+                "Desired-state reconciler: pass complete"
+            );
+        } else {
+            debug!("Desired-state reconciler: all pods converged");
+        }
+    }
+
+    /// Fetch the list of agents that should have running pods from the gateway.
+    async fn fetch_active_agents(&self) -> Result<Vec<ActiveAgentInfo>> {
+        let url = format!("{}/internal/agents/active", self.config.gateway_url);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| SchedulerError::Config(format!("Failed to fetch active agents: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(SchedulerError::Config(format!(
+                "Gateway returned {status} for /internal/agents/active"
+            )));
+        }
+
+        response
+            .json::<Vec<ActiveAgentInfo>>()
+            .await
+            .map_err(|e| SchedulerError::Config(format!("Failed to parse active agents: {e}")))
+    }
+
+    /// Check whether a pod's container image differs from the scheduler's
+    /// configured image. Returns `Some(true)` if stale, `Some(false)` if
+    /// current, or `None` if the image couldn't be determined.
+    fn pod_has_stale_image(&self, pod: &Pod) -> Option<bool> {
+        let container = pod
+            .spec
+            .as_ref()?
+            .containers
+            .first()?;
+        let pod_image = container.image.as_deref()?;
+        Some(pod_image != self.config.image)
     }
 
     async fn handle_pod_update(&self, pod: &Pod) {
