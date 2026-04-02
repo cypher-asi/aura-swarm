@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,10 @@ pub(crate) struct UpdateStatusRequest {
 /// `PATCH /internal/agents/:agent_id/status`
 ///
 /// Called by the scheduler to report pod status changes.
+/// Requires the internal bearer token when configured.
 pub(crate) async fn update_agent_status<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
+    headers: HeaderMap,
     Path(agent_id): Path<String>,
     Json(body): Json<UpdateStatusRequest>,
 ) -> Result<impl IntoResponse, ApiError>
@@ -43,6 +45,18 @@ where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
+    // Verify internal token when configured
+    if let Some(ref expected) = state.config.internal_token {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(token) if token == expected => {}
+            _ => return Err(ApiError::Unauthorized),
+        }
+    }
+
     let agent_id = parse_agent_id(&agent_id)?;
 
     state

@@ -27,6 +27,18 @@ fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
+fn validate_automaton_id(id: &str) -> Result<&str, ApiError> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::BadRequest(format!("invalid automaton ID: {id}")));
+    }
+    Ok(id)
+}
+
 async fn resolve_endpoint<C, V>(
     state: &GatewayState<C, V>,
     agent_id: &AgentId,
@@ -44,7 +56,10 @@ where
 
 async fn proxy_post(endpoint: &str, path: &str, body: Bytes) -> Result<Response, ApiError> {
     let url = format!("http://{endpoint}{path}");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .post(&url)
         .header("content-type", "application/json")
         .body(body)
@@ -65,7 +80,10 @@ async fn proxy_post(endpoint: &str, path: &str, body: Bytes) -> Result<Response,
 
 async fn proxy_get(endpoint: &str, path: &str) -> Result<Response, ApiError> {
     let url = format!("http://{endpoint}{path}");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .send()
@@ -90,7 +108,7 @@ async fn proxy_get(endpoint: &str, path: &str) -> Result<Response, ApiError> {
 pub(crate) async fn automaton_start<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
-    _user: AuthUser,
+    user: AuthUser,
     body: Bytes,
 ) -> Result<Response, ApiError>
 where
@@ -98,6 +116,7 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     tracing::info!(%agent_id, %endpoint, "Proxying automaton start");
     proxy_post(&endpoint, "/automaton/start", body).await
@@ -107,13 +126,15 @@ where
 pub(crate) async fn automaton_status<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path((agent_id, automaton_id)): Path<(String, String)>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_get(&endpoint, &format!("/automaton/{automaton_id}/status")).await
 }
@@ -122,13 +143,15 @@ where
 pub(crate) async fn automaton_pause<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path((agent_id, automaton_id)): Path<(String, String)>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_post(
         &endpoint,
@@ -142,13 +165,15 @@ where
 pub(crate) async fn automaton_stop<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path((agent_id, automaton_id)): Path<(String, String)>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     proxy_post(
         &endpoint,
@@ -166,7 +191,7 @@ where
 pub(crate) async fn workspace_resolve<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
-    _user: AuthUser,
+    user: AuthUser,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, ApiError>
 where
@@ -174,10 +199,14 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     let project_name = params.get("project_name").cloned().unwrap_or_default();
     let url = format!("http://{endpoint}/workspace/resolve");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .query(&[("project_name", &project_name)])
         .timeout(std::time::Duration::from_secs(15))
@@ -202,7 +231,7 @@ pub(crate) async fn automaton_events_ws<C, V>(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState<C, V>>>,
     Path((agent_id, automaton_id)): Path<(String, String)>,
-    _user: AuthUser,
+    user: AuthUser,
     headers: HeaderMap,
 ) -> Result<Response, ApiError>
 where
@@ -210,6 +239,8 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let automaton_id = validate_automaton_id(&automaton_id)?.to_string();
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
     let timeout = state.config.websocket_timeout();
 
@@ -311,4 +342,35 @@ async fn handle_automaton_ws_proxy(
     }
 
     tracing::info!(%automaton_id, "Automaton WS proxy ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_automaton_id() {
+        assert!(validate_automaton_id("abc-123_def").is_ok());
+        assert!(validate_automaton_id("a1b2c3").is_ok());
+    }
+
+    #[test]
+    fn blocks_path_traversal() {
+        assert!(validate_automaton_id("../../secret").is_err());
+        assert!(validate_automaton_id("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn blocks_special_chars() {
+        assert!(validate_automaton_id("id;rm -rf /").is_err());
+        assert!(validate_automaton_id("id&cmd").is_err());
+        assert!(validate_automaton_id("id/path").is_err());
+    }
+
+    #[test]
+    fn blocks_empty_and_long() {
+        assert!(validate_automaton_id("").is_err());
+        assert!(validate_automaton_id(&"a".repeat(65)).is_err());
+        assert!(validate_automaton_id(&"a".repeat(64)).is_ok());
+    }
 }

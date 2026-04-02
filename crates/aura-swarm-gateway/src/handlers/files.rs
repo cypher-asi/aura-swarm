@@ -43,7 +43,7 @@ pub(crate) struct ReadFileRequest {
 pub(crate) async fn list_files<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(body): Json<ListFilesRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError>
 where
@@ -51,6 +51,7 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
 
     let endpoint = state
         .control
@@ -61,7 +62,10 @@ where
     let depth = body.depth.min(20);
     let url = format!("http://{endpoint}/api/files");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let resp = client
         .get(&url)
         .query(&[("path", &body.path), ("depth", &depth.to_string())])
@@ -87,7 +91,7 @@ where
 pub(crate) async fn read_file<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(body): Json<ReadFileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError>
 where
@@ -95,6 +99,7 @@ where
     V: JwtValidator + 'static,
 {
     let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
 
     let endpoint = state
         .control
@@ -104,7 +109,10 @@ where
 
     let url = format!("http://{endpoint}/api/read-file");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let resp = client
         .get(&url)
         .query(&[("path", &body.path)])
