@@ -842,14 +842,35 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
 
             // The scheduler maps K8s "Running + Ready" to AgentState::Running,
             // but the control plane distinguishes Running (has sessions) from
-            // Idle (pod alive, no sessions).  Don't let the scheduler overwrite
+            // Idle (pod alive, no sessions). Don't let the scheduler overwrite
             // a session-driven state with a redundant pod-health signal.
-            let effective_status = if status == AgentState::Running
-                && matches!(agent.status, AgentState::Running | AgentState::Idle)
-            {
-                return Ok(false);
-            } else {
-                status
+            //
+            // Likewise, a pod disappearance for an agent that is still meant to
+            // be active (for example during image-roll convergence or an
+            // unexpected pod eviction) must not turn the logical agent into a
+            // terminal Stopped state. Keeping the current logical state lets the
+            // desired-state reconciler recreate the pod against the same AgentId
+            // and preserved PVC-backed state.
+            let effective_status = match status {
+                AgentState::Running
+                    if matches!(agent.status, AgentState::Running | AgentState::Idle) =>
+                {
+                    return Ok(false);
+                }
+                AgentState::Stopped
+                    if matches!(
+                        agent.status,
+                        AgentState::Provisioning
+                            | AgentState::Running
+                            | AgentState::Idle
+                            | AgentState::Hibernating
+                            | AgentState::Stopped
+                            | AgentState::Error
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                other => other,
             };
 
             if err_msg.is_some() || effective_status == AgentState::Error {
@@ -1436,6 +1457,115 @@ mod tests {
             .unwrap();
         let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(a.status, AgentState::Running);
+    }
+
+    #[tokio::test]
+    async fn internal_stopped_does_not_overwrite_active_agent() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Running, None)
+            .await
+            .unwrap();
+
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Stopped,
+                Some("Pod deleted".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(
+            a.status,
+            AgentState::Running,
+            "Active agents must remain eligible for pod recreation when a pod disappears"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_stopped_does_not_overwrite_idle_agent() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Stopped,
+                Some("Pod deleted".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(
+            a.status,
+            AgentState::Idle,
+            "Idle agents must keep their logical state while the scheduler recreates a missing pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_stopped_does_not_overwrite_hibernating_agent() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Hibernating)
+            .unwrap();
+
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Stopped,
+                Some("Pod deleted".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(
+            a.status,
+            AgentState::Hibernating,
+            "Hibernating agents must not be rewritten to Stopped when their pod deletion is acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_stopped_applies_for_explicit_shutdown() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Stopping)
+            .unwrap();
+
+        service
+            .update_agent_status_internal(
+                &agent.agent_id,
+                AgentState::Stopped,
+                Some("Pod deleted".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(
+            a.status,
+            AgentState::Stopped,
+            "Explicit shutdown must still complete the Stopping -> Stopped transition"
+        );
     }
 
     #[tokio::test]

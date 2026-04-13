@@ -678,8 +678,9 @@ impl K8sScheduler {
         self.endpoint_cache.remove(&agent_id);
         self.state_cache.remove(&agent_id);
 
-        // Notify gateway that pod is deleted (transition to Stopped)
-        // Note: The gateway will check if agent is hibernating and skip if so
+        // Notify the gateway that the pod disappeared. The control plane keeps
+        // active and hibernating agents in their logical states so the
+        // desired-state reconciler can recreate pods without losing AgentIds.
         if let Err(e) = self
             .notify_status_change(
                 &agent_id,
