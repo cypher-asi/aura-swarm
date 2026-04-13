@@ -9,11 +9,14 @@
 #
 # On failure, prints targeted diagnostics (pod events, PVC events, CSI logs)
 # so the operator can identify the root cause without manual kubectl triage.
+#
+# For pre/post redeploy persistence proof, use ./10-verify-redeploy.sh.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/config.env"
+# Tolerate Windows CRLF line endings in config.env when running under Bash.
+source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,7 +63,7 @@ else
             echo -e "${YELLOW}⚠${NC} ${pod_name}: could not parse digest from imageID (${image_id:-missing})"
             ((WARNINGS++)) || true
         fi
-    done <<< "${AGENT_IMAGE_ROWS}"
+    done < <(printf '%s\n' "${AGENT_IMAGE_ROWS}")
 
     DIGEST_TOTAL=${#DIGEST_COUNTS[@]}
     if [[ "${DIGEST_TOTAL}" -eq 1 ]]; then
@@ -68,7 +71,8 @@ else
             echo -e "${GREEN}✓${NC} All swarm-agent pods use digest: ${digest}"
             if [[ -n "${EXPECTED_DIGEST}" && "${EXPECTED_DIGEST}" != "${digest}" ]]; then
                 echo -e "${RED}✗${NC} ConfigMap digest (${EXPECTED_DIGEST}) does not match running pods"
-                echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
+                echo "    Remediation: wait for the scheduler reconciler (~30s per stale pod)"
+                echo "    or run ./08-deploy-k8s.sh --recreate-agents for immediate convergence"
                 ((ERRORS++)) || true
             fi
         done
@@ -77,7 +81,8 @@ else
         for digest in "${!DIGEST_COUNTS[@]}"; do
             echo "    ${digest} (${DIGEST_COUNTS[$digest]} pod(s))"
         done
-        echo "    Remediation: run ./08-deploy-k8s.sh --recreate-agents"
+        echo "    Remediation: wait for the scheduler reconciler (~30s per stale pod)"
+        echo "    or run ./08-deploy-k8s.sh --recreate-agents for immediate convergence"
         ((ERRORS++)) || true
     else
         echo -e "${YELLOW}⚠${NC} Could not parse any swarm-agent image digests"
@@ -326,6 +331,7 @@ if [[ $ERRORS -eq 0 && $WARNINGS -eq 0 ]]; then
     echo -e "${GREEN}All verifications passed!${NC}"
     echo ""
     echo "Deployment completed successfully."
+    echo "For pre/post redeploy persistence proof, run ./10-verify-redeploy.sh."
 elif [[ $ERRORS -eq 0 ]]; then
     echo -e "${YELLOW}Passed with ${WARNINGS} warning(s)${NC}"
     echo ""

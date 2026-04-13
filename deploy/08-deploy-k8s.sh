@@ -9,8 +9,9 @@
 # - Network policies
 #
 # Usage:
-#   ./08-deploy-k8s.sh              # Normal deploy (preserves data)
-#   ./08-deploy-k8s.sh --reset-data # Fresh deploy (wipes databases)
+#   ./08-deploy-k8s.sh                    # Normal deploy (preserves swarm data/IDs)
+#   ./08-deploy-k8s.sh --recreate-agents  # Same data, faster agent pod recycling
+#   ./08-deploy-k8s.sh --reset-data       # Destructive deploy (wipes databases)
 
 set -euo pipefail
 
@@ -38,8 +39,12 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --reset-data  Delete gateway and control plane databases before deploy"
             echo "                (wipes all agent records, sessions, and user data)"
-            echo "  --recreate-agents     Recreate running swarm-agent pods after deploy (default)"
-            echo "  --no-recreate-agents  Skip post-deploy swarm-agent convergence"
+            echo "  --recreate-agents     Recreate running swarm-agent pods after deploy"
+            echo "                        for immediate convergence to the new harness image"
+            echo "  --no-recreate-agents  Rely on the scheduler reconciler instead (default)"
+            echo ""
+            echo "Normal deploy preserves stored swarm data and AgentIds."
+            echo "Only --reset-data wipes the gateway/control databases."
             exit 0
             ;;
         *)
@@ -51,7 +56,8 @@ for arg in "$@"; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/config.env"
+# Tolerate Windows CRLF line endings in config.env when running under Bash.
+source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 
 # Colors for output
 RED='\033[0;31m'
@@ -86,6 +92,7 @@ ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 echo "  EFS ID: ${EFS_ID}"
 echo "  ECR Registry: ${ECR_REGISTRY}"
 echo "  Recreate running agents after deploy: ${RECREATE_AGENTS}"
+echo "  Stored swarm data: preserved unless --reset-data is used"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -445,7 +452,8 @@ else
         --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
     if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
         echo -e "${GREEN}✓${NC} ${AGENT_POD_COUNT} agent pod(s) running. The scheduler reconciler"
-        echo "  will automatically rolling-replace pods with stale images (~30s cycle)."
+        echo "  will automatically rolling-replace stale-image pods (~30s per stale pod)."
+        echo "  Use --recreate-agents if you want immediate pod recycling."
     fi
 fi
 
@@ -463,4 +471,6 @@ echo "Services:"
 kubectl get svc -n "${K8S_NAMESPACE_SYSTEM}"
 
 echo ""
-echo "Next step: Run ./09-verify.sh"
+echo "Next steps:"
+echo "  ./09-verify.sh              # Deployment health and harness digest convergence"
+echo "  ./10-verify-redeploy.sh     # Pre/post proof that active swarm IDs survive redeploy"
