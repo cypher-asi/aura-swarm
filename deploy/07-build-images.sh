@@ -14,6 +14,7 @@
 #   ./07-build-images.sh --all        # Build platform + aura-harness
 #   ./07-build-images.sh --harness    # Build aura-harness only
 #   ./07-build-images.sh --harness --refresh  # Build harness AND restart agent pods
+#   ./07-build-images.sh --harness-path PATH --aura-os-path PATH
 
 set -euo pipefail
 
@@ -33,6 +34,7 @@ DEV_MODE=false
 REFRESH_K8S=false
 REFRESH_GATEWAY_ONLY=false
 AURA_HARNESS_PATH="${PROJECT_ROOT}/../aura-harness"
+AURA_OS_PATH=""
 BUILD_HARNESS=false
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +52,10 @@ while [[ $# -gt 0 ]]; do
             AURA_HARNESS_PATH="$2"
             shift 2
             ;;
+        --aura-os-path)
+            AURA_OS_PATH="$2"
+            shift 2
+            ;;
         --dev-mode)
             DEV_MODE=true
             shift
@@ -65,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--all] [--harness] [--harness-path PATH] [--dev-mode] [--refresh] [--refresh-gateway]"
+            echo "Usage: $0 [--all] [--harness] [--harness-path PATH] [--aura-os-path PATH] [--dev-mode] [--refresh] [--refresh-gateway]"
             exit 1
             ;;
     esac
@@ -195,6 +201,22 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
         echo "Expected: ${AURA_HARNESS_PATH}/Dockerfile"
         exit 1
     fi
+
+    if [[ -z "${AURA_OS_PATH}" ]]; then
+        AURA_OS_PATH="$(cd "${AURA_HARNESS_PATH}/.." && pwd)/aura-os"
+    fi
+
+    if [[ ! -d "${AURA_OS_PATH}" ]]; then
+        echo -e "${RED}✗${NC} Aura OS not found at: ${AURA_OS_PATH}"
+        echo "Use --aura-os-path to specify the location"
+        exit 1
+    fi
+
+    if [[ ! -d "${AURA_OS_PATH}/crates/aura-protocol" ]]; then
+        echo -e "${RED}✗${NC} aura-protocol crate not found in aura-os"
+        echo "Expected: ${AURA_OS_PATH}/crates/aura-protocol"
+        exit 1
+    fi
     
     # Create ECR repo for aura-harness if it doesn't exist
     HARNESS_REPO_NAME="${RESOURCE_PREFIX}-harness"
@@ -210,9 +232,10 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
     echo "Building aura-harness image..."
     docker build \
         --no-cache \
+        -f "${AURA_HARNESS_PATH}/Dockerfile" \
         -t "${HARNESS_REPO_NAME}:${IMAGE_TAG}" \
         -t "${HARNESS_IMAGE}" \
-        "${AURA_HARNESS_PATH}"
+        "$(cd "${AURA_HARNESS_PATH}/.." && pwd)"
     
     echo -e "${GREEN}✓${NC} Built ${HARNESS_REPO_NAME}:${IMAGE_TAG}"
     
