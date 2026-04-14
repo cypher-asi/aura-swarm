@@ -124,7 +124,7 @@ Response: `204 No Content`
 
 **Start Agent**
 ```
-POST /v1/agents/{agent_id}:start
+POST /v1/agents/{agent_id}/start
 ```
 
 Response: `200 OK`
@@ -137,7 +137,7 @@ Response: `200 OK`
 
 **Stop Agent**
 ```
-POST /v1/agents/{agent_id}:stop
+POST /v1/agents/{agent_id}/stop
 ```
 
 Response: `200 OK`
@@ -150,7 +150,7 @@ Response: `200 OK`
 
 **Restart Agent**
 ```
-POST /v1/agents/{agent_id}:restart
+POST /v1/agents/{agent_id}/restart
 ```
 
 Response: `200 OK`
@@ -163,7 +163,7 @@ Response: `200 OK`
 
 **Hibernate Agent**
 ```
-POST /v1/agents/{agent_id}:hibernate
+POST /v1/agents/{agent_id}/hibernate
 ```
 
 Response: `200 OK`
@@ -176,7 +176,7 @@ Response: `200 OK`
 
 **Wake Agent**
 ```
-POST /v1/agents/{agent_id}:wake
+POST /v1/agents/{agent_id}/wake
 ```
 
 Response: `200 OK`
@@ -418,11 +418,11 @@ pub fn create_router(state: GatewayState) -> Router {
         // Agents
         .route("/v1/agents", get(list_agents).post(create_agent))
         .route("/v1/agents/:agent_id", get(get_agent).delete(delete_agent))
-        .route("/v1/agents/:agent_id:start", post(start_agent))
-        .route("/v1/agents/:agent_id:stop", post(stop_agent))
-        .route("/v1/agents/:agent_id:restart", post(restart_agent))
-        .route("/v1/agents/:agent_id:hibernate", post(hibernate_agent))
-        .route("/v1/agents/:agent_id:wake", post(wake_agent))
+        .route("/v1/agents/:agent_id/start", post(start_agent))
+        .route("/v1/agents/:agent_id/stop", post(stop_agent))
+        .route("/v1/agents/:agent_id/restart", post(restart_agent))
+        .route("/v1/agents/:agent_id/hibernate", post(hibernate_agent))
+        .route("/v1/agents/:agent_id/wake", post(wake_agent))
         
         // Sessions
         .route("/v1/agents/:agent_id/sessions", post(create_session))
@@ -516,7 +516,7 @@ async fn handle_websocket(
     session_id: String,
 ) {
     // Connect to agent
-    let agent_url = format!("ws://{}/chat", agent_endpoint);
+    let agent_url = format!("ws://{}/stream", agent_endpoint);
     let (agent_socket, _) = match connect_async(&agent_url).await {
         Ok(conn) => conn,
         Err(e) => {

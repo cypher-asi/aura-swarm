@@ -408,7 +408,7 @@ sequenceDiagram
     Client->>Gateway: WS /v1/sessions/{id}/ws
     Gateway->>Gateway: Validate session
     Gateway->>Gateway: Resolve agent endpoint
-    Gateway->>Agent: WS /chat (internal)
+    Gateway->>Agent: WS /stream (internal)
     
     loop Bidirectional
         Client->>Gateway: Message
@@ -430,7 +430,7 @@ pub async fn proxy_websocket(
     agent_endpoint: String,
 ) {
     // Connect to agent
-    let agent_url = format!("ws://{}/chat", agent_endpoint);
+    let agent_url = format!("ws://{}/stream", agent_endpoint);
     let (agent_ws, _) = match connect_async(&agent_url).await {
         Ok(conn) => conn,
         Err(e) => {

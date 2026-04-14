@@ -112,12 +112,12 @@ Agent is considered:
 
 ## 4. Interaction Contract
 
-### 4.1 WebSocket Chat Endpoint
+### 4.1 WebSocket Session Endpoint
 
 Aura must expose:
 
 ```
-WS /chat
+WS /stream
 ```
 
 This is the primary interface for user interaction.
@@ -263,28 +263,18 @@ Future commands may include:
 
 ## 6. Hibernation Contract
 
-### 6.1 Hibernate Endpoint
+### 6.1 Hibernation Trigger
 
-Control plane calls to initiate hibernation:
+The current harness router does not expose a standalone `POST /hibernate`
+endpoint. Swarm initiates hibernation through the gateway lifecycle API, and
+the scheduler/runtime are responsible for coordinating the resulting pod state
+transition.
 
-```
-POST /hibernate
-```
-
-Aura must:
+When hibernation is requested, Aura must:
 1. Complete any in-flight tool executions
 2. Close all WebSocket connections gracefully
 3. Flush all state to `/state/db/`
-4. Respond with success
-5. Exit cleanly
-
-Response:
-```json
-{
-  "status": "hibernating",
-  "state_saved": true
-}
-```
+4. Exit cleanly once the runtime is safe to suspend
 
 ### 6.2 Wake Behavior
 
@@ -422,15 +412,19 @@ pub trait Store: Send + Sync {
 
 ---
 
-## 9. HTTP Endpoints Summary
+## 9. Harness Endpoints Summary
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/health` | GET | Health check (required) |
-| `/chat` | WS | Interactive session (required) |
-| `/hibernate` | POST | Graceful hibernation (required) |
-| `/status` | GET | Detailed status (optional) |
-| `/metrics` | GET | Prometheus metrics (optional) |
+| `/stream` | WS | Interactive session stream (required) |
+| `/ws/terminal` | WS | Terminal transport |
+| `/api/files` | GET | List workspace files |
+| `/api/read-file` | GET | Read a single file |
+| `/workspace/resolve` | GET | Resolve named workspaces |
+| `/automaton/start` | POST | Start an automaton run |
+| `/automaton/:automaton_id/status` | GET | Fetch automaton status |
+| `/stream/automaton/:automaton_id` | WS | Automaton event stream |
 
 ---
 
