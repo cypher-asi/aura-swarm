@@ -1,8 +1,9 @@
 //! WebSocket proxy handler.
 //!
 //! This module provides bidirectional WebSocket proxying between clients and agent pods.
-//! The gateway is a transparent proxy -- it does not inspect, inject, or mutate any
-//! WebSocket messages. The client drives the full harness protocol end-to-end.
+//! Successful harness protocol traffic remains transparent. The gateway only emits a
+//! typed error frame when it cannot connect to the pod after the client websocket has
+//! already upgraded.
 
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ where
 /// When the proxy ends for any reason, the session is automatically closed
 /// so that the agent can transition to Idle when no sessions remain.
 async fn handle_websocket<C: ControlPlane + 'static>(
-    client_socket: WebSocket,
+    mut client_socket: WebSocket,
     agent_endpoint: String,
     session_id: SessionId,
     session_id_str: String,
@@ -110,6 +111,13 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     let Some(agent_socket) =
         connect_to_agent(&agent_url, &token, timeout, &session_id_str, &agent_id_str).await
     else {
+        send_gateway_error(
+            &mut client_socket,
+            "agent_stream_unavailable",
+            "Gateway could not connect to the remote agent stream.",
+        )
+        .await;
+        close_session_on_proxy_end(&control, &user_id_str, &session_id, &session_id_str).await;
         return;
     };
 
@@ -139,10 +147,36 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     }
 
     // Always close the session when the WebSocket proxy ends, regardless of
-    // how the connection was terminated.  This prevents orphaned Active
-    // sessions that block the Running → Idle transition.
+    // how the connection was terminated. This prevents orphaned Active
+    // sessions that block the Running -> Idle transition.
+    close_session_on_proxy_end(&control, &user_id_str, &session_id, &session_id_str).await;
+
+    tracing::info!(session_id = %session_id_str, "WebSocket proxy ended");
+}
+
+async fn send_gateway_error(socket: &mut WebSocket, code: &str, message: &str) {
+    let payload = gateway_error_payload(code, message);
+    let _ = socket.send(Message::Text(payload.to_string().into())).await;
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn gateway_error_payload(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "code": code,
+        "message": message,
+        "recoverable": true,
+    })
+}
+
+async fn close_session_on_proxy_end<C: ControlPlane + 'static>(
+    control: &Arc<C>,
+    user_id_str: &str,
+    session_id: &SessionId,
+    session_id_str: &str,
+) {
     if let Ok(user_id) = user_id_str.parse::<aura_swarm_core::UserId>() {
-        match control.close_session(&user_id, &session_id).await {
+        match control.close_session(&user_id, session_id).await {
             Ok(()) => {
                 tracing::info!(session_id = %session_id_str, "Session closed on proxy end");
             }
@@ -151,8 +185,6 @@ async fn handle_websocket<C: ControlPlane + 'static>(
             }
         }
     }
-
-    tracing::info!(session_id = %session_id_str, "WebSocket proxy ended");
 }
 
 /// Connect to the agent's WebSocket endpoint with timeout, forwarding the
@@ -173,7 +205,9 @@ async fn connect_to_agent(
     };
     request.headers_mut().insert(
         "Authorization",
-        format!("Bearer {token}").parse().expect("valid header value"),
+        format!("Bearer {token}")
+            .parse()
+            .expect("valid header value"),
     );
 
     match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request)).await {
@@ -273,4 +307,19 @@ async fn forward_agent_to_client(
 fn parse_session_id(s: &str) -> Result<SessionId, ApiError> {
     s.parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid session ID: {s}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_error_payload;
+
+    #[test]
+    fn gateway_error_payload_matches_harness_error_shape() {
+        let payload = gateway_error_payload("agent_stream_unavailable", "no stream");
+
+        assert_eq!(payload["type"], "error");
+        assert_eq!(payload["code"], "agent_stream_unavailable");
+        assert_eq!(payload["message"], "no stream");
+        assert_eq!(payload["recoverable"], true);
+    }
 }
