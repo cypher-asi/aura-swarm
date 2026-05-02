@@ -148,7 +148,7 @@ redeploy_compare_all_agent_ids() {
     local pre_agents_path="$1"
     local post_agents_path="$2"
 
-    local pre_count post_count missing unexpected metadata_changed
+    local pre_count post_count missing unexpected metadata_changed error_regressions active_regressions
     pre_count=$(jq 'length' "${pre_agents_path}")
     post_count=$(jq 'length' "${post_agents_path}")
 
@@ -170,6 +170,22 @@ redeploy_compare_all_agent_ids() {
         | select($post_by_id[.agent_id].user_id != .user_id or $post_by_id[.agent_id].name != .name)
         | .agent_id
     ')
+    error_regressions=$(jq -nr --slurpfile pre "${pre_agents_path}" --slurpfile post "${post_agents_path}" '
+        ($post[0] | map({key: .agent_id, value: .status}) | from_entries) as $post_status
+        | $pre[0][]
+        | select($post_status[.agent_id] != null)
+        | select(.status != "error" and $post_status[.agent_id] == "error")
+        | "\(.agent_id) \(.status) -> error"
+    ')
+    active_regressions=$(jq -nr --slurpfile pre "${pre_agents_path}" --slurpfile post "${post_agents_path}" '
+        def active: . == "provisioning" or . == "running" or . == "idle";
+        ($post[0] | map({key: .agent_id, value: .status}) | from_entries) as $post_status
+        | $pre[0][]
+        | select($post_status[.agent_id] != null)
+        | select(.status | active)
+        | select(($post_status[.agent_id] | active) | not)
+        | "\(.agent_id) \(.status) -> \($post_status[.agent_id])"
+    ')
 
     if [[ -n "${missing}" ]]; then
         echo -e "${RED}✗${NC} Missing persisted AgentIds after redeploy:"
@@ -186,9 +202,19 @@ redeploy_compare_all_agent_ids() {
         printf '%s\n' "${metadata_changed}" | sed 's/^/    /'
     fi
 
-    if [[ -n "${missing}" || -n "${unexpected}" ]]; then
+    if [[ -n "${error_regressions}" ]]; then
+        echo -e "${RED}✗${NC} Existing AgentIds regressed to Error during redeploy:"
+        printf '%s\n' "${error_regressions}" | sed 's/^/    /'
+    fi
+
+    if [[ -n "${active_regressions}" ]]; then
+        echo -e "${RED}✗${NC} Existing active AgentIds stopped being active during redeploy:"
+        printf '%s\n' "${active_regressions}" | sed 's/^/    /'
+    fi
+
+    if [[ -n "${missing}" || -n "${unexpected}" || -n "${error_regressions}" || -n "${active_regressions}" ]]; then
         echo ""
-        echo "Redeploy failed because persisted machine identity changed."
+        echo "Redeploy failed because persisted machine identity or lifecycle state changed unsafely."
         return 1
     fi
 
@@ -200,10 +226,25 @@ redeploy_verify_agent_ids_still_present() {
     local post_agents_path="$2"
     local label="${3:-AgentIds}"
 
-    local pre_count missing
+    local pre_count missing error_regressions active_regressions
     pre_count=$(jq 'length' "${pre_agents_path}")
     missing=$(jq -nr --slurpfile pre "${pre_agents_path}" --slurpfile post "${post_agents_path}" '
         ([$pre[0][].agent_id] - [$post[0][].agent_id])[]?
+    ')
+    error_regressions=$(jq -nr --slurpfile pre "${pre_agents_path}" --slurpfile post "${post_agents_path}" '
+        ($post[0] | map({key: .agent_id, value: .status}) | from_entries) as $post_status
+        | $pre[0][]
+        | select($post_status[.agent_id] != null)
+        | select($post_status[.agent_id] == "error")
+        | "\(.agent_id) \(.status) -> error"
+    ')
+    active_regressions=$(jq -nr --slurpfile pre "${pre_agents_path}" --slurpfile post "${post_agents_path}" '
+        def active: . == "provisioning" or . == "running" or . == "idle";
+        ($post[0] | map({key: .agent_id, value: .status}) | from_entries) as $post_status
+        | $pre[0][]
+        | select($post_status[.agent_id] != null)
+        | select(($post_status[.agent_id] | active) | not)
+        | "\(.agent_id) \(.status) -> \($post_status[.agent_id])"
     ')
 
     echo ""
@@ -213,6 +254,19 @@ redeploy_verify_agent_ids_still_present() {
     if [[ -n "${missing}" ]]; then
         echo -e "${RED}✗${NC} Missing AgentIds after redeploy:"
         printf '%s\n' "${missing}" | sed 's/^/    /'
+    fi
+
+    if [[ -n "${error_regressions}" ]]; then
+        echo -e "${RED}✗${NC} Pre-redeploy AgentIds regressed to Error:"
+        printf '%s\n' "${error_regressions}" | sed 's/^/    /'
+    fi
+
+    if [[ -n "${active_regressions}" ]]; then
+        echo -e "${RED}✗${NC} Pre-redeploy AgentIds stopped being active:"
+        printf '%s\n' "${active_regressions}" | sed 's/^/    /'
+    fi
+
+    if [[ -n "${missing}" || -n "${error_regressions}" || -n "${active_regressions}" ]]; then
         return 1
     fi
 

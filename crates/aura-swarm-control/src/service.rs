@@ -844,6 +844,14 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             // desired-state reconciler recreate the pod against the same AgentId
             // and preserved PVC-backed state.
             let effective_status = match status {
+                AgentState::Error if err_msg.is_none() => {
+                    tracing::warn!(
+                        agent_id = %aid,
+                        current_status = ?agent.status,
+                        "Ignoring scheduler Error update without an error message"
+                    );
+                    return Ok(false);
+                }
                 AgentState::Running
                     if matches!(agent.status, AgentState::Running | AgentState::Idle) =>
                 {
@@ -1579,6 +1587,27 @@ mod tests {
         let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(a.status, AgentState::Error);
         assert_eq!(a.error_message.as_deref(), Some("OOM"));
+    }
+
+    #[tokio::test]
+    async fn internal_error_without_message_is_ignored() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Idle)
+            .unwrap();
+
+        service
+            .update_agent_status_internal(&agent.agent_id, AgentState::Error, None)
+            .await
+            .unwrap();
+
+        let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
+        assert_eq!(a.status, AgentState::Idle);
+        assert_eq!(a.error_message, None);
     }
 
     #[tokio::test]

@@ -518,6 +518,16 @@ impl K8sScheduler {
             return;
         };
 
+        if Self::is_pod_recycling(pod) {
+            debug!(
+                agent_id = %agent_id,
+                "Ignoring pod status update during intentional pod recycle"
+            );
+            self.endpoint_cache.remove(&agent_id);
+            self.state_cache.remove(&agent_id);
+            return;
+        }
+
         let phase = pod
             .status
             .as_ref()
@@ -542,7 +552,11 @@ impl K8sScheduler {
                 ("Running", true) => (AgentState::Running, None),
                 ("Running", false) | ("Pending", _) => (AgentState::Provisioning, None),
                 ("Failed", _) => {
-                    let msg = pod.status.as_ref().and_then(|s| s.message.clone());
+                    let msg = pod
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.message.clone())
+                        .or_else(|| Some("Pod phase Failed".to_string()));
                     (AgentState::Error, msg)
                 }
                 ("Succeeded", _) => (AgentState::Stopped, None),
@@ -656,6 +670,18 @@ impl K8sScheduler {
         }
 
         (false, None)
+    }
+
+    fn is_pod_recycling(pod: &Pod) -> bool {
+        if pod.metadata.deletion_timestamp.is_some() {
+            return true;
+        }
+
+        pod.metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("swarm.io/recycle-reason"))
+            .is_some_and(|reason| reason == "harness-upgrade")
     }
 
     async fn handle_pod_deleted(&self, pod: &Pod) {
@@ -981,6 +1007,8 @@ mod tests {
     use super::*;
     use crate::mock_scheduler::MockScheduler;
     use aura_swarm_core::UserId;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use std::collections::BTreeMap;
 
     fn test_agent_id() -> AgentId {
         AgentId::generate()
@@ -988,6 +1016,38 @@ mod tests {
 
     fn test_spec() -> AgentSpec {
         AgentSpec::default()
+    }
+
+    #[test]
+    fn pod_with_deletion_timestamp_is_recycling() {
+        let pod = Pod {
+            metadata: kube::api::ObjectMeta {
+                deletion_timestamp: Some(Time(chrono::Utc::now())),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(K8sScheduler::is_pod_recycling(&pod));
+    }
+
+    #[test]
+    fn pod_with_harness_recycle_annotation_is_recycling() {
+        let mut annotations = BTreeMap::new();
+        annotations.insert(
+            "swarm.io/recycle-reason".to_string(),
+            "harness-upgrade".to_string(),
+        );
+
+        let pod = Pod {
+            metadata: kube::api::ObjectMeta {
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(K8sScheduler::is_pod_recycling(&pod));
     }
 
     #[tokio::test]

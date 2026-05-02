@@ -79,6 +79,7 @@ PRE_ALL_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/pre-all-agents.json"
 POST_ALL_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-all-agents.json"
 POST_ACTIVE_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-active-agents.json"
 POST_AGENT_PODS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-agent-pods.json"
+PRE_RECYCLE_ACTIVE_JSON="${REDEPLOY_VERIFY_TMP_DIR}/pre-recycle-active-agents.json"
 HAD_EXISTING_GATEWAY=false
 PRE_AGENT_SCOPE="none"
 
@@ -475,31 +476,22 @@ if [[ "${RECREATE_AGENTS}" == "true" ]]; then
     if [[ ${#RUNNING_AGENT_PODS[@]} -eq 0 ]]; then
         echo "No running swarm-agent pods found; nothing to recreate."
     else
-        echo "Deleting ${#RUNNING_AGENT_PODS[@]} agent pod(s); scheduler reconciler will recreate them..."
+        echo "Capturing active AgentIds before harness pod recycle..."
+        redeploy_snapshot_active_agents "${PRE_RECYCLE_ACTIVE_JSON}" "${PORT_FORWARD_LOG}"
+        PRE_RECYCLE_ACTIVE_COUNT=$(jq 'length' "${PRE_RECYCLE_ACTIVE_JSON}")
+        echo -e "${GREEN}✓${NC} Captured ${PRE_RECYCLE_ACTIVE_COUNT} active AgentId(s)"
+
+        echo "Marking ${#RUNNING_AGENT_PODS[@]} pod(s) for intentional harness recycle..."
+        kubectl annotate pod -n "${K8S_NAMESPACE_AGENTS}" "${RUNNING_AGENT_PODS[@]}" \
+            swarm.io/recycle-reason=harness-upgrade --overwrite
+
+        echo "Deleting ${#RUNNING_AGENT_PODS[@]} agent pod(s); scheduler reconciler will recreate the same AgentIds..."
         kubectl delete pod -n "${K8S_NAMESPACE_AGENTS}" "${RUNNING_AGENT_PODS[@]}" --wait=false
 
-        echo "Waiting for scheduler to recreate agent pods (up to 120s)..."
-        AGENT_APPEAR_TIMEOUT=120
-        AGENT_APPEAR_ELAPSED=0
-        AGENT_APPEARED=false
-        while [[ "${AGENT_APPEAR_ELAPSED}" -lt "${AGENT_APPEAR_TIMEOUT}" ]]; do
-            AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
-                --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            if [[ "${AGENT_POD_COUNT}" -gt 0 ]]; then
-                AGENT_APPEARED=true
-                break
-            fi
-            sleep 5
-            AGENT_APPEAR_ELAPSED=$((AGENT_APPEAR_ELAPSED + 5))
-        done
-
-        if [[ "${AGENT_APPEARED}" != "true" ]]; then
-            echo -e "${YELLOW}⚠${NC} No replacement pods appeared within ${AGENT_APPEAR_TIMEOUT}s."
-            echo "  The scheduler reconciler will continue trying in the background."
-            echo "  Check: kubectl logs -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-scheduler --tail=50"
-        else
-            echo -e "${GREEN}✓${NC} Agent pods are being recreated by the scheduler"
-        fi
+        redeploy_wait_for_digest_convergence \
+            "${PRE_RECYCLE_ACTIVE_JSON}" \
+            "${PRE_ALL_AGENTS_JSON}" \
+            "${POST_AGENT_PODS_JSON}"
     fi
 else
     AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
