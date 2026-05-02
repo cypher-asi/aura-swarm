@@ -194,10 +194,7 @@ mod tests {
         // For safety, only assert the error message format if it does fail.
         if let Err(e) = resolve_token(None).await {
             let msg = e.to_string();
-            assert!(
-                msg.contains("Not authenticated"),
-                "unexpected error: {msg}"
-            );
+            assert!(msg.contains("Not authenticated"), "unexpected error: {msg}");
         }
     }
 

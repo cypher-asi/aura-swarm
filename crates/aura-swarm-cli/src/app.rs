@@ -905,9 +905,7 @@ impl App {
             self.session_ids.remove(agent_id);
         }
 
-        let is_selected = self
-            .selected_agent_id()
-            .map_or(false, |id| id == agent_id);
+        let is_selected = self.selected_agent_id().map_or(false, |id| id == agent_id);
 
         if is_selected {
             return self.handle_ws_event(event);

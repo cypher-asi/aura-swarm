@@ -278,8 +278,11 @@ async fn handle_automaton_ws_proxy(
         }
     }
 
-    let agent_socket = match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request))
-        .await
+    let agent_socket = match tokio::time::timeout(
+        timeout,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
     {
         Ok(Ok((socket, _))) => socket,
         Ok(Err(e)) => {

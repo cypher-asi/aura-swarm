@@ -471,7 +471,11 @@ where
 
     // Safe: max(0) ensures non-negative
     let uptime_seconds = (Utc::now() - agent.created_at).num_seconds().max(0) as u64;
-    let active_sessions = state.control.count_active_sessions(&agent_id).await.unwrap_or(0);
+    let active_sessions = state
+        .control
+        .count_active_sessions(&agent_id)
+        .await
+        .unwrap_or(0);
 
     Ok(Json(StatusResponse {
         status: agent.status,
@@ -577,9 +581,21 @@ where
         0
     };
 
-    let isolation = agent.spec.isolation.map(|i| format!("{i:?}").to_lowercase());
-    let endpoint = state.control.resolve_agent_endpoint(&agent.agent_id).await.ok().flatten();
-    let active_sessions = state.control.count_active_sessions(&agent.agent_id).await.unwrap_or(0);
+    let isolation = agent
+        .spec
+        .isolation
+        .map(|i| format!("{i:?}").to_lowercase());
+    let endpoint = state
+        .control
+        .resolve_agent_endpoint(&agent.agent_id)
+        .await
+        .ok()
+        .flatten();
+    let active_sessions = state
+        .control
+        .count_active_sessions(&agent.agent_id)
+        .await
+        .unwrap_or(0);
 
     Ok(Json(AgentStateResponse {
         state: agent.status,

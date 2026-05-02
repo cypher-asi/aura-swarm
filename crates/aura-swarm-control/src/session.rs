@@ -4,7 +4,7 @@
 //! retrieval, and closing of sessions. Sessions are the primary way users
 //! interact with their agents.
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, SessionStatus, Store};
 use chrono::Utc;
 
@@ -215,8 +215,7 @@ mod tests {
         let (store, _dir, user_id, agent) = setup();
 
         let (session, state_change) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         assert_eq!(session.agent_id, agent.agent_id);
         assert_eq!(session.user_id, user_id);
@@ -233,8 +232,7 @@ mod tests {
         store.put_agent(&agent).unwrap();
 
         let (session, state_change) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         assert_eq!(session.status, SessionStatus::Active);
         assert_eq!(state_change, Some(AgentState::Running));
@@ -253,8 +251,7 @@ mod tests {
         store.put_agent(&agent).unwrap();
 
         let (session, state_change) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         assert_eq!(session.status, SessionStatus::Active);
         assert_eq!(state_change, Some(AgentState::Running));
@@ -265,8 +262,12 @@ mod tests {
         let (store, _dir, _user_id, agent) = setup();
         let other_user = UserId::from_uuid(uuid::Uuid::new_v4());
 
-        let result =
-            create_session(&store, &other_user, &agent.agent_id, SessionConfig::default());
+        let result = create_session(
+            &store,
+            &other_user,
+            &agent.agent_id,
+            SessionConfig::default(),
+        );
 
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
     }
@@ -279,8 +280,7 @@ mod tests {
         agent.status = AgentState::Error;
         store.put_agent(&agent).unwrap();
 
-        let result =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default());
+        let result = create_session(&store, &user_id, &agent.agent_id, SessionConfig::default());
 
         assert!(matches!(result, Err(ControlError::AgentNotRunnable(_))));
     }
@@ -291,8 +291,7 @@ mod tests {
 
         // Create a session
         let (session, _) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         // Close it
         let closed = close_session(&store, &user_id, &session.session_id).unwrap();
@@ -325,8 +324,7 @@ mod tests {
         store.put_agent(&agent).unwrap();
 
         let (session, state_change) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         assert_eq!(session.status, SessionStatus::Active);
         assert_eq!(state_change, Some(AgentState::Provisioning));
@@ -350,8 +348,7 @@ mod tests {
         let other_user = UserId::from_uuid(uuid::Uuid::new_v4());
 
         let (session, _) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         let result = get_session(&store, &other_user, &session.session_id);
         assert!(matches!(result, Err(ControlError::NotOwner { .. })));
@@ -362,8 +359,7 @@ mod tests {
         let (store, _dir, user_id, agent) = setup();
 
         let (session, _) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         let closed = close_session(&store, &user_id, &session.session_id).unwrap();
         assert!(closed);
@@ -377,11 +373,9 @@ mod tests {
         let (store, _dir, user_id, agent) = setup();
 
         let (session1, _) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
         let (_session2, _) =
-            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default())
-                .unwrap();
+            create_session(&store, &user_id, &agent.agent_id, SessionConfig::default()).unwrap();
 
         close_session(&store, &user_id, &session1.session_id).unwrap();
 

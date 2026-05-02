@@ -127,13 +127,11 @@ mod tests {
         assert!(!AuthError::InvalidToken("x".into()).is_retriable());
         assert!(!AuthError::KeyNotFound("k".into()).is_retriable());
         assert!(!AuthError::Internal("i".into()).is_retriable());
-        assert!(
-            !AuthError::ZosApi {
-                status: 500,
-                code: "err".into(),
-                message: "msg".into(),
-            }
-            .is_retriable()
-        );
+        assert!(!AuthError::ZosApi {
+            status: 500,
+            code: "err".into(),
+            message: "msg".into(),
+        }
+        .is_retriable());
     }
 }

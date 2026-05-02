@@ -132,11 +132,7 @@ impl ZosClient {
         Err(self.map_error_response(status.as_u16(), response).await)
     }
 
-    async fn map_error_response(
-        &self,
-        status: u16,
-        response: reqwest::Response,
-    ) -> AuthError {
+    async fn map_error_response(&self, status: u16, response: reqwest::Response) -> AuthError {
         let error_body: Option<ZosErrorResponse> = response.json().await.ok();
         let code = error_body
             .as_ref()

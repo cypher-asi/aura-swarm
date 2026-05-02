@@ -86,13 +86,25 @@ mod tests {
     #[test]
     fn all_error_variants_status_codes() {
         assert_eq!(make_kube_api_error().http_status_code(), 503);
-        assert_eq!(SchedulerError::PodNotFound("x".into()).http_status_code(), 404);
-        assert_eq!(SchedulerError::PodCreationFailed("x".into()).http_status_code(), 500);
+        assert_eq!(
+            SchedulerError::PodNotFound("x".into()).http_status_code(),
+            404
+        );
+        assert_eq!(
+            SchedulerError::PodCreationFailed("x".into()).http_status_code(),
+            500
+        );
         assert_eq!(SchedulerError::Timeout("x".into()).http_status_code(), 503);
-        assert_eq!(SchedulerError::InvalidAgentId("x".into()).http_status_code(), 400);
+        assert_eq!(
+            SchedulerError::InvalidAgentId("x".into()).http_status_code(),
+            400
+        );
         assert_eq!(SchedulerError::Config("x".into()).http_status_code(), 400);
         assert_eq!(make_store_error().http_status_code(), 503);
-        assert_eq!(SchedulerError::HealthCheckFailed("x".into()).http_status_code(), 503);
+        assert_eq!(
+            SchedulerError::HealthCheckFailed("x".into()).http_status_code(),
+            503
+        );
     }
 
     #[test]

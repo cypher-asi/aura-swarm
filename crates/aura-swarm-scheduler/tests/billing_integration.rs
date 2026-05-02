@@ -11,8 +11,7 @@ use aura_swarm_scheduler::{ComputeUsageReporter, SchedulerBillingConfig};
 use serde_json::json;
 
 fn billing_url() -> String {
-    std::env::var("Z_BILLING_URL")
-        .unwrap_or_else(|_| "https://z-billing.onrender.com".to_string())
+    std::env::var("Z_BILLING_URL").unwrap_or_else(|_| "https://z-billing.onrender.com".to_string())
 }
 
 fn service_api_key() -> String {
@@ -175,7 +174,10 @@ mod live {
 
     #[tokio::test]
     async fn reporter_reports_compute_usage() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let user_uuid = unique_user_uuid();
         let agent_uuid = unique_user_uuid();
         create_funded_account(&user_uuid, 10000)
@@ -192,7 +194,10 @@ mod live {
 
     #[tokio::test]
     async fn reporter_reports_multiple_pods() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let user_uuid_1 = unique_user_uuid();
         let user_uuid_2 = unique_user_uuid();
         let agent_uuid_1 = unique_user_uuid();
@@ -216,7 +221,10 @@ mod live {
 
     #[tokio::test]
     async fn full_compute_usage_flow() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let user_uuid = unique_user_uuid();
         let agent_uuid_1 = unique_user_uuid();
         let agent_uuid_2 = unique_user_uuid();

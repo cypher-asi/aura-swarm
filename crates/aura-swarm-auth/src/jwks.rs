@@ -177,11 +177,9 @@ impl JwksProvider {
                     .as_ref()
                     .ok_or_else(|| AuthError::InvalidToken("missing e parameter".to_string()))?;
 
-                Ok(Some(
-                    DecodingKey::from_rsa_components(n, e).map_err(|e| {
-                        AuthError::InvalidToken(format!("invalid RSA key: {e}"))
-                    })?,
-                ))
+                Ok(Some(DecodingKey::from_rsa_components(n, e).map_err(
+                    |e| AuthError::InvalidToken(format!("invalid RSA key: {e}")),
+                )?))
             }
             other => {
                 tracing::warn!(kty = other, "Unknown key type");

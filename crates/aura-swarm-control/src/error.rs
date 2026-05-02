@@ -3,7 +3,7 @@
 //! This module defines all errors that can occur during agent lifecycle
 //! and session management operations.
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 use aura_swarm_store::AgentState;
 use thiserror::Error;
 
@@ -151,19 +151,11 @@ mod tests {
             404
         );
         assert_eq!(
-            ControlError::QuotaExceeded {
-                user_id,
-                limit: 10
-            }
-            .http_status_code(),
+            ControlError::QuotaExceeded { user_id, limit: 10 }.http_status_code(),
             429
         );
         assert_eq!(
-            ControlError::NotOwner {
-                user_id,
-                agent_id
-            }
-            .http_status_code(),
+            ControlError::NotOwner { user_id, agent_id }.http_status_code(),
             403
         );
         assert_eq!(
@@ -187,20 +179,8 @@ mod tests {
             (ControlError::AgentNotFound(agent_id), 404),
             (ControlError::AgentAlreadyExists { agent_id }, 409),
             (ControlError::SessionNotFound(session_id), 404),
-            (
-                ControlError::QuotaExceeded {
-                    user_id,
-                    limit: 10,
-                },
-                429,
-            ),
-            (
-                ControlError::NotOwner {
-                    user_id,
-                    agent_id,
-                },
-                403,
-            ),
+            (ControlError::QuotaExceeded { user_id, limit: 10 }, 429),
+            (ControlError::NotOwner { user_id, agent_id }, 403),
             (
                 ControlError::InvalidState {
                     agent_id,
@@ -220,9 +200,7 @@ mod tests {
             ),
             (ControlError::BillingAccountNotFound, 402),
             (
-                ControlError::Store(aura_swarm_store::StoreError::Database(
-                    "test".to_string(),
-                )),
+                ControlError::Store(aura_swarm_store::StoreError::Database("test".to_string())),
                 500,
             ),
             (
@@ -248,30 +226,19 @@ mod tests {
         let session_id = SessionId::generate();
 
         let retriable = vec![
-            ControlError::Store(aura_swarm_store::StoreError::Database(
-                "test".to_string(),
-            )),
+            ControlError::Store(aura_swarm_store::StoreError::Database("test".to_string())),
             ControlError::Internal("test".to_string()),
         ];
         for error in &retriable {
-            assert!(
-                error.is_retriable(),
-                "{error} should be retriable"
-            );
+            assert!(error.is_retriable(), "{error} should be retriable");
         }
 
         let not_retriable = vec![
             ControlError::AgentNotFound(agent_id),
             ControlError::AgentAlreadyExists { agent_id },
             ControlError::SessionNotFound(session_id),
-            ControlError::QuotaExceeded {
-                user_id,
-                limit: 10,
-            },
-            ControlError::NotOwner {
-                user_id,
-                agent_id,
-            },
+            ControlError::QuotaExceeded { user_id, limit: 10 },
+            ControlError::NotOwner { user_id, agent_id },
             ControlError::InvalidState {
                 agent_id,
                 from: AgentState::Running,
@@ -287,10 +254,7 @@ mod tests {
             ControlError::Auth(aura_swarm_auth::AuthError::TokenExpired),
         ];
         for error in &not_retriable {
-            assert!(
-                !error.is_retriable(),
-                "{error} should NOT be retriable"
-            );
+            assert!(!error.is_retriable(), "{error} should NOT be retriable");
         }
     }
 }

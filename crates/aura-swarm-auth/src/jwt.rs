@@ -266,8 +266,7 @@ impl JwtValidator for ZosTokenValidator {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::Internal("zOS response missing 'id' field".to_string()))?;
 
-        let user_id =
-            UserId::from_str(user_id_str).map_err(|_| AuthError::InvalidUserId)?;
+        let user_id = UserId::from_str(user_id_str).map_err(|_| AuthError::InvalidUserId)?;
 
         // Decode exp from JWT payload (no signature check — zOS already validated)
         let expires_at = {

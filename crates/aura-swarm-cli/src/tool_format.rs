@@ -400,7 +400,10 @@ mod tests {
         let args = serde_json::json!({"a": 1});
         let out = format_tool_args("my_tool", &args);
         assert!(out.contains("my_tool"), "output: {out}");
-        assert!(out.contains(r#""a":1"#) || out.contains(r#""a": 1"#), "output: {out}");
+        assert!(
+            out.contains(r#""a":1"#) || out.contains(r#""a": 1"#),
+            "output: {out}"
+        );
     }
 
     #[test]

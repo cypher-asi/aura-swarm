@@ -88,5 +88,5 @@ pub use service::{ControlPlane, ControlPlaneService};
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 
 // Re-export commonly used types from dependencies for convenience
-pub use aura_swarm_core::{AgentId, UserId, SessionId};
+pub use aura_swarm_core::{AgentId, SessionId, UserId};
 pub use aura_swarm_store::{Agent, AgentSpec, AgentState, Session, SessionConfig, SessionStatus};

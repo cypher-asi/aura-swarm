@@ -200,9 +200,7 @@ async fn ws_reader(
         match result {
             Ok(Message::Text(text)) => {
                 if let Ok(msg) = serde_json::from_str::<OutboundMessage>(&text) {
-                    if let Some(event) =
-                        outbound_message_to_event(msg, &mut current_tool_name)
-                    {
+                    if let Some(event) = outbound_message_to_event(msg, &mut current_tool_name) {
                         let _ = tx.send(event).await;
                     }
                 } else {
@@ -264,8 +262,8 @@ fn outbound_message_to_event(
             result,
             is_error,
         }),
-        OutboundMessage::AssistantMessageEnd(end) => Some(WsEvent::TurnComplete(
-            TurnCompleteInfo {
+        OutboundMessage::AssistantMessageEnd(end) => {
+            Some(WsEvent::TurnComplete(TurnCompleteInfo {
                 steps: 0,
                 input_tokens: end.usage.input_tokens,
                 output_tokens: end.usage.output_tokens,
@@ -275,8 +273,8 @@ fn outbound_message_to_event(
                     Some(end.usage.model)
                 },
                 stop_reason: Some(end.stop_reason),
-            },
-        )),
+            }))
+        }
         OutboundMessage::Error(err) => Some(WsEvent::Error {
             message: err.message,
             code: Some(err.code),

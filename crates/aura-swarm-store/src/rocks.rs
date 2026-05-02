@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, MultiThreaded,
     Options, WriteBatch,

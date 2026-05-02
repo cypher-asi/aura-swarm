@@ -43,9 +43,7 @@ impl SwarmClient {
         base_url: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, SwarmClientError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -177,10 +175,7 @@ impl SwarmClient {
     /// # Errors
     ///
     /// Returns an error if the agent is not found or cannot be deleted.
-    pub async fn delete_remote_agent(
-        &self,
-        remote_agent_id: &str,
-    ) -> Result<(), SwarmClientError> {
+    pub async fn delete_remote_agent(&self, remote_agent_id: &str) -> Result<(), SwarmClientError> {
         let url = format!("{}/v1/agents/{}", self.base_url, remote_agent_id);
 
         let response = self
@@ -241,10 +236,7 @@ impl SwarmClient {
         remote_agent_id: &str,
         config: CreateSessionRequest,
     ) -> Result<CreateSessionResponse, SwarmClientError> {
-        let url = format!(
-            "{}/v1/agents/{}/sessions",
-            self.base_url, remote_agent_id
-        );
+        let url = format!("{}/v1/agents/{}/sessions", self.base_url, remote_agent_id);
 
         let response = self
             .client
@@ -269,10 +261,7 @@ impl SwarmClient {
     /// # Errors
     ///
     /// Returns an error if the session is not found or the request fails.
-    pub async fn get_session(
-        &self,
-        session_id: &str,
-    ) -> Result<SessionResponse, SwarmClientError> {
+    pub async fn get_session(&self, session_id: &str) -> Result<SessionResponse, SwarmClientError> {
         let url = format!("{}/v1/sessions/{}", self.base_url, session_id);
 
         let response = self
@@ -301,10 +290,7 @@ impl SwarmClient {
         &self,
         remote_agent_id: &str,
     ) -> Result<Vec<SessionResponse>, SwarmClientError> {
-        let url = format!(
-            "{}/v1/agents/{}/sessions",
-            self.base_url, remote_agent_id
-        );
+        let url = format!("{}/v1/agents/{}/sessions", self.base_url, remote_agent_id);
 
         let response = self
             .client
@@ -382,8 +368,9 @@ impl SwarmClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token))
-                .map_err(|e| SwarmClientError::Parse(format!("invalid authorization header: {e}")))?,
+            HeaderValue::from_str(&format!("Bearer {}", self.token)).map_err(|e| {
+                SwarmClientError::Parse(format!("invalid authorization header: {e}"))
+            })?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(headers)
@@ -479,15 +466,13 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/v1/agents"))
-                .respond_with(
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                        "agent_id": "abc",
-                        "name": "test",
-                        "status": "provisioning",
-                        "created_at": "2026-01-01T00:00:00Z",
-                        "updated_at": "2026-01-01T00:00:00Z"
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "agent_id": "abc",
+                    "name": "test",
+                    "status": "provisioning",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -505,15 +490,13 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/v1/agents/agent-42"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "agent_id": "agent-42",
-                        "name": "test",
-                        "status": "running",
-                        "created_at": "2026-01-01T00:00:00Z",
-                        "updated_at": "2026-01-01T00:00:00Z"
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "agent_id": "agent-42",
+                    "name": "test",
+                    "status": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -529,8 +512,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/v1/agents"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({ "agents": [] })),
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "agents": [] })),
                 )
                 .expect(1)
                 .mount(&server)
@@ -560,13 +542,11 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/v1/agents/agent-42/state"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "state": "running",
-                        "uptime_seconds": 120,
-                        "active_sessions": 1
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "state": "running",
+                    "uptime_seconds": 120,
+                    "active_sessions": 1
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -582,14 +562,12 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/v1/agents/agent-42/sessions"))
-                .respond_with(
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                        "session_id": "sess-1",
-                        "agent_id": "agent-42",
-                        "ws_url": "/v1/sessions/sess-1/ws",
-                        "created_at": "2026-01-01T00:00:00Z"
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "session_id": "sess-1",
+                    "agent_id": "agent-42",
+                    "ws_url": "/v1/sessions/sess-1/ws",
+                    "created_at": "2026-01-01T00:00:00Z"
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -607,14 +585,12 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/v1/sessions/sess-1"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "session_id": "sess-1",
-                        "agent_id": "agent-42",
-                        "status": "active",
-                        "created_at": "2026-01-01T00:00:00Z"
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "session_id": "sess-1",
+                    "agent_id": "agent-42",
+                    "status": "active",
+                    "created_at": "2026-01-01T00:00:00Z"
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -630,8 +606,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/v1/agents/agent-42/sessions"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({ "sessions": [] })),
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "sessions": [] })),
                 )
                 .expect(1)
                 .mount(&server)
@@ -661,14 +636,12 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/v1/agents/missing"))
-                .respond_with(
-                    ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                        "error": {
-                            "code": "not_found",
-                            "message": "Agent not found"
-                        }
-                    })),
-                )
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {
+                        "code": "not_found",
+                        "message": "Agent not found"
+                    }
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;

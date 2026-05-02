@@ -106,7 +106,9 @@ impl BillingChecker {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| BillingCheckError::ServiceError(format!("failed to create HTTP client: {e}")))?;
+            .map_err(|e| {
+                BillingCheckError::ServiceError(format!("failed to create HTTP client: {e}"))
+            })?;
         Ok(Self { http, config })
     }
 

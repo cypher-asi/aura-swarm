@@ -130,9 +130,7 @@ async fn connect_to_runtime() -> Result<
 
 /// Send a session_init, wait for session_ready, then send a user_message
 /// and collect all OutboundMessage until assistant_message_end or error.
-async fn send_prompt_and_collect(
-    prompt: &str,
-) -> Result<(Vec<OutboundMessage>, String), String> {
+async fn send_prompt_and_collect(prompt: &str) -> Result<(Vec<OutboundMessage>, String), String> {
     let ws_stream = connect_to_runtime().await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -152,7 +150,11 @@ async fn send_prompt_and_collect(
                 return Err(format!("Expected session_ready, got: {text}"));
             }
         }
-        other => return Err(format!("Unexpected response waiting for session_ready: {other:?}")),
+        other => {
+            return Err(format!(
+                "Unexpected response waiting for session_ready: {other:?}"
+            ))
+        }
     }
 
     // 3. Send user_message
@@ -178,7 +180,9 @@ async fn send_prompt_and_collect(
                             OutboundMessage::TextDelta { text: ref delta } => {
                                 text_buffer.push_str(delta);
                             }
-                            OutboundMessage::ThinkingDelta { thinking: ref delta } => {
+                            OutboundMessage::ThinkingDelta {
+                                thinking: ref delta,
+                            } => {
                                 text_buffer.push_str(delta);
                             }
                             _ => {}
@@ -186,8 +190,7 @@ async fn send_prompt_and_collect(
 
                         let is_terminal = matches!(
                             &msg,
-                            OutboundMessage::AssistantMessageEnd(_)
-                                | OutboundMessage::Error(_)
+                            OutboundMessage::AssistantMessageEnd(_) | OutboundMessage::Error(_)
                         );
 
                         messages.push(msg);
@@ -293,7 +296,10 @@ async fn test_connection() {
                         }
                         OutboundMessage::TextDelta { text: delta } => {
                             if message_count <= 3 {
-                                println!("  [{message_count:>3}] TextDelta (+{} chars)", delta.len());
+                                println!(
+                                    "  [{message_count:>3}] TextDelta (+{} chars)",
+                                    delta.len()
+                                );
                             }
                         }
                         _ => {
@@ -458,7 +464,10 @@ async fn test_cancellation() {
         match timeout(Duration::from_secs(2), read.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 if let Ok(msg) = serde_json::from_str::<OutboundMessage>(&text) {
-                    if matches!(msg, OutboundMessage::AssistantMessageEnd(_) | OutboundMessage::Error(_)) {
+                    if matches!(
+                        msg,
+                        OutboundMessage::AssistantMessageEnd(_) | OutboundMessage::Error(_)
+                    ) {
                         println!("OK Stream ended after cancel");
                         break;
                     }

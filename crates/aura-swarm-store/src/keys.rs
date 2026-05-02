@@ -10,7 +10,7 @@
 //! - `agent_session_key`: 32 bytes (AgentId + SessionId)
 //! - `user_key`: 16 bytes (UserId)
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 
 /// Encode an agent key (just the agent ID bytes).
 #[must_use]

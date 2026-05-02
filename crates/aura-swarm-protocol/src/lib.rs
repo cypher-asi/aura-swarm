@@ -241,7 +241,9 @@ mod tests {
 
     #[test]
     fn user_message_serializes() {
-        let msg = InboundMessage::UserMessage { content: "Hello".into() };
+        let msg = InboundMessage::UserMessage {
+            content: "Hello".into(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"user_message\""));
         assert!(json.contains("\"content\":\"Hello\""));
@@ -340,7 +342,8 @@ mod tests {
 
     #[test]
     fn heartbeat_deserializes() {
-        let json = r#"{"type":"tool_result","name":"fs_read","result":"contents","is_error":false}"#;
+        let json =
+            r#"{"type":"tool_result","name":"fs_read","result":"contents","is_error":false}"#;
         let msg: OutboundMessage = serde_json::from_str(json).unwrap();
         match msg {
             OutboundMessage::ToolResult {

@@ -44,9 +44,7 @@ impl GatewayClient {
     /// * `base_url` - Base URL of the gateway (e.g., "http://localhost:8080")
     /// * `token` - JWT token for authentication
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),

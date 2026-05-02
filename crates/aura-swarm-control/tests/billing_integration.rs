@@ -17,8 +17,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn billing_url() -> String {
-    std::env::var("Z_BILLING_URL")
-        .unwrap_or_else(|_| "https://z-billing.onrender.com".to_string())
+    std::env::var("Z_BILLING_URL").unwrap_or_else(|_| "https://z-billing.onrender.com".to_string())
 }
 
 fn service_api_key() -> String {
@@ -180,9 +179,14 @@ mod live {
 
     #[tokio::test]
     async fn billing_checker_sufficient_balance() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let user_uuid = unique_user_uuid();
-        create_funded_account(&user_uuid, 10000).await.expect("Failed to create test account");
+        create_funded_account(&user_uuid, 10000)
+            .await
+            .expect("Failed to create test account");
 
         let checker = BillingChecker::new(test_billing_config()).unwrap();
         assert!(checker.is_enabled());
@@ -196,9 +200,14 @@ mod live {
 
     #[tokio::test]
     async fn billing_checker_insufficient_balance() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let user_uuid = unique_user_uuid();
-        create_funded_account(&user_uuid, 50).await.expect("Failed to create test account");
+        create_funded_account(&user_uuid, 50)
+            .await
+            .expect("Failed to create test account");
 
         let checker = BillingChecker::new(test_billing_config()).unwrap();
 
@@ -209,60 +218,101 @@ mod live {
         );
 
         let result = checker.check_session_credits(&user_uuid).await;
-        assert!(result.is_ok(), "check_session_credits should pass: {result:?}");
+        assert!(
+            result.is_ok(),
+            "check_session_credits should pass: {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn control_plane_with_billing_checks_balance() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let (user_id, user_str) = unique_user_id_and_str();
-        create_funded_account(&user_str, 10000).await.expect("Failed to create test account");
+        create_funded_account(&user_str, 10000)
+            .await
+            .expect("Failed to create test account");
 
         let billing = Arc::new(BillingChecker::new(test_billing_config()).unwrap());
         let (store, _temp_dir) = setup_store();
 
         let service: ControlPlaneService<RocksStore, NoopSchedulerClient> =
-            ControlPlaneService::with_integrations(store, ControlConfig::default(), None, Some(billing));
+            ControlPlaneService::with_integrations(
+                store,
+                ControlConfig::default(),
+                None,
+                Some(billing),
+            );
 
-        let result = service.create_agent(&user_id, CreateAgentRequest::new("test-agent")).await;
+        let result = service
+            .create_agent(&user_id, CreateAgentRequest::new("test-agent"))
+            .await;
         assert!(result.is_ok(), "create_agent failed: {result:?}");
     }
 
     #[tokio::test]
     async fn control_plane_rejects_agent_with_insufficient_balance() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let (user_id, user_str) = unique_user_id_and_str();
-        create_funded_account(&user_str, 50).await.expect("Failed to create test account");
+        create_funded_account(&user_str, 50)
+            .await
+            .expect("Failed to create test account");
 
         let billing = Arc::new(BillingChecker::new(test_billing_config()).unwrap());
         let (store, _temp_dir) = setup_store();
 
         let service: ControlPlaneService<RocksStore, NoopSchedulerClient> =
-            ControlPlaneService::with_integrations(store, ControlConfig::default(), None, Some(billing));
+            ControlPlaneService::with_integrations(
+                store,
+                ControlConfig::default(),
+                None,
+                Some(billing),
+            );
 
-        let result = service.create_agent(&user_id, CreateAgentRequest::new("test-agent")).await;
+        let result = service
+            .create_agent(&user_id, CreateAgentRequest::new("test-agent"))
+            .await;
         assert!(result.is_err(), "Expected error for insufficient balance");
         assert_eq!(result.unwrap_err().http_status_code(), 402);
     }
 
     #[tokio::test]
     async fn control_plane_session_checks_balance() {
-        if !has_billing_keys() { println!("skipped: Z_BILLING_API_KEY not set"); return; }
+        if !has_billing_keys() {
+            println!("skipped: Z_BILLING_API_KEY not set");
+            return;
+        }
         let (user_id, user_str) = unique_user_id_and_str();
-        create_funded_account(&user_str, 10000).await.expect("Failed to create test account");
+        create_funded_account(&user_str, 10000)
+            .await
+            .expect("Failed to create test account");
 
         let billing = Arc::new(BillingChecker::new(test_billing_config()).unwrap());
         let (store, _temp_dir) = setup_store();
 
         let service: ControlPlaneService<RocksStore, NoopSchedulerClient> =
-            ControlPlaneService::with_integrations(store.clone(), ControlConfig::default(), None, Some(billing));
+            ControlPlaneService::with_integrations(
+                store.clone(),
+                ControlConfig::default(),
+                None,
+                Some(billing),
+            );
 
         let request = CreateAgentRequest::new("test-agent");
         let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
         Store::update_agent_status(&*store, &agent.agent_id, AgentState::Running).unwrap();
 
         let result = service
-            .create_session(&user_id, &agent.agent_id, aura_swarm_store::SessionConfig::default())
+            .create_session(
+                &user_id,
+                &agent.agent_id,
+                aura_swarm_store::SessionConfig::default(),
+            )
             .await;
         assert!(result.is_ok(), "create_session failed: {result:?}");
     }

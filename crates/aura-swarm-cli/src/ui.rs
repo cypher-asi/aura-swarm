@@ -734,7 +734,10 @@ mod tests {
         let long_line = "a".repeat(160);
         let text = Text::from(long_line);
         let count = calculate_wrapped_line_count(&text, 80);
-        assert!(count >= 4, "160 chars / 80 width = 2 wrapped + extra + margin = >= 4, got {count}");
+        assert!(
+            count >= 4,
+            "160 chars / 80 width = 2 wrapped + extra + margin = >= 4, got {count}"
+        );
     }
 
     #[test]

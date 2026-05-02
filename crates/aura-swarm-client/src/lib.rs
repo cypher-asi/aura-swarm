@@ -44,7 +44,6 @@ pub use client::SwarmClient;
 pub use error::SwarmClientError;
 pub use types::{
     CreateRemoteAgentRequest, CreateSessionRequest, CreateSessionResponse,
-    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentSpec,
-    RemoteAgentState, RemoteAgentStateResponse, RemoteIsolationLevel, SessionConfig,
-    SessionResponse, SessionStatus,
+    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentSpec, RemoteAgentState,
+    RemoteAgentStateResponse, RemoteIsolationLevel, SessionConfig, SessionResponse, SessionStatus,
 };

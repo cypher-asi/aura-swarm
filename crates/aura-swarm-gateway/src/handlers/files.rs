@@ -29,8 +29,12 @@ pub(crate) struct ListFilesRequest {
     depth: usize,
 }
 
-fn default_path() -> String { ".".into() }
-fn default_depth() -> usize { 3 }
+fn default_path() -> String {
+    ".".into()
+}
+fn default_depth() -> usize {
+    3
+}
 
 #[derive(serde::Deserialize)]
 pub(crate) struct ReadFileRequest {

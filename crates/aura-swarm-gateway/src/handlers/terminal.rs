@@ -55,9 +55,7 @@ where
     let agent_id_str = agent_id.to_string();
     let token = user.token;
 
-    Ok(ws.on_upgrade(move |socket| {
-        proxy_terminal(socket, endpoint, agent_id_str, token, timeout)
-    }))
+    Ok(ws.on_upgrade(move |socket| proxy_terminal(socket, endpoint, agent_id_str, token, timeout)))
 }
 
 async fn proxy_terminal(
@@ -78,32 +76,30 @@ async fn proxy_terminal(
     };
     request.headers_mut().insert(
         "Authorization",
-        format!("Bearer {token}").parse().expect("valid header value"),
+        format!("Bearer {token}")
+            .parse()
+            .expect("valid header value"),
     );
 
-    let agent_socket = match tokio::time::timeout(
-        timeout,
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    {
-        Ok(Ok((socket, _))) => socket,
-        Ok(Err(e)) => {
-            tracing::error!(
-                agent_id = %agent_id_str,
-                error = %e,
-                "Failed to connect to agent terminal"
-            );
-            return;
-        }
-        Err(_) => {
-            tracing::error!(
-                agent_id = %agent_id_str,
-                "Timeout connecting to agent terminal"
-            );
-            return;
-        }
-    };
+    let agent_socket =
+        match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(request)).await {
+            Ok(Ok((socket, _))) => socket,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    agent_id = %agent_id_str,
+                    error = %e,
+                    "Failed to connect to agent terminal"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::error!(
+                    agent_id = %agent_id_str,
+                    "Timeout connecting to agent terminal"
+                );
+                return;
+            }
+        };
 
     tracing::info!(agent_id = %agent_id_str, "Terminal WS proxy started");
 

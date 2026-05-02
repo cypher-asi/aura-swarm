@@ -352,7 +352,10 @@ mod tests {
 
     #[test]
     fn remote_isolation_level_default() {
-        assert_eq!(RemoteIsolationLevel::default(), RemoteIsolationLevel::MicroVm);
+        assert_eq!(
+            RemoteIsolationLevel::default(),
+            RemoteIsolationLevel::MicroVm
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub use types::{
     SessionStatus, User, WorkspaceConfig,
 };
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 
 /// The storage trait defining all database operations.
 ///

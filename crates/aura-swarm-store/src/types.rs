@@ -2,7 +2,7 @@
 //!
 //! These types represent the persisted state of agents, sessions, and users.
 
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 pub use aura_swarm_protocol::ExternalToolDef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

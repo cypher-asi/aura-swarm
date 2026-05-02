@@ -574,7 +574,10 @@ async fn create_session_success() {
     resp.assert_status(axum::http::StatusCode::CREATED);
     let body: Value = resp.json();
     assert!(body.get("session_id").is_some());
-    assert!(body["ws_url"].as_str().unwrap().starts_with("/v1/sessions/"));
+    assert!(body["ws_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("/v1/sessions/"));
     assert!(body["ws_url"].as_str().unwrap().ends_with("/ws"));
 }
 
