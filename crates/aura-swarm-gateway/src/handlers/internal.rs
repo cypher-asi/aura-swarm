@@ -74,14 +74,26 @@ pub(crate) async fn internal_health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
-/// Compact representation of an active agent for the scheduler reconciler.
+/// Compact representation of an agent for internal reconciliation and deploy checks.
 #[derive(Debug, Serialize)]
-pub(crate) struct ActiveAgentEntry {
+pub(crate) struct InternalAgentEntry {
     pub agent_id: String,
     pub user_id: String,
     pub name: String,
     pub status: AgentState,
     pub spec: aura_swarm_store::AgentSpec,
+}
+
+impl From<aura_swarm_store::Agent> for InternalAgentEntry {
+    fn from(agent: aura_swarm_store::Agent) -> Self {
+        Self {
+            agent_id: agent.agent_id.to_hex(),
+            user_id: agent.user_id.to_string(),
+            name: agent.name,
+            status: agent.status,
+            spec: agent.spec,
+        }
+    }
 }
 
 /// `GET /internal/agents/active`
@@ -98,16 +110,26 @@ where
 {
     let agents = state.control.list_active_agents().await?;
 
-    let entries: Vec<ActiveAgentEntry> = agents
-        .into_iter()
-        .map(|a| ActiveAgentEntry {
-            agent_id: a.agent_id.to_hex(),
-            user_id: a.user_id.to_string(),
-            name: a.name,
-            status: a.status,
-            spec: a.spec,
-        })
-        .collect();
+    let entries: Vec<InternalAgentEntry> =
+        agents.into_iter().map(InternalAgentEntry::from).collect();
+
+    Ok(Json(entries))
+}
+
+/// `GET /internal/agents/all`
+///
+/// Returns every persisted agent so deploy verification can prove machine IDs
+/// are preserved across redeploy, including inactive lifecycle states.
+pub(crate) async fn list_all_agents<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agents = state.control.list_all_agents().await?;
+    let entries: Vec<InternalAgentEntry> =
+        agents.into_iter().map(InternalAgentEntry::from).collect();
 
     Ok(Json(entries))
 }

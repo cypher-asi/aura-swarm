@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_swarm_core::{AgentId, UserId, SessionId};
+use aura_swarm_core::{AgentId, SessionId, UserId};
 use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, SessionStatus, Store};
 use chrono::Utc;
 
@@ -116,11 +116,7 @@ pub trait ControlPlane: Send + Sync {
     async fn close_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<()>;
 
     /// List all sessions for an agent.
-    async fn list_sessions(
-        &self,
-        user_id: &UserId,
-        agent_id: &AgentId,
-    ) -> Result<Vec<Session>>;
+    async fn list_sessions(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Vec<Session>>;
 
     // =========================================================================
     // Operational
@@ -182,6 +178,12 @@ pub trait ControlPlane: Send + Sync {
     /// the scheduler's desired-state reconciliation loop to detect missing
     /// or stale pods.
     async fn list_active_agents(&self) -> Result<Vec<Agent>>;
+
+    /// List every persisted agent regardless of lifecycle state.
+    ///
+    /// Used by deploy verification to prove that redeploys preserved machine
+    /// identities, including hibernating, stopped, and error agents.
+    async fn list_all_agents(&self) -> Result<Vec<Agent>>;
 }
 
 /// The main control plane service implementation.
@@ -396,10 +398,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         if let Some(ref supplied_id) = request.agent_id {
             let check_id = *supplied_id;
             let check_uid = uid;
-            let existing = blocking_store(&self.store, move |s| {
-                Ok(s.get_agent(&check_id)?)
-            })
-            .await?;
+            let existing =
+                blocking_store(&self.store, move |s| Ok(s.get_agent(&check_id)?)).await?;
 
             if let Some(agent) = existing {
                 if agent.user_id == check_uid {
@@ -410,9 +410,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
                     );
                     return Ok((agent, false));
                 }
-                return Err(ControlError::AgentAlreadyExists {
-                    agent_id: check_id,
-                });
+                return Err(ControlError::AgentAlreadyExists { agent_id: check_id });
             }
         }
 
@@ -427,9 +425,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
 
             let now = Utc::now();
             let spec = request.spec.unwrap_or_default();
-            let agent_id = request
-                .agent_id
-                .unwrap_or_else(AgentId::generate);
+            let agent_id = request.agent_id.unwrap_or_else(AgentId::generate);
 
             let agent = Agent {
                 agent_id,
@@ -522,7 +518,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     async fn start_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
         let mut agent = self.get_and_verify(user_id, agent_id).await?;
 
-        self.transition_state(&mut agent, AgentState::Provisioning).await?;
+        self.transition_state(&mut agent, AgentState::Provisioning)
+            .await?;
 
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
@@ -562,7 +559,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         })
         .await?;
 
-        self.transition_state(&mut agent, AgentState::Stopping).await?;
+        self.transition_state(&mut agent, AgentState::Stopping)
+            .await?;
 
         if let Err(e) = self.terminate_agent_pod(agent_id).await {
             tracing::error!(
@@ -580,8 +578,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     async fn restart_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent> {
         let mut agent = self.stop_agent(user_id, agent_id).await?;
 
-        self.transition_state(&mut agent, AgentState::Stopped).await?;
-        self.transition_state(&mut agent, AgentState::Provisioning).await?;
+        self.transition_state(&mut agent, AgentState::Stopped)
+            .await?;
+        self.transition_state(&mut agent, AgentState::Provisioning)
+            .await?;
 
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
@@ -621,7 +621,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         })
         .await?;
 
-        self.transition_state(&mut agent, AgentState::Hibernating).await?;
+        self.transition_state(&mut agent, AgentState::Hibernating)
+            .await?;
 
         if let Err(e) = self.terminate_agent_pod(agent_id).await {
             tracing::error!(
@@ -647,7 +648,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             });
         }
 
-        self.transition_state(&mut agent, AgentState::Provisioning).await?;
+        self.transition_state(&mut agent, AgentState::Provisioning)
+            .await?;
 
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
@@ -683,11 +685,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
 
         let uid = *user_id;
         let aid = *agent_id;
-        let (session, state_change) =
-            blocking_store(&self.store, move |s| {
-                session::create_session(s, &uid, &aid, config)
-            })
-            .await?;
+        let (session, state_change) = blocking_store(&self.store, move |s| {
+            session::create_session(s, &uid, &aid, config)
+        })
+        .await?;
 
         tracing::info!(
             session_id = %session.session_id,
@@ -718,11 +719,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         Ok(())
     }
 
-    async fn list_sessions(
-        &self,
-        user_id: &UserId,
-        agent_id: &AgentId,
-    ) -> Result<Vec<Session>> {
+    async fn list_sessions(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Vec<Session>> {
         let uid = *user_id;
         let aid = *agent_id;
         blocking_store(&self.store, move |s| session::list_sessions(s, &uid, &aid)).await
@@ -792,9 +789,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     async fn process_heartbeat(&self, agent_id: &AgentId) -> Result<()> {
         let aid = *agent_id;
         blocking_store(&self.store, move |s| {
-            let mut agent = s
-                .get_agent(&aid)?
-                .ok_or(ControlError::AgentNotFound(aid))?;
+            let mut agent = s.get_agent(&aid)?.ok_or(ControlError::AgentNotFound(aid))?;
 
             agent.last_heartbeat_at = Some(Utc::now());
             agent.updated_at = Utc::now();
@@ -811,8 +806,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
     async fn resolve_agent_endpoint(&self, agent_id: &AgentId) -> Result<Option<String>> {
         let aid = *agent_id;
         let agent = blocking_store(&self.store, move |s| {
-            s.get_agent(&aid)?
-                .ok_or(ControlError::AgentNotFound(aid))
+            s.get_agent(&aid)?.ok_or(ControlError::AgentNotFound(aid))
         })
         .await?;
 
@@ -836,9 +830,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         let aid = *agent_id;
         let err_msg = error_message.clone();
         let applied = blocking_store(&self.store, move |s| {
-            let agent = s
-                .get_agent(&aid)?
-                .ok_or(ControlError::AgentNotFound(aid))?;
+            let agent = s.get_agent(&aid)?.ok_or(ControlError::AgentNotFound(aid))?;
 
             // The scheduler maps K8s "Running + Ready" to AgentState::Running,
             // but the control plane distinguishes Running (has sessions) from
@@ -908,6 +900,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             Ok(agents)
         })
         .await
+    }
+
+    async fn list_all_agents(&self) -> Result<Vec<Agent>> {
+        blocking_store(&self.store, move |s| Ok(s.list_all_agents()?)).await
     }
 }
 
@@ -1067,10 +1063,7 @@ mod tests {
         assert_eq!(agent.status, AgentState::Hibernating);
 
         // Wake (goes through Provisioning for scheduler)
-        let agent = service
-            .wake_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let agent = service.wake_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(agent.status, AgentState::Provisioning);
 
         // Simulate provisioning complete
@@ -1080,10 +1073,7 @@ mod tests {
             .unwrap();
 
         // Stop
-        let agent = service
-            .stop_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let agent = service.stop_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(agent.status, AgentState::Stopping);
 
         // Simulate stop complete
@@ -1162,10 +1152,7 @@ mod tests {
             .unwrap();
 
         // Agent should transition to Idle
-        let agent = service
-            .get_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let agent = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(agent.status, AgentState::Idle);
     }
 
@@ -1294,10 +1281,7 @@ mod tests {
             .update_agent_status(&agent.agent_id, AgentState::Running)
             .unwrap();
 
-        let agent = service
-            .stop_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let agent = service.stop_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(agent.status, AgentState::Stopping);
     }
 
@@ -1358,10 +1342,7 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = service
-            .get_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let updated = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(updated.status, AgentState::Running);
     }
 
@@ -1392,10 +1373,7 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = service
-            .get_agent(&user_id, &agent.agent_id)
-            .await
-            .unwrap();
+        let updated = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(updated.status, AgentState::Error);
         assert_eq!(updated.error_message.as_deref(), Some("pod crashed"));
     }
@@ -1425,7 +1403,10 @@ mod tests {
         assert_eq!(a.status, AgentState::Running);
 
         // Control plane transitions to Idle (last session closed)
-        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Idle)
+            .unwrap();
         let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
         assert_eq!(a.status, AgentState::Idle);
 
@@ -1435,7 +1416,11 @@ mod tests {
             .await
             .unwrap();
         let a = service.get_agent(&user_id, &agent.agent_id).await.unwrap();
-        assert_eq!(a.status, AgentState::Idle, "Idle must not be overwritten by scheduler Running");
+        assert_eq!(
+            a.status,
+            AgentState::Idle,
+            "Idle must not be overwritten by scheduler Running"
+        );
     }
 
     #[tokio::test]
@@ -1493,7 +1478,10 @@ mod tests {
 
         let request = CreateAgentRequest::new("test-agent");
         let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
-        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Idle)
+            .unwrap();
 
         service
             .update_agent_status_internal(
@@ -1574,7 +1562,10 @@ mod tests {
 
         let request = CreateAgentRequest::new("test-agent");
         let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
-        service.store.update_agent_status(&agent.agent_id, AgentState::Idle).unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Idle)
+            .unwrap();
 
         // Error should always go through regardless of current state
         service
@@ -1597,7 +1588,10 @@ mod tests {
         let request = CreateAgentRequest::new("test-agent");
         let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
 
-        let count = service.count_active_sessions(&agent.agent_id).await.unwrap();
+        let count = service
+            .count_active_sessions(&agent.agent_id)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1615,8 +1609,14 @@ mod tests {
             .unwrap();
 
         // Force both to Running (simulating scheduler push)
-        service.store.update_agent_status(&a1.agent_id, AgentState::Running).unwrap();
-        service.store.update_agent_status(&a2.agent_id, AgentState::Running).unwrap();
+        service
+            .store
+            .update_agent_status(&a1.agent_id, AgentState::Running)
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&a2.agent_id, AgentState::Running)
+            .unwrap();
 
         let reconciled = service.reconcile_idle_agents().await.unwrap();
         assert_eq!(reconciled, 2);
@@ -1637,7 +1637,10 @@ mod tests {
             .unwrap();
 
         // Force to Running and create a session (simulating an orphan)
-        service.store.update_agent_status(&agent.agent_id, AgentState::Running).unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
         let sess = service
             .create_session(&user_id, &agent.agent_id, Default::default())
             .await
@@ -1651,7 +1654,10 @@ mod tests {
         assert_eq!(a.status, AgentState::Idle);
 
         // Session should be closed
-        let s = service.get_session(&user_id, &sess.session_id).await.unwrap();
+        let s = service
+            .get_session(&user_id, &sess.session_id)
+            .await
+            .unwrap();
         assert_eq!(s.status, SessionStatus::Closed);
     }
 }

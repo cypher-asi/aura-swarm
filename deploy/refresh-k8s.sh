@@ -31,6 +31,7 @@ echo ""
 # Parse arguments - which services to restart
 SERVICES=()
 REFRESH_AGENTS=false
+REFRESH_FAILED=false
 
 for arg in "$@"; do
     case $arg in
@@ -67,6 +68,7 @@ if [[ ${#SERVICES[@]} -gt 0 ]]; then
             echo -e "${GREEN}✓${NC} Triggered restart for ${DEPLOYMENT}"
         else
             echo -e "${RED}✗${NC} Failed to restart ${DEPLOYMENT}"
+            REFRESH_FAILED=true
         fi
     done
 
@@ -86,7 +88,8 @@ if [[ ${#SERVICES[@]} -gt 0 ]]; then
         if kubectl rollout status deployment/${DEPLOYMENT} -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s; then
             echo -e "${GREEN}✓${NC} ${DEPLOYMENT} is ready"
         else
-            echo -e "${YELLOW}⚠${NC} ${DEPLOYMENT} rollout timed out or failed"
+            echo -e "${RED}✗${NC} ${DEPLOYMENT} rollout timed out or failed"
+            REFRESH_FAILED=true
         fi
     done
 
@@ -128,8 +131,14 @@ if [[ "$REFRESH_AGENTS" == "true" ]]; then
     # new AURA_HARNESS_IMAGE from the ConfigMap. It will then detect image
     # drift on existing agent pods and rolling-replace them automatically.
     echo "Restarting scheduler to trigger agent pod convergence..."
-    kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" || true
-    kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
+    if ! kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}"; then
+        echo -e "${RED}✗${NC} Failed to restart aura-swarm-scheduler"
+        REFRESH_FAILED=true
+    fi
+    if ! kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s; then
+        echo -e "${RED}✗${NC} aura-swarm-scheduler rollout timed out or failed"
+        REFRESH_FAILED=true
+    fi
     
     AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
         --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
@@ -145,4 +154,9 @@ if [[ "$REFRESH_AGENTS" == "true" ]]; then
 fi
 
 echo ""
+if [[ "${REFRESH_FAILED}" == "true" ]]; then
+    echo -e "${RED}Refresh failed. See rollout errors above.${NC}"
+    exit 1
+fi
+
 echo -e "${GREEN}Refresh complete!${NC}"

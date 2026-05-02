@@ -262,8 +262,9 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
         echo -e "${GREEN}✓${NC} Resolved digest: ${HARNESS_DIGEST}"
         echo -e "${GREEN}✓${NC} Persisted deploy state: ${HARNESS_STATE_FILE}"
     else
-        echo -e "${YELLOW}⚠${NC} Unable to resolve digest for ${HARNESS_IMAGE}"
-        echo "  Deploy will fall back to tag unless a digest is provided later."
+        echo -e "${RED}✗${NC} Unable to resolve digest for ${HARNESS_IMAGE}"
+        echo "  Refusing to continue because redeploy verification requires an immutable harness digest."
+        exit 1
     fi
 fi
 
@@ -318,7 +319,7 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
         for service in "${REFRESH_SERVICES[@]}"; do
             DEPLOYMENT="aura-swarm-${service}"
             echo "Restarting ${DEPLOYMENT}..."
-            kubectl rollout restart deployment/${DEPLOYMENT} -n "${K8S_NAMESPACE_SYSTEM}" || true
+            kubectl rollout restart deployment/${DEPLOYMENT} -n "${K8S_NAMESPACE_SYSTEM}"
         done
         
         echo ""
@@ -328,7 +329,7 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
         for service in "${REFRESH_SERVICES[@]}"; do
             DEPLOYMENT="aura-swarm-${service}"
             echo "Waiting for ${DEPLOYMENT}..."
-            kubectl rollout status deployment/${DEPLOYMENT} -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
+            kubectl rollout status deployment/${DEPLOYMENT} -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s
         done
         
         echo ""
@@ -352,8 +353,8 @@ if [[ "$REFRESH_K8S" == "true" ]]; then
         # Its desired-state reconciler will detect image drift on existing
         # agent pods and rolling-replace them automatically.
         echo "Restarting scheduler to pick up new harness image..."
-        kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" || true
-        kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
+        kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}"
+        kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s
         
         AGENT_POD_COUNT=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
             --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")

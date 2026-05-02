@@ -67,6 +67,7 @@ done
 
 # Tolerate Windows CRLF line endings in config.env when running under Bash.
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
+source "${SCRIPT_DIR}/_redeploy_verify.sh"
 
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -369,13 +370,24 @@ echo ""
 
 PRE_ACTIVE_JSON="${TMP_DIR}/pre-active-agents.json"
 POST_ACTIVE_JSON="${TMP_DIR}/post-active-agents.json"
+PRE_ALL_JSON="${TMP_DIR}/pre-all-agents.json"
+POST_ALL_JSON="${TMP_DIR}/post-all-agents.json"
 PRE_PODS_JSON="${TMP_DIR}/pre-agent-pods.json"
 POST_PODS_JSON="${TMP_DIR}/post-agent-pods.json"
+PRE_AGENT_SCOPE="all"
 
 echo "Capturing pre-redeploy snapshots..."
 snapshot_active_agents "${PRE_ACTIVE_JSON}"
+if redeploy_snapshot_all_agents "${PRE_ALL_JSON}" "${PORT_FORWARD_LOG}"; then
+    PRE_AGENT_SCOPE="all"
+else
+    echo -e "${YELLOW}⚠${NC} Existing gateway does not expose /internal/agents/all."
+    echo "    Falling back to active AgentId preservation for this first upgraded deploy."
+    cp "${PRE_ACTIVE_JSON}" "${PRE_ALL_JSON}"
+    PRE_AGENT_SCOPE="active"
+fi
 snapshot_agent_pods "${PRE_PODS_JSON}"
-echo -e "${GREEN}✓${NC} Captured pre-redeploy active agents and pod state"
+echo -e "${GREEN}✓${NC} Captured pre-redeploy persisted agents, active agents, and pod state"
 
 if [[ "${RUN_DEPLOY}" == "true" ]]; then
     echo ""
@@ -386,13 +398,19 @@ fi
 echo ""
 echo "Capturing post-redeploy snapshots..."
 snapshot_active_agents "${POST_ACTIVE_JSON}"
+redeploy_snapshot_all_agents "${POST_ALL_JSON}" "${PORT_FORWARD_LOG}"
 
-wait_for_digest_convergence "${POST_ACTIVE_JSON}" "${POST_PODS_JSON}"
+redeploy_wait_for_digest_convergence "${POST_ACTIVE_JSON}" "${POST_ALL_JSON}" "${POST_PODS_JSON}"
 
 echo ""
 echo "Running final deployment health verification..."
 "${SCRIPT_DIR}/09-verify.sh"
 
+if [[ "${PRE_AGENT_SCOPE}" == "all" ]]; then
+    redeploy_compare_all_agent_ids "${PRE_ALL_JSON}" "${POST_ALL_JSON}"
+else
+    redeploy_verify_agent_ids_still_present "${PRE_ALL_JSON}" "${POST_ALL_JSON}" "Active AgentId"
+fi
 compare_active_agents "${PRE_ACTIVE_JSON}" "${POST_ACTIVE_JSON}" "${PRE_PODS_JSON}" "${POST_PODS_JSON}"
 
 EXPECTED_DIGEST=$(get_expected_harness_digest || true)

@@ -103,20 +103,11 @@ fn build_metadata(
 ) -> ObjectMeta {
     let mut labels = BTreeMap::new();
     labels.insert("app".to_string(), "swarm-agent".to_string());
-    labels.insert(
-        "swarm.io/agent-id".to_string(),
-        agent_id_hex.to_string(),
-    );
+    labels.insert("swarm.io/agent-id".to_string(), agent_id_hex.to_string());
 
     let mut annotations = BTreeMap::new();
-    annotations.insert(
-        "swarm.io/agent-name".to_string(),
-        agent_name.to_string(),
-    );
-    annotations.insert(
-        "swarm.io/pod-id".to_string(),
-        pod_id.to_string(),
-    );
+    annotations.insert("swarm.io/agent-name".to_string(), agent_name.to_string());
+    annotations.insert("swarm.io/pod-id".to_string(), pod_id.to_string());
     annotations.insert(
         "swarm.io/created-at".to_string(),
         chrono::Utc::now().to_rfc3339(),
@@ -186,14 +177,20 @@ fn build_container(
 /// Name of the Kubernetes secret containing LLM API keys.
 const LLM_SECRETS_NAME: &str = "aura-swarm-secrets";
 
-fn build_env_vars(
-    agent_id_hex: &str,
-    user_id_hex: &str,
-    config: &SchedulerConfig,
-) -> Vec<EnvVar> {
+fn build_env_vars(agent_id_hex: &str, user_id_hex: &str, config: &SchedulerConfig) -> Vec<EnvVar> {
     vec![
         EnvVar {
             name: "AGENT_ID".to_string(),
+            value: Some(agent_id_hex.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "MACHINE_ID".to_string(),
+            value: Some(agent_id_hex.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_MACHINE_ID".to_string(),
             value: Some(agent_id_hex.to_string()),
             ..Default::default()
         },
@@ -459,6 +456,8 @@ mod tests {
         let env = container.env.as_ref().unwrap();
         let env_names: Vec<_> = env.iter().map(|e| e.name.as_str()).collect();
         assert!(env_names.contains(&"AGENT_ID"));
+        assert!(env_names.contains(&"MACHINE_ID"));
+        assert!(env_names.contains(&"AURA_MACHINE_ID"));
         assert!(env_names.contains(&"USER_ID"));
         assert!(env_names.contains(&"STATE_DIR"));
         assert!(env_names.contains(&"AURA_LISTEN_ADDR"));
@@ -541,5 +540,4 @@ mod tests {
 
         assert_eq!(pod_spec.runtime_class_name, None);
     }
-
 }

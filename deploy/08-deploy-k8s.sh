@@ -58,6 +58,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Tolerate Windows CRLF line endings in config.env when running under Bash.
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
+source "${SCRIPT_DIR}/_redeploy_verify.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -69,6 +70,24 @@ echo "=============================================="
 echo "  Aura Swarm - Deploy Kubernetes Manifests"
 echo "=============================================="
 echo ""
+
+redeploy_require_tools
+
+REDEPLOY_VERIFY_TMP_DIR=$(mktemp -d)
+PORT_FORWARD_LOG="${REDEPLOY_VERIFY_TMP_DIR}/port-forward.log"
+PRE_ALL_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/pre-all-agents.json"
+POST_ALL_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-all-agents.json"
+POST_ACTIVE_AGENTS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-active-agents.json"
+POST_AGENT_PODS_JSON="${REDEPLOY_VERIFY_TMP_DIR}/post-agent-pods.json"
+HAD_EXISTING_GATEWAY=false
+PRE_AGENT_SCOPE="none"
+
+cleanup() {
+    redeploy_stop_port_forward
+    rm -rf "${DEPLOY_TMP_DIR:-}" "${REDEPLOY_VERIFY_TMP_DIR:-}"
+}
+
+trap cleanup EXIT
 
 cd "${SCRIPT_DIR}/terraform"
 
@@ -150,7 +169,6 @@ echo "Updating Kubernetes manifests..."
 
 # Copy manifests to a temp directory so we never modify the tracked originals
 DEPLOY_TMP_DIR=$(mktemp -d)
-trap "rm -rf '${DEPLOY_TMP_DIR}'" EXIT
 cp "${K8S_DIR}"/*.yaml "${DEPLOY_TMP_DIR}/"
 
 # Update storage class with EFS ID
@@ -181,11 +199,20 @@ if [[ -z "${PINNED_HARNESS_IMAGE}" ]]; then
 fi
 
 if [[ -z "${PINNED_HARNESS_IMAGE}" ]]; then
-    echo -e "${YELLOW}⚠${NC} Could not resolve harness digest; using mutable tag reference"
-    PINNED_HARNESS_IMAGE="${HARNESS_IMAGE}"
-else
-    echo -e "${GREEN}✓${NC} Using pinned harness image: ${PINNED_HARNESS_IMAGE}"
+    echo -e "${RED}✗${NC} Could not resolve immutable harness digest for deploy."
+    echo "    Refusing to deploy with mutable tag: ${HARNESS_IMAGE}"
+    echo "    Run ./07-build-images.sh --harness or set AURA_HARNESS_IMAGE to an image@sha256 digest."
+    exit 1
 fi
+
+if [[ ! "${PINNED_HARNESS_IMAGE}" =~ @sha256:[a-f0-9]{64}$ ]]; then
+    echo -e "${RED}✗${NC} AURA_HARNESS_IMAGE must be pinned to an immutable digest."
+    echo "    Got: ${PINNED_HARNESS_IMAGE}"
+    echo "    Expected format: ${ECR_REGISTRY}/${RESOURCE_PREFIX}-harness@sha256:<64 hex chars>"
+    exit 1
+fi
+
+echo -e "${GREEN}✓${NC} Using pinned harness image: ${PINNED_HARNESS_IMAGE}"
 
 sed -i "s|REPLACE_WITH_ECR_REGISTRY/RESOURCE_PREFIX-runtime:v0.1.0|${RUNTIME_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
 sed -i "s|ECR_REGISTRY/RESOURCE_PREFIX-harness:IMAGE_TAG|${PINNED_HARNESS_IMAGE}|g" "${DEPLOY_TMP_DIR}/03-secrets.yaml" 2>/dev/null || true
@@ -212,6 +239,33 @@ done
 
 echo -e "${GREEN}✓${NC} Manifests updated"
 echo ""
+
+#------------------------------------------------------------------------------
+# Pre-redeploy identity snapshot
+#------------------------------------------------------------------------------
+
+if [[ "${RESET_DATA}" != "true" ]]; then
+    if kubectl get svc aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
+        echo "Capturing persisted machine IDs before redeploy..."
+        HAD_EXISTING_GATEWAY=true
+        if redeploy_snapshot_all_agents "${PRE_ALL_AGENTS_JSON}" "${PORT_FORWARD_LOG}"; then
+            PRE_AGENT_SCOPE="all"
+        else
+            echo -e "${YELLOW}⚠${NC} Existing gateway does not expose /internal/agents/all."
+            echo "    Falling back to active AgentId snapshot for this first upgraded deploy."
+            echo "    Future redeploys will verify the exact all-agent ID set."
+            redeploy_snapshot_active_agents "${PRE_ALL_AGENTS_JSON}" "${PORT_FORWARD_LOG}"
+            PRE_AGENT_SCOPE="active"
+        fi
+        PRE_AGENT_COUNT=$(jq 'length' "${PRE_ALL_AGENTS_JSON}")
+        echo -e "${GREEN}✓${NC} Captured ${PRE_AGENT_COUNT} pre-redeploy AgentId(s) (scope=${PRE_AGENT_SCOPE})"
+        echo ""
+    else
+        echo -e "${YELLOW}⚠${NC} Existing gateway service not found; treating this as an initial deploy."
+        echo "[]" > "${PRE_ALL_AGENTS_JSON}"
+        echo ""
+    fi
+fi
 
 #------------------------------------------------------------------------------
 # Reset data (if requested)
@@ -395,9 +449,9 @@ kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYST
 echo "Waiting for deployments to be ready..."
 echo ""
 
-kubectl rollout status deployment/aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
-kubectl rollout status deployment/aura-swarm-control -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
-kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s || true
+kubectl rollout status deployment/aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s
+kubectl rollout status deployment/aura-swarm-control -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s
+kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s
 
 echo ""
 
@@ -458,6 +512,37 @@ else
 fi
 
 echo ""
+
+#------------------------------------------------------------------------------
+# Strict redeploy verification
+#------------------------------------------------------------------------------
+
+if [[ "${RESET_DATA}" != "true" ]]; then
+    echo "Running strict redeploy verification..."
+    redeploy_snapshot_all_agents "${POST_ALL_AGENTS_JSON}" "${PORT_FORWARD_LOG}"
+
+    if [[ "${HAD_EXISTING_GATEWAY}" == "true" ]]; then
+        if [[ "${PRE_AGENT_SCOPE}" == "all" ]]; then
+            redeploy_compare_all_agent_ids "${PRE_ALL_AGENTS_JSON}" "${POST_ALL_AGENTS_JSON}"
+        else
+            redeploy_verify_agent_ids_still_present \
+                "${PRE_ALL_AGENTS_JSON}" \
+                "${POST_ALL_AGENTS_JSON}" \
+                "Active AgentId"
+        fi
+    else
+        POST_AGENT_COUNT=$(jq 'length' "${POST_ALL_AGENTS_JSON}")
+        echo -e "${GREEN}✓${NC} Initial deploy has ${POST_AGENT_COUNT} persisted AgentId(s)"
+    fi
+
+    redeploy_snapshot_active_agents "${POST_ACTIVE_AGENTS_JSON}" "${PORT_FORWARD_LOG}"
+    redeploy_wait_for_digest_convergence \
+        "${POST_ACTIVE_AGENTS_JSON}" \
+        "${POST_ALL_AGENTS_JSON}" \
+        "${POST_AGENT_PODS_JSON}"
+    echo ""
+fi
+
 echo -e "${GREEN}=============================================="
 echo "  Kubernetes resources deployed!"
 echo "==============================================${NC}"

@@ -293,16 +293,15 @@ impl K8sScheduler {
             return;
         }
 
-        // Get the involved pod name
         let involved = &event.involved_object;
+        if involved.kind.as_deref() != Some("Pod") {
+            return;
+        }
+
+        // Get the involved pod name
         let Some(ref pod_name) = involved.name else {
             return;
         };
-
-        // Only process events for our agent pods
-        if !pod_name.starts_with("agent-") {
-            return;
-        }
 
         let reason = event.reason.as_deref().unwrap_or("Unknown");
         let message = event.message.as_deref().unwrap_or("No message");
@@ -322,8 +321,8 @@ impl K8sScheduler {
                 reason, message, "Pod creation error detected from event"
             );
 
-            // Pod name is truncated (agent-{first 16 hex chars}), so we need to
-            // fetch the pod to get the full agent ID from the annotation
+            // Pod names are based on user-provided agent names, so use labels
+            // instead of name prefixes to identify swarm-agent pods.
             let agent_id = match self.pods_api().get_opt(pod_name).await {
                 Ok(Some(pod)) => Self::extract_agent_id(&pod),
                 Ok(None) => {
@@ -451,11 +450,7 @@ impl K8sScheduler {
                     // Pod exists -- check for image drift (rolling, one at a time)
                     if !stale_deleted {
                         if let Some(true) = self.pod_has_stale_image(pod) {
-                            let pod_name = pod
-                                .metadata
-                                .name
-                                .as_deref()
-                                .unwrap_or("unknown");
+                            let pod_name = pod.metadata.name.as_deref().unwrap_or("unknown");
                             info!(
                                 agent_id = %agent_info.agent_id,
                                 pod_name,
@@ -480,8 +475,7 @@ impl K8sScheduler {
         if created > 0 || stale_deleted {
             info!(
                 created,
-                stale_deleted,
-                "Desired-state reconciler: pass complete"
+                stale_deleted, "Desired-state reconciler: pass complete"
             );
         } else {
             debug!("Desired-state reconciler: all pods converged");
@@ -492,12 +486,10 @@ impl K8sScheduler {
     async fn fetch_active_agents(&self) -> Result<Vec<ActiveAgentInfo>> {
         let url = format!("{}/internal/agents/active", self.config.gateway_url);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SchedulerError::Config(format!("Failed to fetch active agents: {e}")))?;
+        let response =
+            self.http_client.get(&url).send().await.map_err(|e| {
+                SchedulerError::Config(format!("Failed to fetch active agents: {e}"))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -516,11 +508,7 @@ impl K8sScheduler {
     /// configured image. Returns `Some(true)` if stale, `Some(false)` if
     /// current, or `None` if the image couldn't be determined.
     fn pod_has_stale_image(&self, pod: &Pod) -> Option<bool> {
-        let container = pod
-            .spec
-            .as_ref()?
-            .containers
-            .first()?;
+        let container = pod.spec.as_ref()?.containers.first()?;
         let pod_image = container.image.as_deref()?;
         Some(pod_image != self.config.image)
     }
