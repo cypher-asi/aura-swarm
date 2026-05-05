@@ -22,9 +22,39 @@ redeploy_require_command() {
 
 redeploy_require_tools() {
     local cmd
-    for cmd in kubectl jq curl; do
+    for cmd in kubectl jq curl base64; do
         redeploy_require_command "$cmd"
     done
+}
+
+redeploy_internal_token() {
+    if [[ -n "${INTERNAL_TOKEN:-}" ]]; then
+        printf '%s' "${INTERNAL_TOKEN}"
+        return 0
+    fi
+
+    local encoded
+    encoded=$(kubectl get secret aura-swarm-secrets -n "${K8S_NAMESPACE_SYSTEM}" \
+        -o jsonpath='{.data.INTERNAL_TOKEN}' 2>/dev/null || true)
+    if [[ -z "${encoded}" ]]; then
+        return 1
+    fi
+
+    printf '%s' "${encoded}" | base64 --decode
+}
+
+redeploy_internal_get() {
+    local endpoint="$1"
+    local token
+
+    if ! token="$(redeploy_internal_token)"; then
+        echo -e "${RED}✗${NC} Missing INTERNAL_TOKEN for gateway internal API."
+        echo "    Create .secrets/INTERNAL_TOKEN or ensure the swarm-system/aura-swarm-secrets secret exists."
+        return 1
+    fi
+
+    curl -fsS -H "Authorization: Bearer ${token}" \
+        "http://127.0.0.1:${PORT_FORWARD_PORT}${endpoint}"
 }
 
 redeploy_stop_port_forward() {
@@ -49,7 +79,7 @@ redeploy_start_port_forward() {
         PORT_FORWARD_PID=$!
 
         for _ in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:${PORT_FORWARD_PORT}/internal/health" >/dev/null 2>&1; then
+            if redeploy_internal_get "/internal/health" >/dev/null 2>&1; then
                 return 0
             fi
             if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
@@ -75,7 +105,7 @@ redeploy_snapshot_internal_agents() {
 
     redeploy_start_port_forward "${log_path}"
     set +e
-    curl -fsS "http://127.0.0.1:${PORT_FORWARD_PORT}${endpoint}" \
+    redeploy_internal_get "${endpoint}" \
         | jq -S 'sort_by(.agent_id)' > "${output_path}"
     rc=$?
     set -e

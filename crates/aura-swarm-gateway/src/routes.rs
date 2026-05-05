@@ -60,7 +60,7 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/automaton/:automaton_id/stop` - Stop
 /// - `GET /v1/agents/:agent_id/stream/automaton/:automaton_id` - Event stream WS
 ///
-/// ## Internal (no auth, cluster-only)
+/// ## Internal (service-token authenticated, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
 /// - `GET /internal/agents/active` - List agents expected to have pods (scheduler reconciler)
 /// - `GET /internal/agents/all` - List all persisted agents (deploy verification)
@@ -177,7 +177,7 @@ where
             "/v1/agents/:agent_id/stream/automaton/:automaton_id",
             get(automaton::automaton_events_ws::<C, V>),
         )
-        // Internal endpoints (no auth required - protected by network policies)
+        // Internal endpoints (service-token authenticated; not user API)
         .route(
             "/internal/agents/:agent_id/status",
             patch(internal::update_agent_status::<C, V>),
@@ -190,7 +190,7 @@ where
             "/internal/agents/all",
             get(internal::list_all_agents::<C, V>),
         )
-        .route("/internal/health", get(internal::internal_health))
+        .route("/internal/health", get(internal::internal_health::<C, V>))
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

@@ -486,10 +486,13 @@ impl K8sScheduler {
     async fn fetch_active_agents(&self) -> Result<Vec<ActiveAgentInfo>> {
         let url = format!("{}/internal/agents/active", self.config.gateway_url);
 
-        let response =
-            self.http_client.get(&url).send().await.map_err(|e| {
-                SchedulerError::Config(format!("Failed to fetch active agents: {e}"))
-            })?;
+        let response = self
+            .http_client
+            .get(&url)
+            .bearer_auth(&self.config.gateway_token)
+            .send()
+            .await
+            .map_err(|e| SchedulerError::Config(format!("Failed to fetch active agents: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();

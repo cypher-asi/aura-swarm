@@ -138,11 +138,15 @@ ANTHROPIC_API_KEY=$(load_secret "ANTHROPIC_API_KEY")
 OPENAI_API_KEY=$(load_secret "OPENAI_API_KEY")
 ZERO_ID_SECRET=$(load_secret "ZERO_ID_SECRET")
 Z_BILLING_API_KEY=$(load_secret "Z_BILLING_API_KEY")
+INTERNAL_TOKEN=$(load_secret "INTERNAL_TOKEN")
 
 # Validate required secrets
 MISSING_SECRETS=()
 if [[ -z "$ANTHROPIC_API_KEY" ]]; then
     MISSING_SECRETS+=("ANTHROPIC_API_KEY")
+fi
+if [[ -z "$INTERNAL_TOKEN" ]]; then
+    MISSING_SECRETS+=("INTERNAL_TOKEN")
 fi
 
 if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
@@ -227,6 +231,7 @@ sed -i "s|__ANTHROPIC_API_KEY__|${ANTHROPIC_API_KEY}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__OPENAI_API_KEY__|${OPENAI_API_KEY:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__ZERO_ID_SECRET__|${ZERO_ID_SECRET:-placeholder-not-set}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__Z_BILLING_API_KEY__|${Z_BILLING_API_KEY:-}|g" "$SECRETS_YAML_TMP"
+sed -i "s|__INTERNAL_TOKEN__|${INTERNAL_TOKEN}|g" "$SECRETS_YAML_TMP"
 sed -i "s|__DEFAULT_ISOLATION__|${DEFAULT_ISOLATION}|g" "$SECRETS_YAML_TMP"
 
 # Update deployments with ECR image URLs

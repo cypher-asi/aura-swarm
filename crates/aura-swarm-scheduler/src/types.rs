@@ -139,7 +139,7 @@ pub struct SchedulerConfig {
     pub aura_storage_url: String,
     /// URL of the Aura network service.
     pub aura_network_url: String,
-    /// JWT token for authenticating status callbacks to the gateway.
+    /// Internal bearer token for gateway service-to-service APIs.
     pub gateway_token: String,
 }
 
@@ -191,7 +191,8 @@ impl SchedulerConfig {
     /// - `AURA_ROUTER_URL`: URL of the Aura router service
     /// - `AURA_STORAGE_URL`: URL of the Aura storage service
     /// - `AURA_NETWORK_URL`: URL of the Aura network service
-    /// - `GATEWAY_TOKEN`: JWT token for authenticating status callbacks to the gateway
+    /// - `INTERNAL_TOKEN`: bearer token for gateway internal APIs
+    /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -251,7 +252,9 @@ impl SchedulerConfig {
         if let Ok(val) = std::env::var("AURA_NETWORK_URL") {
             config.aura_network_url = val;
         }
-        if let Ok(val) = std::env::var("GATEWAY_TOKEN") {
+        if let Ok(val) = std::env::var("INTERNAL_TOKEN") {
+            config.gateway_token = val;
+        } else if let Ok(val) = std::env::var("GATEWAY_TOKEN") {
             config.gateway_token = val;
         }
 

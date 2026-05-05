@@ -23,6 +23,30 @@ fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
+fn require_internal_auth<C, V>(
+    state: &GatewayState<C, V>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let Some(expected) = state.config.internal_token.as_deref() else {
+        tracing::error!("Rejecting internal request because INTERNAL_TOKEN is not configured");
+        return Err(ApiError::Unauthorized);
+    };
+
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match provided {
+        Some(token) if token == expected => Ok(()),
+        _ => Err(ApiError::Unauthorized),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpdateStatusRequest {
     pub status: AgentState,
@@ -45,17 +69,7 @@ where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
-    // Verify internal token when configured
-    if let Some(ref expected) = state.config.internal_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        match provided {
-            Some(token) if token == expected => {}
-            _ => return Err(ApiError::Unauthorized),
-        }
-    }
+    require_internal_auth(&state, &headers)?;
 
     let agent_id = parse_agent_id(&agent_id)?;
 
@@ -69,9 +83,17 @@ where
 
 /// `GET /internal/health`
 ///
-/// Internal health check for cluster probes (no auth required).
-pub(crate) async fn internal_health() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+/// Internal health check for service-to-service probes.
+pub(crate) async fn internal_health<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    require_internal_auth(&state, &headers)?;
+    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
 }
 
 /// Compact representation of an agent for internal reconciliation and deploy checks.
@@ -103,11 +125,14 @@ impl From<aura_swarm_store::Agent> for InternalAgentEntry {
 /// by network policies restricting access to cluster-internal traffic.
 pub(crate) async fn list_active_agents<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
+    require_internal_auth(&state, &headers)?;
+
     let agents = state.control.list_active_agents().await?;
 
     let entries: Vec<InternalAgentEntry> =
@@ -122,11 +147,14 @@ where
 /// are preserved across redeploy, including inactive lifecycle states.
 pub(crate) async fn list_all_agents<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
+    require_internal_auth(&state, &headers)?;
+
     let agents = state.control.list_all_agents().await?;
     let entries: Vec<InternalAgentEntry> =
         agents.into_iter().map(InternalAgentEntry::from).collect();

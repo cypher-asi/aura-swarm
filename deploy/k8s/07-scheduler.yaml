@@ -59,6 +59,11 @@ spec:
                 configMapKeyRef:
                   name: aura-swarm-config
                   key: GATEWAY_URL
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aura-swarm-secrets
+                  key: INTERNAL_TOKEN
             - name: STATE_PVC_NAME
               valueFrom:
                 configMapKeyRef:

@@ -7,6 +7,7 @@ Run `./08-deploy-k8s.sh` for a normal redeploy. This path updates Kubernetes man
 - Per-agent harness state remains on the shared `swarm-agent-state` PVC under each agent's stable `agent_id` subdirectory.
 - Running `swarm-agent` pods are disposable. The scheduler reconciler recreates missing pods and rolling-replaces stale-image pods against the same logical agent IDs.
 - The harness image must be pinned to an immutable `@sha256` digest. Run `./07-build-images.sh --harness` before redeploying a new harness.
+- Internal gateway APIs require a service bearer token. Create `.secrets/INTERNAL_TOKEN` before deploying; gateway, scheduler, and redeploy verification use the same token for `/internal/*`.
 - The deploy fails non-zero if platform rollouts fail, persisted `AgentId`s disappear, unexpected persisted `AgentId`s appear, or active agent pods do not converge to the configured harness digest.
 
 ## Destructive Path

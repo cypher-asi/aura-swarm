@@ -23,6 +23,7 @@ use aura_swarm_store::RocksStore;
 
 const TEST_USER_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const OTHER_USER_UUID: &str = "660e8400-e29b-41d4-a716-446655440099";
+const TEST_INTERNAL_TOKEN: &str = "test-internal-token";
 
 fn test_token(user_uuid: &str) -> String {
     format!("test-token:{user_uuid}")
@@ -35,12 +36,22 @@ fn auth_header(user_uuid: &str) -> (HeaderName, HeaderValue) {
     )
 }
 
+fn internal_auth_header() -> (HeaderName, HeaderValue) {
+    (
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {TEST_INTERNAL_TOKEN}")).unwrap(),
+    )
+}
+
 fn build_test_app() -> (TestServer, tempfile::TempDir) {
     let tmpdir = tempfile::TempDir::new().unwrap();
     let store = Arc::new(RocksStore::open(tmpdir.path()).unwrap());
     let control = Arc::new(ControlPlaneService::with_defaults(store));
     let jwt = Arc::new(MockJwtValidator);
-    let config = GatewayConfig::default();
+    let config = GatewayConfig {
+        internal_token: Some(TEST_INTERNAL_TOKEN.to_string()),
+        ..GatewayConfig::default()
+    };
     let state = GatewayState::new(control, jwt, config);
     let app: Router = create_router(state);
     let server = TestServer::new(app).unwrap();
@@ -64,10 +75,49 @@ async fn health_returns_200_with_version() {
 #[tokio::test]
 async fn internal_health_returns_200() {
     let (server, _tmp) = build_test_app();
-    let resp = server.get("/internal/health").await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+    let resp = server
+        .get("/internal/health")
+        .add_header(internal_hdr, internal_val)
+        .await;
     resp.assert_status_ok();
     let body: Value = resp.json();
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn internal_health_without_token_returns_401() {
+    let (server, _tmp) = build_test_app();
+    let resp = server.get("/internal/health").await;
+    resp.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn internal_agent_lists_require_token() {
+    let (server, _tmp) = build_test_app();
+
+    server
+        .get("/internal/agents/active")
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .get("/internal/agents/all")
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn internal_agent_lists_accept_internal_token() {
+    let (server, _tmp) = build_test_app();
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    let resp = server
+        .get("/internal/agents/all")
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body, json!([]));
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +353,7 @@ async fn delete_agent_requires_stopped() {
 async fn delete_agent_success_when_stopped() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -317,6 +368,7 @@ async fn delete_agent_success_when_stopped() {
     // Transition to stopped via internal API
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "stopped"}))
         .await
         .assert_status_ok();
@@ -450,6 +502,7 @@ async fn create_agent_idempotent_does_not_duplicate_in_list() {
 async fn lifecycle_start_stop() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -464,6 +517,7 @@ async fn lifecycle_start_stop() {
     // Transition to Running via internal API (simulates scheduler callback)
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await
         .assert_status_ok();
@@ -482,6 +536,7 @@ async fn lifecycle_start_stop() {
 async fn lifecycle_hibernate_wake() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -496,6 +551,7 @@ async fn lifecycle_hibernate_wake() {
     // Move to Running, then Idle (so hibernate is valid)
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "idle"}))
         .await
         .assert_status_ok();
@@ -550,6 +606,7 @@ async fn lifecycle_invalid_transition_returns_409() {
 async fn create_session_success() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -564,6 +621,7 @@ async fn create_session_success() {
     // Move agent to Running
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
 
@@ -585,6 +643,7 @@ async fn create_session_success() {
 async fn create_session_with_config() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -598,6 +657,7 @@ async fn create_session_with_config() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
 
@@ -631,6 +691,7 @@ async fn create_session_invalid_agent_id() {
 async fn get_session_success() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -644,6 +705,7 @@ async fn get_session_success() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
 
@@ -683,6 +745,7 @@ async fn get_session_not_found() {
 async fn list_sessions_success() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -696,6 +759,7 @@ async fn list_sessions_success() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
 
@@ -718,6 +782,7 @@ async fn list_sessions_success() {
 async fn close_session_success() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -731,6 +796,7 @@ async fn close_session_success() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
 
@@ -758,6 +824,7 @@ async fn close_session_success() {
 async fn internal_update_status_valid() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -771,19 +838,30 @@ async fn internal_update_status_valid() {
 
     let resp = server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
-    resp.assert_status_ok();
-    let body: Value = resp.json();
-    assert_eq!(body["Ok"]["success"], true);
-    assert_eq!(body["Ok"]["status"], "running");
+    resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn internal_update_status_without_token_returns_401() {
+    let (server, _tmp) = build_test_app();
+    let fake_id = "aa".repeat(16);
+    let resp = server
+        .patch(&format!("/internal/agents/{fake_id}/status"))
+        .json(&json!({"status": "running"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn internal_update_status_invalid_id() {
     let (server, _tmp) = build_test_app();
+    let (internal_hdr, internal_val) = internal_auth_header();
     let resp = server
         .patch("/internal/agents/not-hex/status")
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
     resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
@@ -792,9 +870,11 @@ async fn internal_update_status_invalid_id() {
 #[tokio::test]
 async fn internal_update_status_not_found() {
     let (server, _tmp) = build_test_app();
+    let (internal_hdr, internal_val) = internal_auth_header();
     let fake_id = "bb".repeat(16);
     let resp = server
         .patch(&format!("/internal/agents/{fake_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await;
     resp.assert_status(axum::http::StatusCode::NOT_FOUND);
@@ -804,6 +884,7 @@ async fn internal_update_status_not_found() {
 async fn internal_update_status_with_error_message() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -817,9 +898,10 @@ async fn internal_update_status_with_error_message() {
 
     let resp = server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "error", "message": "pod crashed"}))
         .await;
-    resp.assert_status_ok();
+    resp.assert_status(axum::http::StatusCode::NO_CONTENT);
 
     // Verify the error message is stored
     let get_resp = server
@@ -919,6 +1001,7 @@ async fn get_agent_state_returns_lifecycle_state() {
 async fn get_agent_state_running_has_uptime() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -932,6 +1015,7 @@ async fn get_agent_state_running_has_uptime() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await
         .assert_status_ok();
@@ -950,6 +1034,7 @@ async fn get_agent_state_running_has_uptime() {
 async fn get_agent_state_includes_error_message() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
 
     let create_resp = server
         .post("/v1/agents")
@@ -963,6 +1048,7 @@ async fn get_agent_state_includes_error_message() {
 
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "error", "message": "OOM killed"}))
         .await
         .assert_status_ok();

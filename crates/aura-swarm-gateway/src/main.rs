@@ -125,6 +125,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("JWT validator initialized");
 
     let gateway_config = GatewayConfig::from_env();
+    #[cfg(not(feature = "dev-mode"))]
+    if gateway_config.internal_token.is_none() {
+        return Err("INTERNAL_TOKEN must be set to protect /internal gateway endpoints".into());
+    }
+
     let state = GatewayState::new(control, jwt_validator, gateway_config);
 
     let app = create_router(state);

@@ -76,7 +76,7 @@ require_command() {
     fi
 }
 
-for cmd in kubectl jq curl; do
+for cmd in kubectl jq curl base64; do
     require_command "$cmd"
 done
 
@@ -118,7 +118,7 @@ start_port_forward() {
         PORT_FORWARD_PID=$!
 
         for _ in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:${PORT_FORWARD_PORT}/internal/health" >/dev/null 2>&1; then
+            if redeploy_internal_get "/internal/health" >/dev/null 2>&1; then
                 return 0
             fi
             if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
@@ -138,10 +138,7 @@ start_port_forward() {
 
 snapshot_active_agents() {
     local output_path="$1"
-    start_port_forward
-    curl -fsS "http://127.0.0.1:${PORT_FORWARD_PORT}/internal/agents/active" \
-        | jq -S 'sort_by(.agent_id)' > "${output_path}"
-    stop_port_forward
+    redeploy_snapshot_active_agents "${output_path}" "${PORT_FORWARD_LOG}"
 }
 
 snapshot_agent_pods() {
