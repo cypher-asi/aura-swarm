@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Event, Pod};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
@@ -76,6 +77,14 @@ pub trait Scheduler: Send + Sync {
     /// Returns an error if the health check fails.
     async fn check_agent_health(&self, agent_id: &AgentId) -> Result<bool>;
 }
+
+/// Maximum time a pod is allowed to remain in a non-Ready Provisioning state
+/// before the scheduler escalates it to `AgentState::Error`. Pods that are
+/// `Pending`/`Unschedulable` or stuck in `ContainerCreating` past this
+/// threshold otherwise sit in `Provisioning` indefinitely with no signal to
+/// the gateway, which is what produced the "stuck on Cooking..." UX in
+/// aura-os when a brand-new pod could not be scheduled.
+const POD_STUCK_TIMEOUT: chrono::Duration = chrono::Duration::seconds(120);
 
 /// Kubernetes-based scheduler for agent pods.
 ///
@@ -480,6 +489,18 @@ impl K8sScheduler {
         } else {
             debug!("Desired-state reconciler: all pods converged");
         }
+
+        // Re-evaluate every existing pod after the convergence pass. The pod
+        // watcher only fires on Kubernetes Apply/Delete events, so a pod that
+        // is silently stuck (e.g. Unschedulable with no further events for
+        // minutes) would never trip the time-based escalation in
+        // `handle_pod_update`. Running it on every 30s reconcile tick gives
+        // stuck pods a deterministic upper-bound on how long they can stay
+        // hidden in Provisioning. `state_cache.update_if_changed` dedupes the
+        // no-op case so this does not flood the gateway.
+        for pod in pod_by_agent.values() {
+            self.handle_pod_update(pod).await;
+        }
     }
 
     /// Fetch the list of agents that should have running pods from the gateway.
@@ -548,7 +569,7 @@ impl K8sScheduler {
         let (container_error, error_message) = Self::extract_container_error(pod);
 
         // Map pod phase to agent state, considering container errors
-        let (new_state, message) = if container_error {
+        let (mut new_state, mut message) = if container_error {
             (AgentState::Error, error_message)
         } else {
             match (phase, ready) {
@@ -566,6 +587,26 @@ impl K8sScheduler {
                 _ => return, // Don't update for unknown states
             }
         };
+
+        // Time-based escalation: if a pod has been sitting in Provisioning for
+        // longer than POD_STUCK_TIMEOUT (typically due to Unschedulable or a
+        // stalled ContainerCreating that never trips ImagePullBackOff), surface
+        // it as Error with whatever diagnostic the pod object can provide.
+        // Without this, brand-new agents can sit in Provisioning forever and
+        // the desktop UI never gets a definitive failure event.
+        if matches!(new_state, AgentState::Provisioning) {
+            if let Some(stuck_msg) = detect_stuck_pod(pod, Utc::now(), POD_STUCK_TIMEOUT) {
+                warn!(
+                    agent_id = %agent_id,
+                    phase,
+                    ready,
+                    reason = %stuck_msg,
+                    "Pod stuck in Provisioning past timeout; escalating to Error"
+                );
+                new_state = AgentState::Error;
+                message = Some(stuck_msg);
+            }
+        }
 
         // Only notify the gateway when the mapped state actually changes
         if !self.state_cache.update_if_changed(agent_id, new_state) {
@@ -792,6 +833,13 @@ impl K8sScheduler {
             })
     }
 
+    fn pod_reference_time(pod: &Pod) -> Option<DateTime<Utc>> {
+        if let Some(start) = pod.status.as_ref().and_then(|s| s.start_time.as_ref()) {
+            return Some(start.0);
+        }
+        pod.metadata.creation_timestamp.as_ref().map(|t| t.0)
+    }
+
     fn extract_pod_status(pod: &Pod) -> PodStatus {
         let status = pod.status.as_ref();
 
@@ -819,6 +867,75 @@ impl K8sScheduler {
             message,
         }
     }
+}
+
+/// Returns a diagnostic message if `pod` has been alive for at least
+/// `threshold` and is still not Ready. Used to escalate silently-stuck
+/// pods (e.g. `Unschedulable`, slow `ContainerCreating`) to
+/// `AgentState::Error` so callers stop seeing an indefinite Provisioning.
+///
+/// Pure helper -- takes `now` as a parameter so the time logic is fully
+/// unit-testable without a live cluster.
+fn detect_stuck_pod(
+    pod: &Pod,
+    now: DateTime<Utc>,
+    threshold: chrono::Duration,
+) -> Option<String> {
+    let reference = K8sScheduler::pod_reference_time(pod)?;
+    let age = now - reference;
+    if age < threshold {
+        return None;
+    }
+
+    let status = pod.status.as_ref();
+
+    // Prefer the most specific signal we can find. Order matters: a
+    // PodScheduled=False message (e.g. "0/3 nodes are available...") is far
+    // more useful than the generic phase fallback.
+    if let Some(conditions) = status.and_then(|s| s.conditions.as_ref()) {
+        for condition in conditions {
+            if condition.type_ == "PodScheduled" && condition.status == "False" {
+                let reason = condition.reason.as_deref().unwrap_or("Unschedulable");
+                let detail = condition
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| reason.to_string());
+                return Some(format!(
+                    "pod stuck unscheduled for {}s ({reason}): {detail}",
+                    age.num_seconds()
+                ));
+            }
+        }
+    }
+
+    // Latest container waiting reason (e.g. ContainerCreating with a slow
+    // image pull). The hard-error reasons are already caught upstream by
+    // `extract_container_error`; here we surface the soft-stuck ones.
+    let container_statuses = status.and_then(|s| s.container_statuses.as_ref());
+    let init_container_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
+    for cs in container_statuses
+        .into_iter()
+        .flatten()
+        .chain(init_container_statuses.into_iter().flatten())
+    {
+        if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+            if let Some(reason) = waiting.reason.as_deref() {
+                let detail = waiting.message.clone().unwrap_or_else(|| reason.to_string());
+                return Some(format!(
+                    "pod stuck in {reason} for {}s: {detail}",
+                    age.num_seconds()
+                ));
+            }
+        }
+    }
+
+    let phase = status
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("Unknown");
+    Some(format!(
+        "pod stuck in phase {phase} for {}s with no progress signal",
+        age.num_seconds()
+    ))
 }
 
 #[async_trait]
@@ -1189,5 +1306,126 @@ mod tests {
 
         let healthy = scheduler.check_agent_health(&agent_id).await.unwrap();
         assert!(!healthy);
+    }
+
+    // =========================================================================
+    // detect_stuck_pod tests
+    //
+    // These exercise the pure stuck-pod heuristic without spinning up a real
+    // kube client, by hand-building Pod objects with the relevant status
+    // fields populated.
+    // =========================================================================
+
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateWaiting, ContainerStatus, PodCondition,
+        PodStatus as K8sPodStatus,
+    };
+
+    fn pod_with_age_secs(age_secs: i64) -> Pod {
+        let now = Utc::now();
+        Pod {
+            metadata: kube::api::ObjectMeta {
+                creation_timestamp: Some(Time(now - chrono::Duration::seconds(age_secs))),
+                ..Default::default()
+            },
+            status: Some(K8sPodStatus {
+                phase: Some("Pending".to_string()),
+                start_time: Some(Time(now - chrono::Duration::seconds(age_secs))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn unschedulable_condition(message: &str) -> PodCondition {
+        PodCondition {
+            type_: "PodScheduled".to_string(),
+            status: "False".to_string(),
+            reason: Some("Unschedulable".to_string()),
+            message: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn waiting_container(reason: &str, message: Option<&str>) -> ContainerStatus {
+        ContainerStatus {
+            name: "agent".to_string(),
+            ready: false,
+            restart_count: 0,
+            image: "test".to_string(),
+            image_id: String::new(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some(reason.to_string()),
+                    message: message.map(str::to_string),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn detect_stuck_pod_under_threshold_returns_none() {
+        let pod = pod_with_age_secs(30);
+        let now = Utc::now();
+        assert!(detect_stuck_pod(&pod, now, chrono::Duration::seconds(120)).is_none());
+    }
+
+    #[test]
+    fn detect_stuck_pod_unschedulable_surfaces_condition_message() {
+        let mut pod = pod_with_age_secs(150);
+        pod.status.as_mut().unwrap().conditions = Some(vec![unschedulable_condition(
+            "0/3 nodes are available: 3 Insufficient cpu",
+        )]);
+
+        let msg =
+            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+
+        assert!(
+            msg.contains("Unschedulable"),
+            "expected reason in message: {msg}"
+        );
+        assert!(
+            msg.contains("Insufficient cpu"),
+            "expected detail in message: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_stuck_pod_container_creating_surfaces_waiting_reason() {
+        let mut pod = pod_with_age_secs(200);
+        pod.status.as_mut().unwrap().container_statuses = Some(vec![waiting_container(
+            "ContainerCreating",
+            Some("pulling image foo:bar"),
+        )]);
+
+        let msg =
+            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+
+        assert!(
+            msg.contains("ContainerCreating"),
+            "expected reason in message: {msg}"
+        );
+        assert!(
+            msg.contains("pulling image foo:bar"),
+            "expected detail in message: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_stuck_pod_falls_back_to_phase_when_no_signal() {
+        let pod = pod_with_age_secs(180);
+        let msg =
+            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+
+        assert!(msg.contains("Pending"), "expected phase in message: {msg}");
+        assert!(msg.contains("180s"), "expected age in message: {msg}");
+    }
+
+    #[test]
+    fn detect_stuck_pod_without_timestamps_returns_none() {
+        let pod = Pod::default();
+        assert!(detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).is_none());
     }
 }
