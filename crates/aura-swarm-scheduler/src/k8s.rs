@@ -840,6 +840,35 @@ impl K8sScheduler {
         pod.metadata.creation_timestamp.as_ref().map(|t| t.0)
     }
 
+    /// The configured `INTERNAL_TOKEN` used for gateway internal APIs.
+    ///
+    /// Empty when the scheduler is started without `INTERNAL_TOKEN` /
+    /// `GATEWAY_TOKEN` (dev mode); callers can use this to skip the
+    /// gateway-auth boot probe in that case.
+    #[must_use]
+    pub fn gateway_token(&self) -> &str {
+        &self.config.gateway_token
+    }
+
+    /// Probe the gateway's `/internal/health` with the configured bearer
+    /// token. Used at startup to fail fast on `INTERNAL_TOKEN` drift between
+    /// the scheduler and gateway deployments, which would otherwise manifest
+    /// as new agents silently getting stuck in `Provisioning`.
+    ///
+    /// See [`verify_gateway_auth`] for the error semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`GatewayAuthError`] variants as [`verify_gateway_auth`].
+    pub async fn verify_gateway_auth(&self) -> std::result::Result<(), GatewayAuthError> {
+        verify_gateway_auth(
+            &self.http_client,
+            &self.config.gateway_url,
+            &self.config.gateway_token,
+        )
+        .await
+    }
+
     fn extract_pod_status(pod: &Pod) -> PodStatus {
         let status = pod.status.as_ref();
 
@@ -936,6 +965,122 @@ fn detect_stuck_pod(
         "pod stuck in phase {phase} for {}s with no progress signal",
         age.num_seconds()
     ))
+}
+
+/// Outcome of [`verify_gateway_auth`].
+///
+/// Distinguishes hard misconfiguration (wrong / missing token) from transient
+/// transport errors so callers can fail fast on the former and retry the
+/// latter while the gateway is still coming up.
+#[derive(Debug)]
+pub enum GatewayAuthError {
+    /// Gateway rejected the bearer token (HTTP 401/403). Almost always means
+    /// the scheduler's `INTERNAL_TOKEN` does not match the gateway's, e.g.
+    /// because only one of the two deployments was rolled with a new secret.
+    /// Do NOT retry; new agents will silently sit in `Provisioning` forever
+    /// because `notify_status_change` rides this same auth path.
+    InvalidToken {
+        /// HTTP status code (401 or 403).
+        status: u16,
+        /// Response body returned by the gateway, for diagnostics.
+        body: String,
+    },
+    /// Could not reach the gateway at all (DNS, connection refused, timeout,
+    /// TLS handshake error). Retriable during boot - the gateway service may
+    /// just not be ready yet.
+    Transport(String),
+    /// Gateway returned a non-success status that is not 401/403 (e.g. 5xx
+    /// during a deploy, or an unexpected 4xx). Treated as a hard failure
+    /// because it implies the internal contract is broken in some way the
+    /// scheduler cannot reason about.
+    Unexpected {
+        /// HTTP status code returned by the gateway.
+        status: u16,
+        /// Response body returned by the gateway, for diagnostics.
+        body: String,
+    },
+}
+
+impl GatewayAuthError {
+    /// Whether this error is worth retrying during scheduler boot.
+    ///
+    /// Only transport errors are retriable - 401/403 means the operator has
+    /// to fix the secret, and unexpected statuses mean the gateway is
+    /// returning something we don't understand.
+    #[must_use]
+    pub const fn is_retriable(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl std::fmt::Display for GatewayAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidToken { status, body } => write!(
+                f,
+                "gateway rejected INTERNAL_TOKEN (HTTP {status}); \
+                 scheduler->gateway internal callbacks will fail and new agents \
+                 will get stuck in Provisioning. Body: {body}"
+            ),
+            Self::Transport(msg) => {
+                write!(f, "transport error reaching gateway /internal/health: {msg}")
+            }
+            Self::Unexpected { status, body } => write!(
+                f,
+                "gateway /internal/health returned unexpected HTTP {status}: {body}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GatewayAuthError {}
+
+/// Verify the scheduler can authenticate to the gateway's protected
+/// `/internal/health` endpoint with the configured bearer token.
+///
+/// The scheduler's reconciler and status callbacks all hit `/internal/*`
+/// with this token, so if it is wrong everything downstream of pod readiness
+/// silently breaks: new agents never transition `Provisioning -> Running` and
+/// even the stuck-pod escalation in `handle_pod_update` 401s. Probing
+/// `/internal/health` once at startup makes that misconfiguration loud
+/// instead of silent.
+///
+/// # Errors
+///
+/// - [`GatewayAuthError::InvalidToken`] on 401/403 (do not retry).
+/// - [`GatewayAuthError::Transport`] on network/DNS/timeout failures
+///   (retriable while the gateway boots).
+/// - [`GatewayAuthError::Unexpected`] on any other non-success status.
+pub async fn verify_gateway_auth(
+    http_client: &reqwest::Client,
+    gateway_url: &str,
+    gateway_token: &str,
+) -> std::result::Result<(), GatewayAuthError> {
+    let url = format!("{gateway_url}/internal/health");
+
+    let response = http_client
+        .get(&url)
+        .bearer_auth(gateway_token)
+        .send()
+        .await
+        .map_err(|e| GatewayAuthError::Transport(e.to_string()))?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    match status.as_u16() {
+        401 | 403 => Err(GatewayAuthError::InvalidToken {
+            status: status.as_u16(),
+            body,
+        }),
+        other => Err(GatewayAuthError::Unexpected {
+            status: other,
+            body,
+        }),
+    }
 }
 
 #[async_trait]
@@ -1427,5 +1572,128 @@ mod tests {
     fn detect_stuck_pod_without_timestamps_returns_none() {
         let pod = Pod::default();
         assert!(detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).is_none());
+    }
+
+    // =========================================================================
+    // verify_gateway_auth tests
+    //
+    // These exercise the boot-time gateway auth probe via wiremock so we can
+    // simulate the real `Authorization: Bearer ...` check the gateway runs in
+    // require_internal_auth without needing to spin up the gateway crate.
+    // =========================================================================
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build reqwest client")
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_auth_ok_on_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/health"))
+            .and(header("authorization", "Bearer good-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = verify_gateway_auth(&test_http_client(), &server.uri(), "good-token").await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_auth_returns_invalid_token_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/health"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let err = verify_gateway_auth(&test_http_client(), &server.uri(), "wrong-token")
+            .await
+            .expect_err("expected InvalidToken error");
+
+        assert!(
+            matches!(err, GatewayAuthError::InvalidToken { status: 401, .. }),
+            "expected InvalidToken{{401}}, got {err:?}"
+        );
+        assert!(!err.is_retriable(), "401 must not be retriable");
+        assert!(
+            err.to_string().contains("INTERNAL_TOKEN"),
+            "error message should mention INTERNAL_TOKEN for operator clarity: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_auth_returns_invalid_token_on_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/health"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let err = verify_gateway_auth(&test_http_client(), &server.uri(), "any")
+            .await
+            .expect_err("expected InvalidToken error");
+
+        assert!(
+            matches!(err, GatewayAuthError::InvalidToken { status: 403, .. }),
+            "expected InvalidToken{{403}}, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_auth_returns_unexpected_on_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/health"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let err = verify_gateway_auth(&test_http_client(), &server.uri(), "any")
+            .await
+            .expect_err("expected Unexpected error");
+
+        assert!(
+            matches!(err, GatewayAuthError::Unexpected { status: 500, .. }),
+            "expected Unexpected{{500}}, got {err:?}"
+        );
+        assert!(
+            !err.is_retriable(),
+            "Unexpected statuses should not be retried at boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_auth_returns_transport_on_dead_endpoint() {
+        // Bind a port, then drop the listener so the address is closed. Any
+        // OS will return connection refused for connections to it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let dead_url = format!("http://{addr}");
+
+        let err = verify_gateway_auth(&test_http_client(), &dead_url, "any")
+            .await
+            .expect_err("expected Transport error");
+
+        assert!(
+            matches!(err, GatewayAuthError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        assert!(
+            err.is_retriable(),
+            "Transport errors must be retriable so boot can wait for the gateway"
+        );
     }
 }

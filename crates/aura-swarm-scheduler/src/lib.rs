@@ -112,7 +112,7 @@ pub mod types;
 
 pub use billing::{ComputeUsageReporter, PodUsageInfo, SchedulerBillingConfig};
 pub use error::{Result, SchedulerError};
-pub use k8s::{K8sScheduler, Scheduler};
+pub use k8s::{verify_gateway_auth, GatewayAuthError, K8sScheduler, Scheduler};
 pub use types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
 
 #[cfg(any(test, feature = "test-utils"))]

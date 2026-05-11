@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use aura_swarm_core::AgentId;
 use aura_swarm_scheduler::{
-    ComputeUsageReporter, K8sScheduler, Scheduler, SchedulerBillingConfig, SchedulerConfig,
-    SchedulerError,
+    ComputeUsageReporter, GatewayAuthError, K8sScheduler, Scheduler, SchedulerBillingConfig,
+    SchedulerConfig, SchedulerError,
 };
 use aura_swarm_store::AgentSpec;
 use axum::{
@@ -279,6 +279,74 @@ fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Maximum number of retries for transient transport errors when probing the
+/// gateway's `/internal/health` endpoint at boot. The gateway and scheduler
+/// are usually rolled together so a brief unavailability window is normal;
+/// 401/403 / unexpected statuses are NOT retried (see [`GatewayAuthError`]).
+const GATEWAY_AUTH_MAX_RETRIES: u32 = 5;
+
+/// Verify the scheduler can authenticate to the gateway's internal API at
+/// boot, with bounded retries on transient transport errors. Hard failures
+/// (token rejected, unexpected status) bail immediately so the deployment
+/// crashloops with a clear, operator-actionable error message instead of
+/// silently mis-running.
+///
+/// In dev mode (`INTERNAL_TOKEN` and `GATEWAY_TOKEN` both unset) the check
+/// is skipped with a warning, matching the gateway's pre-2cc329c behavior.
+async fn ensure_gateway_auth(scheduler: &K8sScheduler) -> Result<(), Box<dyn std::error::Error>> {
+    if scheduler.gateway_token().is_empty() {
+        tracing::warn!(
+            "INTERNAL_TOKEN is not set; skipping gateway auth check (dev mode). \
+             Production must set INTERNAL_TOKEN so that scheduler->gateway \
+             internal callbacks succeed; otherwise new agents will silently \
+             stay in Provisioning."
+        );
+        return Ok(());
+    }
+
+    let mut attempt: u32 = 0;
+    loop {
+        match scheduler.verify_gateway_auth().await {
+            Ok(()) => {
+                tracing::info!(
+                    "Verified scheduler can authenticate to gateway /internal/health"
+                );
+                return Ok(());
+            }
+            Err(err) if err.is_retriable() && attempt < GATEWAY_AUTH_MAX_RETRIES => {
+                attempt = attempt.saturating_add(1);
+                let backoff = Duration::from_secs(1u64 << attempt.min(5));
+                tracing::warn!(
+                    error = %err,
+                    attempt,
+                    max_retries = GATEWAY_AUTH_MAX_RETRIES,
+                    backoff_secs = backoff.as_secs(),
+                    "Gateway auth check failed transiently; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(err @ GatewayAuthError::InvalidToken { .. }) => {
+                tracing::error!(
+                    error = %err,
+                    "Gateway rejected the scheduler's INTERNAL_TOKEN. This is almost \
+                     always token drift after a redeploy: re-apply aura-swarm-secrets \
+                     and roll both the gateway and scheduler so they share the same \
+                     INTERNAL_TOKEN. Refusing to start so the regression is loud."
+                );
+                return Err(err.into());
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "Gateway auth check failed (non-retriable or retries exhausted); \
+                     refusing to start to avoid silently stuck-Provisioning agents"
+                );
+                return Err(err.into());
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -324,6 +392,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Arc::new(K8sScheduler::new(config).await?),
     };
     tracing::info!("Connected to Kubernetes cluster");
+
+    // Verify the scheduler can authenticate to the gateway's internal API
+    // before we start the reconciler. If INTERNAL_TOKEN drifts between the
+    // scheduler and gateway across a redeploy, the scheduler can still
+    // successfully create pods (it talks directly to the K8s API) but every
+    // notify_status_change PATCH would 401, so brand-new agents silently get
+    // stuck in `Provisioning` and the stuck-pod escalation in
+    // handle_pod_update can't surface it either. Crashing here makes that
+    // misconfiguration loud at deploy time.
+    ensure_gateway_auth(&scheduler).await?;
 
     // Start the reconciler as a background task
     let reconciler_scheduler = Arc::clone(&scheduler);
