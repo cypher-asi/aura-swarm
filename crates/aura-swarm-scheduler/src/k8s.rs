@@ -324,46 +324,93 @@ impl K8sScheduler {
             "NetworkNotReady",
         ];
 
-        if error_reasons.contains(&reason) {
-            warn!(
-                pod_name,
-                reason, message, "Pod creation error detected from event"
-            );
-
-            // Pod names are based on user-provided agent names, so use labels
-            // instead of name prefixes to identify swarm-agent pods.
-            let agent_id = match self.pods_api().get_opt(pod_name).await {
-                Ok(Some(pod)) => Self::extract_agent_id(&pod),
-                Ok(None) => {
-                    debug!(pod_name, "Pod not found when handling error event");
-                    None
-                }
-                Err(e) => {
-                    debug!(pod_name, error = %e, "Failed to fetch pod for error event");
-                    None
-                }
-            };
-
-            if let Some(agent_id) = agent_id {
-                let error_msg = format!("{reason}: {message}");
-                if let Err(e) = self
-                    .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
-                    .await
-                {
-                    error!(
-                        agent_id = %agent_id,
-                        error = %e,
-                        "Failed to notify gateway of pod error from event"
-                    );
-                } else {
-                    info!(
-                        agent_id = %agent_id,
-                        reason,
-                        "Notified gateway of pod error from Kubernetes event"
-                    );
-                }
-            }
+        if !error_reasons.contains(&reason) {
+            return;
         }
+
+        warn!(
+            pod_name,
+            reason, message, "Pod creation error detected from event"
+        );
+
+        // Fetch the pod so we can both extract the agent ID and check whether
+        // the warning is still relevant against the pod's *current* state.
+        // Pod names are based on user-provided agent names, so we use labels
+        // rather than name prefixes to identify swarm-agent pods.
+        let pod = match self.pods_api().get_opt(pod_name).await {
+            Ok(Some(pod)) => pod,
+            Ok(None) => {
+                debug!(pod_name, "Pod not found when handling error event");
+                return;
+            }
+            Err(e) => {
+                debug!(pod_name, error = %e, "Failed to fetch pod for error event");
+                return;
+            }
+        };
+
+        let Some(agent_id) = Self::extract_agent_id(&pod) else {
+            return;
+        };
+
+        // Stale-warning guard: Warning events for `FailedAttachVolume` and
+        // friends can fire on already-running pods during control-plane
+        // re-evaluations (e.g. an EKS kube-controller-manager leader
+        // re-election re-resolving every PV's plugin). When the pod is
+        // currently `Running` and `Ready` the warning is stale -- the
+        // volume is in fact attached, the workload is healthy, and
+        // escalating to `Error` would produce a wedged gateway record.
+        //
+        // The wedge is non-obvious: `handle_pod_update`'s state_cache dedup
+        // would early-return on the next pod update (cache still says
+        // Running, mapped state still Running, no change to push), leaving
+        // the gateway DB stuck in Error indefinitely. Drop the event here
+        // instead.
+        let phase = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .unwrap_or("Unknown");
+        let ready = Self::is_pod_ready(&pod);
+
+        if phase == "Running" && ready {
+            debug!(
+                agent_id = %agent_id,
+                pod_name,
+                reason,
+                "Ignoring Warning event on Running+Ready pod (stale vs. current state)"
+            );
+            return;
+        }
+
+        let error_msg = format!("{reason}: {message}");
+        if let Err(e) = self
+            .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
+            .await
+        {
+            error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to notify gateway of pod error from event"
+            );
+            return;
+        }
+
+        // Keep `state_cache` in sync with what we just pushed to the gateway.
+        // Without this, a subsequent `handle_pod_update` that observes the
+        // pod recovering to `Running+Ready` would early-return on its
+        // `update_if_changed(Running)` dedup check (cache still records the
+        // pre-event mapped state) and the gateway would remain stuck in
+        // `Error`. Recording `Error` here ensures the next legitimate
+        // transition is pushed.
+        self.state_cache
+            .update_if_changed(agent_id, AgentState::Error);
+
+        info!(
+            agent_id = %agent_id,
+            reason,
+            "Notified gateway of pod error from Kubernetes event"
+        );
     }
 
     /// Periodically reconcile desired agent state against actual pods.
@@ -1572,6 +1619,105 @@ mod tests {
     fn detect_stuck_pod_without_timestamps_returns_none() {
         let pod = Pod::default();
         assert!(detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).is_none());
+    }
+
+    // =========================================================================
+    // is_pod_ready tests
+    //
+    // These exercise the Ready-condition probe used by the stale-warning
+    // guard in `handle_k8s_event`. The guard relies on `is_pod_ready` to
+    // decide whether to ignore a `FailedAttachVolume`/`FailedMount` Warning
+    // event arriving on an already-running pod (e.g. during a kube
+    // controller-manager re-election that re-evaluates every PV plugin).
+    // =========================================================================
+
+    fn ready_condition(status: &str) -> PodCondition {
+        PodCondition {
+            type_: "Ready".to_string(),
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_pod_ready_true_when_ready_condition_is_true() {
+        let pod = Pod {
+            status: Some(K8sPodStatus {
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![ready_condition("True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(K8sScheduler::is_pod_ready(&pod));
+    }
+
+    #[test]
+    fn is_pod_ready_false_when_ready_condition_is_false() {
+        let pod = Pod {
+            status: Some(K8sPodStatus {
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![ready_condition("False")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!K8sScheduler::is_pod_ready(&pod));
+    }
+
+    #[test]
+    fn is_pod_ready_false_when_no_conditions() {
+        let pod = Pod {
+            status: Some(K8sPodStatus {
+                phase: Some("Running".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!K8sScheduler::is_pod_ready(&pod));
+    }
+
+    #[test]
+    fn is_pod_ready_false_when_no_status() {
+        let pod = Pod::default();
+        assert!(!K8sScheduler::is_pod_ready(&pod));
+    }
+
+    // =========================================================================
+    // state_cache divergence regression test
+    //
+    // Before the fix in `handle_k8s_event`, the scheduler had two paths
+    // pushing status to the gateway -- pod watcher (cached) and event
+    // watcher (uncached) -- and the in-memory cache only tracked the
+    // former. A Warning event would push `Error` to the gateway DB while
+    // leaving the cache at `Running`, after which the next pod update
+    // (still showing Running+Ready) would early-return on the dedup check
+    // and the gateway DB would stay wedged in `Error` forever.
+    //
+    // The fix keeps the cache synchronized with event-driven pushes. This
+    // test reproduces the wedge scenario at the cache level.
+    // =========================================================================
+
+    #[test]
+    fn state_cache_event_path_keeps_cache_in_sync_with_gateway() {
+        let cache = StateCache::new();
+        let agent_id = test_agent_id();
+
+        // Pod watcher records that the agent is Running.
+        assert!(cache.update_if_changed(agent_id, AgentState::Running));
+
+        // Event watcher pushes Error to the gateway (e.g. FailedAttachVolume).
+        // After the fix, it must also update the cache so future pod-watcher
+        // updates can detect the divergence and re-notify.
+        assert!(cache.update_if_changed(agent_id, AgentState::Error));
+
+        // Pod watcher fires again -- pod is back to Running+Ready. The cache
+        // must allow this transition through (cache miss vs. Error), since
+        // otherwise the gateway DB stays stuck in Error.
+        assert!(
+            cache.update_if_changed(agent_id, AgentState::Running),
+            "cache must allow Error -> Running transition to unstick the gateway"
+        );
     }
 
     // =========================================================================
