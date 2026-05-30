@@ -7,9 +7,10 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 
+use aura_swarm_protocol::RuntimeRunResponse;
+
 use crate::types::{
-    Agent, ApiErrorResponse, CreateAgentRequest, CreateSessionResponse, LifecycleResponse,
-    ListAgentsResponse,
+    Agent, ApiErrorResponse, CreateAgentRequest, LifecycleResponse, ListAgentsResponse,
 };
 
 /// Error type for client operations.
@@ -268,20 +269,21 @@ impl GatewayClient {
     }
 
     // =========================================================================
-    // Session Operations
+    // Run Operations
     // =========================================================================
 
-    /// Create a new session for an agent.
-    pub async fn create_session(
-        &self,
-        agent_id: &str,
-    ) -> Result<CreateSessionResponse, ClientError> {
-        let url = format!("{}/v1/agents/{}/sessions", self.base_url, agent_id);
+    /// Start a chat run for an agent via the gateway `POST /v1/agents/:id/run`.
+    ///
+    /// Returns the harness run handle; `event_stream_url` is the swarm-facing
+    /// WS path to attach to (already rewritten by the gateway).
+    pub async fn create_run(&self, agent_id: &str) -> Result<RuntimeRunResponse, ClientError> {
+        let url = format!("{}/v1/agents/{}/run", self.base_url, agent_id);
 
         let response = self
             .client
             .post(&url)
             .headers(self.auth_headers()?)
+            .json(&serde_json::json!({}))
             .send()
             .await?;
 
@@ -289,21 +291,24 @@ impl GatewayClient {
             return Err(Self::handle_error(response).await);
         }
 
-        let session: CreateSessionResponse = response
+        let run: RuntimeRunResponse = response
             .json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))?;
 
-        Ok(session)
+        Ok(run)
     }
 
-    /// Close a session.
-    pub async fn close_session(&self, session_id: &str) -> Result<(), ClientError> {
-        let url = format!("{}/v1/sessions/{}", self.base_url, session_id);
+    /// Stop a run via the gateway `POST /v1/agents/:id/run/:run_id/stop`.
+    pub async fn stop_run(&self, agent_id: &str, run_id: &str) -> Result<(), ClientError> {
+        let url = format!(
+            "{}/v1/agents/{}/run/{}/stop",
+            self.base_url, agent_id, run_id
+        );
 
         let response = self
             .client
-            .delete(&url)
+            .post(&url)
             .headers(self.auth_headers()?)
             .send()
             .await?;
@@ -331,15 +336,15 @@ impl GatewayClient {
         &self.token
     }
 
-    /// Build a WebSocket URL for a session.
+    /// Build a WebSocket URL for attaching to a run's event stream.
     #[must_use]
-    pub fn ws_url(&self, session_id: &str) -> String {
+    pub fn run_ws_url(&self, agent_id: &str, run_id: &str) -> String {
         let ws_base = if self.base_url.starts_with("https://") {
             self.base_url.replace("https://", "wss://")
         } else {
             self.base_url.replace("http://", "ws://")
         };
-        format!("{}/v1/sessions/{}/ws", ws_base, session_id)
+        format!("{ws_base}/v1/agents/{agent_id}/stream/{run_id}")
     }
 }
 
@@ -366,32 +371,32 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_http_to_ws() {
+    fn run_ws_url_http_to_ws() {
         let client = GatewayClient::new("http://localhost:8080", "tok").unwrap();
-        let url = client.ws_url("sess-1");
+        let url = client.run_ws_url("agent-1", "run-1");
         assert!(url.starts_with("ws://"), "url: {url}");
         assert!(!url.contains("http://"), "url: {url}");
     }
 
     #[test]
-    fn ws_url_https_to_wss() {
+    fn run_ws_url_https_to_wss() {
         let client = GatewayClient::new("https://gateway.example.com", "tok").unwrap();
-        let url = client.ws_url("sess-2");
+        let url = client.run_ws_url("agent-2", "run-2");
         assert!(url.starts_with("wss://"), "url: {url}");
         assert!(!url.contains("https://"), "url: {url}");
     }
 
     #[test]
-    fn ws_url_includes_session_id() {
+    fn run_ws_url_includes_agent_and_run() {
         let client = GatewayClient::new("http://localhost:8080", "tok").unwrap();
-        let url = client.ws_url("abc-123");
-        assert_eq!(url, "ws://localhost:8080/v1/sessions/abc-123/ws");
+        let url = client.run_ws_url("abc-123", "run-9");
+        assert_eq!(url, "ws://localhost:8080/v1/agents/abc-123/stream/run-9");
     }
 
     #[test]
-    fn ws_url_with_trailing_slash_base() {
+    fn run_ws_url_with_trailing_slash_base() {
         let client = GatewayClient::new("https://api.example.com/", "tok").unwrap();
-        let url = client.ws_url("s1");
-        assert_eq!(url, "wss://api.example.com/v1/sessions/s1/ws");
+        let url = client.run_ws_url("a1", "r1");
+        assert_eq!(url, "wss://api.example.com/v1/agents/a1/stream/r1");
     }
 }

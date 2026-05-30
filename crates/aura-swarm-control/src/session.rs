@@ -28,6 +28,27 @@ pub fn create_session<S: Store>(
     agent_id: &AgentId,
     config: SessionConfig,
 ) -> Result<(Session, Option<AgentState>)> {
+    create_session_with_run(store, user_id, agent_id, config, None)
+}
+
+/// Create a new session pre-bound to a harness `run_id`.
+///
+/// Identical to [`create_session`] but records the `run_id` so the WS-attach
+/// path can resolve the owning session from the run.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The agent is not found
+/// - The user is not the owner
+/// - The agent is not in a state that can accept sessions
+pub fn create_session_with_run<S: Store>(
+    store: &S,
+    user_id: &UserId,
+    agent_id: &AgentId,
+    config: SessionConfig,
+    run_id: Option<String>,
+) -> Result<(Session, Option<AgentState>)> {
     let agent = store
         .get_agent(agent_id)?
         .ok_or(ControlError::AgentNotFound(*agent_id))?;
@@ -55,6 +76,7 @@ pub fn create_session<S: Store>(
         user_id: *user_id,
         status: SessionStatus::Active,
         config,
+        run_id,
         created_at: Utc::now(),
         closed_at: None,
     };
@@ -62,6 +84,27 @@ pub fn create_session<S: Store>(
     store.put_session(&session)?;
 
     Ok((session, state_change))
+}
+
+/// Find the active session bound to `run_id` for an agent, verifying ownership.
+///
+/// Returns `Ok(None)` if the agent has no active session for that run.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The agent is not found
+/// - The user is not the owner
+pub fn find_session_by_run<S: Store>(
+    store: &S,
+    user_id: &UserId,
+    agent_id: &AgentId,
+    run_id: &str,
+) -> Result<Option<Session>> {
+    let sessions = list_sessions(store, user_id, agent_id)?;
+    Ok(sessions
+        .into_iter()
+        .find(|s| s.run_id.as_deref() == Some(run_id) && s.status == SessionStatus::Active))
 }
 
 /// Determine what state change (if any) is needed for a session to be created.

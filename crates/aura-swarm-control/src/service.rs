@@ -109,6 +109,28 @@ pub trait ControlPlane: Send + Sync {
         config: SessionConfig,
     ) -> Result<Session>;
 
+    /// Create a new session pre-bound to a harness `run_id`.
+    ///
+    /// Used by the `POST /v1/run` proxy so the WS-attach path can later resolve
+    /// the owning session (for ownership checks + the Running -> Idle
+    /// transition) from the run id alone.
+    async fn create_run_session(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        run_id: String,
+    ) -> Result<Session>;
+
+    /// Find the active session bound to `run_id` for an agent.
+    ///
+    /// Returns `Ok(None)` if no active session is attached to that run.
+    async fn find_session_by_run(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        run_id: &str,
+    ) -> Result<Option<Session>>;
+
     /// Get a session by ID.
     async fn get_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<Session>;
 
@@ -698,6 +720,45 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         );
 
         Ok(session)
+    }
+
+    async fn create_run_session(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        run_id: String,
+    ) -> Result<Session> {
+        let uid = *user_id;
+        let aid = *agent_id;
+        let (session, state_change) = blocking_store(&self.store, move |s| {
+            session::create_session_with_run(s, &uid, &aid, SessionConfig::default(), Some(run_id))
+        })
+        .await?;
+
+        tracing::info!(
+            session_id = %session.session_id,
+            agent_id = %agent_id,
+            run_id = ?session.run_id,
+            state_change = ?state_change,
+            "Created run session"
+        );
+
+        Ok(session)
+    }
+
+    async fn find_session_by_run(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        run_id: &str,
+    ) -> Result<Option<Session>> {
+        let uid = *user_id;
+        let aid = *agent_id;
+        let run_id = run_id.to_string();
+        blocking_store(&self.store, move |s| {
+            session::find_session_by_run(s, &uid, &aid, &run_id)
+        })
+        .await
     }
 
     async fn get_session(&self, user_id: &UserId, session_id: &SessionId) -> Result<Session> {

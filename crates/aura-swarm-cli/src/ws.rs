@@ -5,7 +5,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aura_swarm_protocol::{InboundMessage, OutboundMessage, SessionInit};
+use aura_swarm_protocol::{InboundMessage, OutboundMessage};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -37,22 +37,6 @@ pub struct WsSender {
 }
 
 impl WsSender {
-    /// Send a `session_init` message to the harness.
-    ///
-    /// Must be sent immediately after connecting (both local and remote).
-    /// Currently unused — session init is sent inline during connect — but
-    /// retained as the canonical API for callers that manage the lifecycle
-    /// in two steps (connect then init).
-    #[allow(dead_code)]
-    pub async fn send_session_init(&self, init: SessionInit) -> Result<(), WsError> {
-        let msg = InboundMessage::SessionInit(init);
-        let json = serde_json::to_string(&msg)?;
-        self.tx
-            .send(json)
-            .await
-            .map_err(|e| WsError::Send(e.to_string()))
-    }
-
     /// Send a user message to the agent.
     pub async fn send_prompt(&self, content: &str) -> Result<(), WsError> {
         let msg = InboundMessage::UserMessage {
@@ -659,19 +643,5 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "cancel");
-    }
-
-    #[test]
-    fn session_init_serializes_correctly() {
-        let msg = InboundMessage::SessionInit(SessionInit {
-            model: Some("claude-opus-4-6-20250514".to_string()),
-            system_prompt: Some("You are helpful".to_string()),
-            ..SessionInit::default()
-        });
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["type"], "session_init");
-        assert_eq!(parsed["model"], "claude-opus-4-6-20250514");
-        assert_eq!(parsed["system_prompt"], "You are helpful");
     }
 }

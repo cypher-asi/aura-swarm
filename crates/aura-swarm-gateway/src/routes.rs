@@ -15,7 +15,7 @@ use tower_http::trace::TraceLayer;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
-use crate::handlers::{agents, automaton, files, health, internal, sessions, terminal, ws};
+use crate::handlers::{agents, automaton, files, health, internal, run, sessions, terminal, ws};
 use crate::state::GatewayState;
 
 /// Create the gateway router with all routes and middleware.
@@ -46,19 +46,20 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/files` - List directory contents
 /// - `POST /v1/agents/:agent_id/read-file` - Read file contents
 ///
-/// ## Sessions (authenticated)
+/// ## Sessions (authenticated, CRUD/observability only)
 /// - `POST /v1/agents/:agent_id/sessions` - Create session
 /// - `GET /v1/agents/:agent_id/sessions` - List sessions
 /// - `GET /v1/sessions/:session_id` - Get session
 /// - `DELETE /v1/sessions/:session_id` - Close session
-/// - `GET /v1/sessions/:session_id/ws` - WebSocket connection
 ///
-/// ## Automaton proxy (authenticated, dev-loop / task runner)
-/// - `POST /v1/agents/:agent_id/automaton/start` - Start automaton
-/// - `GET /v1/agents/:agent_id/automaton/:automaton_id/status` - Get status
-/// - `POST /v1/agents/:agent_id/automaton/:automaton_id/pause` - Pause
-/// - `POST /v1/agents/:agent_id/automaton/:automaton_id/stop` - Stop
-/// - `GET /v1/agents/:agent_id/stream/automaton/:automaton_id` - Event stream WS
+/// ## Runs (authenticated, proxied to pod `POST /v1/run` contract)
+/// - `POST /v1/agents/:agent_id/run` - Start a run (chat / dev-loop / task)
+/// - `GET /v1/agents/:agent_id/run/list` - List runs
+/// - `GET /v1/agents/:agent_id/run/:run_id/status` - Get run status
+/// - `POST /v1/agents/:agent_id/run/:run_id/pause` - Pause a run
+/// - `POST /v1/agents/:agent_id/run/:run_id/stop` - Stop a run
+/// - `GET /v1/agents/:agent_id/stream/:run_id` - Attach to a run's event stream (WS)
+/// - `GET /v1/agents/:agent_id/workspace/resolve` - Resolve a workspace path
 ///
 /// ## Internal (service-token authenticated, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
@@ -138,7 +139,8 @@ where
             "/v1/agents/:agent_id/read-file",
             post(files::read_file::<C, V>),
         )
-        // Sessions
+        // Sessions (CRUD + observability; the chat/automaton stream is driven
+        // by the run endpoints below)
         .route(
             "/v1/agents/:agent_id/sessions",
             post(sessions::create_session::<C, V>).get(sessions::list_sessions::<C, V>),
@@ -147,35 +149,31 @@ where
             "/v1/sessions/:session_id",
             get(sessions::get_session::<C, V>).delete(sessions::close_session::<C, V>),
         )
-        // WebSocket
+        // Run proxy (harness POST /v1/run + WS /stream/:run_id contract)
+        .route("/v1/agents/:agent_id/run", post(run::run_start::<C, V>))
         .route(
-            "/v1/sessions/:session_id/ws",
-            get(ws::websocket_handler::<C, V>),
-        )
-        // Automaton proxy (dev loop / task runner on agent pods)
-        .route(
-            "/v1/agents/:agent_id/automaton/start",
-            post(automaton::automaton_start::<C, V>),
+            "/v1/agents/:agent_id/run/list",
+            get(run::run_list::<C, V>),
         )
         .route(
-            "/v1/agents/:agent_id/automaton/:automaton_id/status",
-            get(automaton::automaton_status::<C, V>),
+            "/v1/agents/:agent_id/run/:run_id/status",
+            get(run::run_status::<C, V>),
         )
         .route(
-            "/v1/agents/:agent_id/automaton/:automaton_id/pause",
-            post(automaton::automaton_pause::<C, V>),
+            "/v1/agents/:agent_id/run/:run_id/pause",
+            post(run::run_pause::<C, V>),
         )
         .route(
-            "/v1/agents/:agent_id/automaton/:automaton_id/stop",
-            post(automaton::automaton_stop::<C, V>),
+            "/v1/agents/:agent_id/run/:run_id/stop",
+            post(run::run_stop::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/stream/:run_id",
+            get(ws::run_attach_handler::<C, V>),
         )
         .route(
             "/v1/agents/:agent_id/workspace/resolve",
             get(automaton::workspace_resolve::<C, V>),
-        )
-        .route(
-            "/v1/agents/:agent_id/stream/automaton/:automaton_id",
-            get(automaton::automaton_events_ws::<C, V>),
         )
         // Internal endpoints (service-token authenticated; not user API)
         .route(

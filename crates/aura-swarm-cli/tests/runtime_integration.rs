@@ -2,6 +2,10 @@
 //!
 //! These tests require aura-harness to be running on localhost:8080.
 //!
+//! They exercise the migrated runtime contract: a run is created with
+//! `POST /v1/run` (returning a `run_id`), then the client attaches to
+//! `WS /stream/:run_id` and exchanges `user_message` / streaming frames.
+//!
 //! Token resolution (first match wins):
 //!   1. `AURA_RUNTIME_TOKEN` env var
 //!   2. `AURA_SWARM_TOKEN` env var
@@ -18,17 +22,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aura_swarm_auth::{AuthConfig, ZosClient};
-use aura_swarm_protocol::{InboundMessage, OutboundMessage, SessionInit};
+use aura_swarm_protocol::{InboundMessage, OutboundMessage, RuntimeRequest, RuntimeRunResponse};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
-/// Default aura-harness endpoint.
-const RUNTIME_URL: &str = "ws://localhost:8080/stream";
+/// Default aura-harness HTTP base (override with `AURA_RUNTIME_URL`).
+const RUNTIME_BASE_URL: &str = "http://localhost:8080";
+
+/// User id stamped onto the `RuntimeRequest` (must be non-empty or the harness
+/// rejects the run with code `invalid_workspace`).
+const TEST_USER_ID: &str = "aura-swarm-cli-integration-test";
 
 /// Timeout for receiving messages.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -106,58 +115,87 @@ async fn login_from_env() -> Option<String> {
 // Test Helpers
 // =============================================================================
 
-/// Build a `SessionInit` with the resolved auth token.
-async fn session_init() -> SessionInit {
-    SessionInit {
-        token: get_token().await,
-        ..Default::default()
+/// HTTP base URL for the harness (`AURA_RUNTIME_URL`, default localhost:8080).
+fn runtime_base_url() -> String {
+    std::env::var("AURA_RUNTIME_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| RUNTIME_BASE_URL.to_string())
+}
+
+/// Derive the `ws://` base from the HTTP base.
+fn runtime_ws_base() -> String {
+    let base = runtime_base_url();
+    if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base
     }
 }
 
-/// Connect to the aura-harness WebSocket endpoint.
-async fn connect_to_runtime() -> Result<
+/// Create a chat run via `POST /v1/run` and return its `run_id`.
+async fn start_chat_run() -> Result<String, String> {
+    let token = get_token().await;
+
+    let mut request = RuntimeRequest::chat(TEST_USER_ID);
+    request.auth_jwt = token.clone();
+
+    let url = format!("{}/v1/run", runtime_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut builder = client.post(&url).json(&request);
+    if let Some(ref t) = token {
+        builder = builder.bearer_auth(t);
+    }
+
+    let resp = builder.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("POST /v1/run failed ({status}): {body}"));
+    }
+
+    let run: RuntimeRunResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(run.run_id)
+}
+
+/// Attach to a run's event stream WebSocket, forwarding the bearer token.
+async fn attach_to_run(
+    run_id: &str,
+) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
-    let url = std::env::var("AURA_RUNTIME_URL").unwrap_or_else(|_| RUNTIME_URL.to_string());
+    let url = format!("{}/stream/{run_id}", runtime_ws_base());
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("invalid ws url {url}: {e}"))?;
+    if let Some(token) = get_token().await {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            request.headers_mut().insert("Authorization", value);
+        }
+    }
 
-    match timeout(CONNECT_TIMEOUT, connect_async(&url)).await {
+    match timeout(CONNECT_TIMEOUT, connect_async(request)).await {
         Ok(Ok((ws_stream, _))) => Ok(ws_stream),
-        Ok(Err(e)) => Err(format!("Failed to connect to {url}: {e}")),
+        Ok(Err(e)) => Err(format!("Failed to attach to {url}: {e}")),
         Err(_) => Err(format!("Connection timeout to {url}")),
     }
 }
 
-/// Send a session_init, wait for session_ready, then send a user_message
-/// and collect all OutboundMessage until assistant_message_end or error.
+/// Start a chat run, attach to it, send a user_message, and collect all
+/// `OutboundMessage`s until `assistant_message_end` or `error`.
 async fn send_prompt_and_collect(prompt: &str) -> Result<(Vec<OutboundMessage>, String), String> {
-    let ws_stream = connect_to_runtime().await?;
+    let run_id = start_chat_run().await?;
+    let ws_stream = attach_to_run(&run_id).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    // 1. Send session_init (with resolved auth token)
-    let init = InboundMessage::SessionInit(session_init().await);
-    let json = serde_json::to_string(&init).map_err(|e| e.to_string())?;
-    write
-        .send(Message::Text(json))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 2. Wait for session_ready
-    match timeout(Duration::from_secs(30), read.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            let msg: OutboundMessage = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            if !matches!(msg, OutboundMessage::SessionReady(_)) {
-                return Err(format!("Expected session_ready, got: {text}"));
-            }
-        }
-        other => {
-            return Err(format!(
-                "Unexpected response waiting for session_ready: {other:?}"
-            ))
-        }
-    }
-
-    // 3. Send user_message
+    // Send user_message directly — the run is already configured server-side.
     let user_msg = InboundMessage::UserMessage {
         content: prompt.to_string(),
     };
@@ -167,7 +205,7 @@ async fn send_prompt_and_collect(prompt: &str) -> Result<(Vec<OutboundMessage>, 
         .await
         .map_err(|e| e.to_string())?;
 
-    // 4. Collect messages
+    // Collect messages
     let mut messages = Vec::new();
     let mut text_buffer = String::new();
 
@@ -236,37 +274,18 @@ async fn send_prompt_and_collect(prompt: &str) -> Result<(Vec<OutboundMessage>, 
 // Integration Tests
 // =============================================================================
 
-/// Test basic connectivity: session_init -> session_ready -> user_message -> streaming response.
+/// Test basic connectivity: create run -> attach -> user_message -> streaming.
 #[tokio::test]
 async fn test_connection() {
-    let ws_stream = connect_to_runtime()
+    let run_id = start_chat_run().await.expect("Failed to create run");
+    println!("OK Created run {run_id}");
+
+    let ws_stream = attach_to_run(&run_id)
         .await
-        .expect("Failed to connect to aura-harness");
-    println!("OK WebSocket handshake successful");
+        .expect("Failed to attach to run stream");
+    println!("OK WebSocket attach successful");
 
     let (mut write, mut read) = ws_stream.split();
-
-    // Send session_init (with resolved auth token)
-    let init = InboundMessage::SessionInit(session_init().await);
-    let json = serde_json::to_string(&init).expect("Failed to serialize");
-    write
-        .send(Message::Text(json))
-        .await
-        .expect("Failed to send session_init");
-    println!("OK Sent session_init");
-
-    // Wait for session_ready
-    match timeout(Duration::from_secs(30), read.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            let msg: OutboundMessage = serde_json::from_str(&text).expect("Failed to parse");
-            assert!(
-                matches!(msg, OutboundMessage::SessionReady(_)),
-                "Expected session_ready, got: {text}"
-            );
-            println!("OK Received session_ready");
-        }
-        other => panic!("Unexpected response: {other:?}"),
-    }
 
     // Send user_message
     let user_msg = InboundMessage::UserMessage {
@@ -404,24 +423,9 @@ fn variant_name(msg: &OutboundMessage) -> &'static str {
 /// Test cancellation mid-stream.
 #[tokio::test]
 async fn test_cancellation() {
-    let ws_stream = connect_to_runtime().await.expect("Failed to connect");
+    let run_id = start_chat_run().await.expect("Failed to create run");
+    let ws_stream = attach_to_run(&run_id).await.expect("Failed to attach");
     let (mut write, mut read) = ws_stream.split();
-
-    // session_init (with resolved auth token)
-    let init = InboundMessage::SessionInit(session_init().await);
-    write
-        .send(Message::Text(serde_json::to_string(&init).unwrap()))
-        .await
-        .expect("Failed to send session_init");
-
-    // Wait for session_ready
-    match timeout(Duration::from_secs(30), read.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            let msg: OutboundMessage = serde_json::from_str(&text).unwrap();
-            assert!(matches!(msg, OutboundMessage::SessionReady(_)));
-        }
-        other => panic!("Expected session_ready, got: {other:?}"),
-    }
 
     // Send a long prompt
     let user_msg = InboundMessage::UserMessage {

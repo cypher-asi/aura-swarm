@@ -57,8 +57,8 @@ pub struct App {
     pub input_mode: InputMode,
     /// WebSocket senders per connected agent (by agent_id).
     ws_senders: HashMap<String, WsSender>,
-    /// Active session IDs per connected agent (by agent_id).
-    session_ids: HashMap<String, String>,
+    /// Active harness run IDs per connected agent (by agent_id).
+    run_ids: HashMap<String, String>,
     /// Chat scroll position.
     pub chat_scroll: usize,
     /// Status message to display.
@@ -109,7 +109,7 @@ impl App {
             cursor_position: 0,
             input_mode: InputMode::Normal,
             ws_senders: HashMap::new(),
-            session_ids: HashMap::new(),
+            run_ids: HashMap::new(),
             chat_scroll: 0,
             status_message: None,
             should_quit: false,
@@ -601,26 +601,24 @@ impl App {
             self.disconnect_agent(&agent_id).await;
         }
 
-        let session = self
+        // Start a run, then attach to its event stream. The harness no longer
+        // takes a `session_init` first frame — run configuration lives in the
+        // `POST /v1/run` body, and the gateway returns the swarm-facing WS path.
+        let run = self
             .client
-            .create_session(&agent_id)
+            .create_run(&agent_id)
             .await
             .map_err(|e| e.to_string())?;
 
-        let session_id = session.session_id.clone();
-        let ws_url = self.client.ws_url(&session_id);
+        let run_id = run.run_id.clone();
+        let ws_url = self.client.run_ws_url(&agent_id, &run_id);
 
         let (sender, receiver) = ws::connect(&ws_url, self.client.token())
             .await
             .map_err(|e| e.to_string())?;
 
-        sender
-            .send_session_init(aura_swarm_protocol::SessionInit::default())
-            .await
-            .map_err(|e| e.to_string())?;
-
         self.ws_senders.insert(agent_id.clone(), sender);
-        self.session_ids.insert(agent_id.clone(), session_id);
+        self.run_ids.insert(agent_id.clone(), run_id);
 
         self.load_messages_from_cache(&agent_id);
 
@@ -642,12 +640,16 @@ impl App {
     }
 
     /// Disconnect a specific agent's WebSocket session.
+    ///
+    /// Dropping the WS sender ends the proxy, which closes the swarm session
+    /// server-side. We additionally best-effort stop the run so the pod tears
+    /// down the runtime promptly.
     async fn disconnect_agent(&mut self, agent_id: &str) {
         self.ws_senders.remove(agent_id);
         self.streaming_state_cache.remove(agent_id);
 
-        if let Some(session_id) = self.session_ids.remove(agent_id) {
-            let _ = self.client.close_session(&session_id).await;
+        if let Some(run_id) = self.run_ids.remove(agent_id) {
+            let _ = self.client.stop_run(agent_id, &run_id).await;
         }
     }
 
@@ -680,9 +682,9 @@ impl App {
             }
         }
 
-        let session_ids: Vec<String> = self.session_ids.drain().map(|(_, v)| v).collect();
-        for session_id in session_ids {
-            let _ = self.client.close_session(&session_id).await;
+        let runs: Vec<(String, String)> = self.run_ids.drain().collect();
+        for (agent_id, run_id) in runs {
+            let _ = self.client.stop_run(&agent_id, &run_id).await;
         }
 
         self.ws_senders.clear();
@@ -734,9 +736,7 @@ impl App {
             }
             WsEvent::SessionReady { session_id, tools } => {
                 let tool_count = tools.len();
-                if let Some(agent_id) = self.selected_agent_id().map(String::from) {
-                    self.session_ids.insert(agent_id, session_id);
-                }
+                tracing::debug!(session_id = %session_id, tool_count, "Run session ready");
                 self.set_status(format!("Session ready ({tool_count} tools available)"));
                 true
             }
@@ -902,7 +902,7 @@ impl App {
         // agent it is or whether it is selected.
         if matches!(event, WsEvent::Disconnected) {
             self.ws_senders.remove(agent_id);
-            self.session_ids.remove(agent_id);
+            self.run_ids.remove(agent_id);
         }
 
         let is_selected = self.selected_agent_id().map_or(false, |id| id == agent_id);

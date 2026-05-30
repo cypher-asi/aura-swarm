@@ -1,9 +1,14 @@
-//! WebSocket proxy handler.
+//! WebSocket run-attach proxy handler.
 //!
-//! This module provides bidirectional WebSocket proxying between clients and agent pods.
-//! Successful harness protocol traffic remains transparent. The gateway only emits a
-//! typed error frame when it cannot connect to the pod after the client websocket has
-//! already upgraded.
+//! This module provides bidirectional WebSocket proxying between clients and
+//! agent pods for an in-flight run. A run is first created via
+//! `POST /v1/agents/:agent_id/run` ([`crate::handlers::run`]); the client then
+//! attaches to `GET /v1/agents/:agent_id/stream/:run_id`, which proxies to the
+//! pod's `ws://{pod}/stream/{run_id}`.
+//!
+//! Successful harness protocol traffic remains transparent. The gateway only
+//! emits a typed error frame when it cannot connect to the pod after the client
+//! websocket has already upgraded.
 
 use std::sync::Arc;
 
@@ -17,61 +22,70 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::MaybeTlsStream;
 
 use aura_swarm_auth::JwtValidator;
-use aura_swarm_control::{ControlPlane, SessionStatus};
-use aura_swarm_core::SessionId;
+use aura_swarm_control::ControlPlane;
+use aura_swarm_core::{AgentId, SessionId};
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
+use crate::handlers::run::validate_run_id;
 use crate::state::GatewayState;
 
-/// WebSocket connection handler.
+/// Parse an agent ID from a hex string.
+fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
+    AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
+}
+
+/// WebSocket run-attach handler.
 ///
-/// Validates session ownership and upgrades to a WebSocket connection, then
-/// proxies messages bidirectionally between the client and the agent pod.
-/// No message inspection or side effects -- pure transparent proxy.
+/// Verifies agent ownership, resolves the swarm session bound to the run, then
+/// upgrades and proxies messages bidirectionally between the client and the
+/// pod's `/stream/:run_id`. No message inspection or side effects -- pure
+/// transparent proxy, except that the swarm session is closed when the proxy
+/// ends so the agent can transition to Idle when no sessions remain.
 ///
 /// # Errors
 ///
-/// Returns an error if the session is not found, the user doesn't own it,
-/// the session is not active, or the agent is unavailable.
-pub(crate) async fn websocket_handler<C, V>(
+/// Returns an error if the agent or run session is not found, the user doesn't
+/// own it, the session is not active, or the agent is unavailable.
+pub(crate) async fn run_attach_handler<C, V>(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState<C, V>>>,
-    Path(session_id): Path<String>,
+    Path((agent_id, run_id)): Path<(String, String)>,
     user: AuthUser,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
-    let session_id = parse_session_id(&session_id)?;
+    let agent_id = parse_agent_id(&agent_id)?;
+    let run_id = validate_run_id(&run_id)?.to_string();
 
+    // Verify ownership and resolve the session that the run handler created.
     let session = state
         .control
-        .get_session(&user.user_id, &session_id)
-        .await?;
-
-    if session.status != SessionStatus::Active {
-        return Err(ApiError::Conflict("session is not active".to_string()));
-    }
+        .find_session_by_run(&user.user_id, &agent_id, &run_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("active run {run_id}")))?;
 
     let endpoint = state
         .control
-        .resolve_agent_endpoint(&session.agent_id)
+        .resolve_agent_endpoint(&agent_id)
         .await?
         .ok_or(ApiError::AgentUnavailable)?;
 
     let timeout = state.config.websocket_timeout();
-    let agent_id_str = session.agent_id.to_string();
+    let agent_id_str = agent_id.to_string();
+    let session_id = session.session_id;
     let session_id_str = session_id.to_string();
     let user_id_str = user.user_id.to_string();
     let token = user.token;
 
     tracing::info!(
+        run_id = %run_id,
         session_id = %session_id_str,
         agent_id = %agent_id_str,
         user_id = %user_id_str,
-        "WebSocket connection initiated"
+        "WebSocket run attach initiated"
     );
 
     let control = Arc::clone(&state.control);
@@ -80,6 +94,7 @@ where
         handle_websocket(
             socket,
             endpoint,
+            run_id,
             session_id,
             session_id_str,
             agent_id_str,
@@ -93,12 +108,15 @@ where
 
 /// Handle the WebSocket connection after upgrade.
 ///
-/// Connects to the agent's `/stream` endpoint and proxies bidirectionally.
-/// When the proxy ends for any reason, the session is automatically closed
-/// so that the agent can transition to Idle when no sessions remain.
+/// Connects to the agent's `/stream/:run_id` endpoint and proxies
+/// bidirectionally. When the proxy ends for any reason, the session is
+/// automatically closed so that the agent can transition to Idle when no
+/// sessions remain.
+#[allow(clippy::too_many_arguments)]
 async fn handle_websocket<C: ControlPlane + 'static>(
     mut client_socket: WebSocket,
     agent_endpoint: String,
+    run_id: String,
     session_id: SessionId,
     session_id_str: String,
     agent_id_str: String,
@@ -107,7 +125,7 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     timeout: std::time::Duration,
     control: Arc<C>,
 ) {
-    let agent_url = format!("ws://{agent_endpoint}/stream");
+    let agent_url = format!("ws://{agent_endpoint}/stream/{run_id}");
     let Some(agent_socket) =
         connect_to_agent(&agent_url, &token, timeout, &session_id_str, &agent_id_str).await
     else {
@@ -301,12 +319,6 @@ async fn forward_agent_to_client(
         }
     }
     Ok(())
-}
-
-/// Parse a session ID from a string.
-fn parse_session_id(s: &str) -> Result<SessionId, ApiError> {
-    s.parse()
-        .map_err(|_| ApiError::BadRequest(format!("invalid session ID: {s}")))
 }
 
 #[cfg(test)]

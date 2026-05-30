@@ -405,10 +405,12 @@ sequenceDiagram
     participant Gateway
     participant Agent
     
-    Client->>Gateway: WS /v1/sessions/{id}/ws
-    Gateway->>Gateway: Validate session
-    Gateway->>Gateway: Resolve agent endpoint
-    Gateway->>Agent: WS /stream (internal)
+    Client->>Gateway: POST /v1/agents/{id}/run
+    Gateway->>Agent: POST /v1/run (internal) -> { run_id }
+    Gateway->>Client: { run_id, event_stream_url }
+    Client->>Gateway: WS /v1/agents/{id}/stream/{run_id}
+    Gateway->>Gateway: Resolve run session + agent endpoint
+    Gateway->>Agent: WS /stream/{run_id} (internal)
     
     loop Bidirectional
         Client->>Gateway: Message
@@ -428,9 +430,10 @@ use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
 pub async fn proxy_websocket(
     client: WebSocket,
     agent_endpoint: String,
+    run_id: String,
 ) {
-    // Connect to agent
-    let agent_url = format!("ws://{}/stream", agent_endpoint);
+    // Connect to the pod's per-run stream
+    let agent_url = format!("ws://{}/stream/{}", agent_endpoint, run_id);
     let (agent_ws, _) = match connect_async(&agent_url).await {
         Ok(conn) => conn,
         Err(e) => {

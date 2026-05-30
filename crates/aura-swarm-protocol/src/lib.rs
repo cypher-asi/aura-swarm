@@ -1,8 +1,14 @@
-//! Shared WebSocket protocol types for the aura-harness `/stream` endpoint.
+//! Shared protocol types for the aura-harness runtime contract.
 //!
 //! This crate defines the canonical message format for communication between
 //! clients and the aura-harness reasoning engine. Both the CLI and gateway
 //! depend on these types to ensure protocol consistency.
+//!
+//! A run is started with [`RuntimeRequest`] via `POST /v1/run`, which returns
+//! a [`RuntimeRunResponse`] carrying the `run_id`. The caller then opens
+//! `WS /stream/:run_id` and exchanges [`InboundMessage`] / [`OutboundMessage`]
+//! frames over that socket (chat runs are bidirectional; automaton runs are
+//! event-only).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -14,11 +20,14 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Client -> Harness: top-level message envelope.
+///
+/// Sent over `WS /stream/:run_id` after a run is created with
+/// [`RuntimeRequest`]. There is no longer a `session_init` first frame —
+/// session configuration now lives in the [`RuntimeRequest`] body posted to
+/// `POST /v1/run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundMessage {
-    /// Initialize the session (must be the first message).
-    SessionInit(SessionInit),
     /// Send a user message for processing.
     UserMessage {
         /// The user's message text.
@@ -28,43 +37,6 @@ pub enum InboundMessage {
     Cancel,
     /// External tool callback response (client -> harness).
     ToolCallbackResponse(ToolCallbackResponse),
-}
-
-/// Payload for `session_init`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionInit {
-    /// Optional system prompt for the session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    /// Optional model identifier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Optional maximum tokens per response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    /// Optional maximum number of turns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
-    /// Optional workspace path or root directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
-    /// Optional authentication token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// External tools registered for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub external_tools: Vec<ExternalToolDef>,
-}
-
-/// External tool definition for session registration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalToolDef {
-    /// Tool name used in protocol messages.
-    pub name: String,
-    /// Human-readable description for the model.
-    pub description: String,
-    /// JSON Schema describing the tool's input arguments.
-    pub input_schema: serde_json::Value,
 }
 
 // =============================================================================
@@ -223,20 +195,280 @@ pub struct ToolCallbackResponse {
     pub is_error: bool,
 }
 
+// =============================================================================
+// Runtime Run Request (`POST /v1/run`)
+// =============================================================================
+//
+// These types are wire-compatible *mirrors* of the canonical harness types in
+// `aura_protocol::runtime_request` (aura-os). A run is created by POSTing a
+// [`RuntimeRequest`] to the pod's `/v1/run` endpoint; the harness responds with
+// a [`RuntimeRunResponse`] carrying the `run_id`, after which the caller opens
+// `WS /stream/:run_id`.
+//
+// The swarm only ever *constructs* the chat-shaped subset of this contract
+// (it does not author the heavy policy / capability bundles), so the
+// kernel-enforced bundles (`agent_permissions`, `tool_permissions`,
+// `agent_capabilities`) and the rich sub-objects the swarm never builds
+// (`persona`, `provider_overrides`) are modeled as opaque
+// `Option<serde_json::Value>` that simply round-trip through the gateway.
+
+/// Canonical body of `POST /v1/run`.
+///
+/// Returned synchronously with [`RuntimeRunResponse`]. Build one with
+/// [`RuntimeRequest::chat`] and populate the model / workspace / auth fields
+/// via the builder setters or public fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRequest {
+    /// Discriminated union carrying the data unique to each request type.
+    #[serde(rename = "type")]
+    pub r#type: RuntimeRequestType,
+    /// Who is this agent — template + partition + persona + skills + prompt.
+    #[serde(default)]
+    pub agent_identity: AgentIdentity,
+    /// What model to drive the agent with.
+    #[serde(default)]
+    pub model: ModelSelection,
+    /// Where the agent runs (workspace + project path + git repo/branch).
+    #[serde(default)]
+    pub workspace: WorkspaceLocation,
+    /// Project context (project id + billing partition). `None` for ad-hoc chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectContext>,
+    /// Opaque policy bundle — what the agent is allowed to do. The swarm does
+    /// not construct this; it is forwarded verbatim when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_permissions: Option<serde_json::Value>,
+    /// Opaque per-tool on/off overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_permissions: Option<serde_json::Value>,
+    /// Opaque capability bundle — tools / integrations / intent classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_capabilities: Option<serde_json::Value>,
+    /// Bearer JWT forwarded to the model proxy + domain API calls. `None` is
+    /// valid only in dev (auth disabled on the pod).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_jwt: Option<String>,
+    /// Originating end-user id. REQUIRED and must be non-empty, or the harness
+    /// rejects the request with code `invalid_workspace`.
+    pub user_id: String,
+}
+
+impl RuntimeRequest {
+    /// Construct a bare chat run request for the given end-user id.
+    ///
+    /// Populate `model`, `workspace`, `auth_jwt`, etc. via the builder setters
+    /// or by mutating the public fields directly.
+    #[must_use]
+    pub fn chat(user_id: impl Into<String>) -> Self {
+        Self {
+            r#type: RuntimeRequestType::Chat {
+                conversation_messages: Vec::new(),
+            },
+            agent_identity: AgentIdentity::default(),
+            model: ModelSelection::default(),
+            workspace: WorkspaceLocation::default(),
+            project: None,
+            agent_permissions: None,
+            tool_permissions: None,
+            agent_capabilities: None,
+            auth_jwt: None,
+            user_id: user_id.into(),
+        }
+    }
+
+    /// Set the bearer JWT forwarded to the pod.
+    #[must_use]
+    pub fn with_auth_jwt(mut self, jwt: impl Into<String>) -> Self {
+        self.auth_jwt = Some(jwt.into());
+        self
+    }
+
+    /// Set the model selection.
+    #[must_use]
+    pub fn with_model(mut self, model: ModelSelection) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Set the workspace location.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceLocation) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Set the agent identity.
+    #[must_use]
+    pub fn with_agent_identity(mut self, agent_identity: AgentIdentity) -> Self {
+        self.agent_identity = agent_identity;
+        self
+    }
+}
+
+/// Discriminated union carrying the data unique to each run type.
+///
+/// Serializes with an internal `kind` tag and a `params` content object, e.g.
+/// `{"kind":"chat","params":{"conversation_messages":[]}}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
+pub enum RuntimeRequestType {
+    /// Bidirectional chat session. The WS stream stays open and the client
+    /// sends `user_message` frames over it.
+    Chat {
+        /// Prior conversation messages to hydrate (empty for a new session).
+        /// Opaque to the swarm; forwarded verbatim.
+        #[serde(default)]
+        conversation_messages: Vec<serde_json::Value>,
+    },
+    /// Dev-loop automaton — long-running, no client messages after kickoff.
+    DevLoop {},
+    /// Single-task automaton — runs one task to completion, then exits.
+    TaskRun {
+        /// Task UUID the automaton should execute.
+        task_id: String,
+        /// Reason text persisted on the previous attempt's failure.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_failure: Option<String>,
+        /// Recent work-log entries the agent should re-see.
+        #[serde(default)]
+        work_log: Vec<String>,
+    },
+}
+
+impl Default for RuntimeRequestType {
+    fn default() -> Self {
+        Self::Chat {
+            conversation_messages: Vec::new(),
+        }
+    }
+}
+
+/// "Who is this agent" bundle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    /// Stable template agent UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    /// Partitioned harness agent id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_id: Option<String>,
+    /// Opaque persona fields. The swarm does not construct this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<serde_json::Value>,
+    /// Operator-curated skill names.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Operator-authored system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+}
+
+/// "What model to drive the agent with."
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelSelection {
+    /// Model identifier (e.g. `"claude-opus-4-7"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Maximum tokens per model response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Maximum agentic steps per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Opaque per-session provider overrides. The swarm does not construct this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_overrides: Option<serde_json::Value>,
+}
+
+/// "Where the agent runs."
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceLocation {
+    /// Workspace directory path (under the pod's `workspaces` base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// Absolute path to the real project directory on the host filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    /// Optional remote-git source URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo_url: Option<String>,
+    /// Optional remote-git branch paired with `git_repo_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+/// "Which project + which billing partition."
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectContext {
+    /// Project UUID for domain tool calls.
+    pub project_id: String,
+    /// Opaque typed project descriptor. The swarm does not construct this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_info: Option<serde_json::Value>,
+    /// Organization UUID for the `X-Aura-Org-Id` billing header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aura_org_id: Option<String>,
+    /// Storage session UUID for the `X-Aura-Session-Id` billing header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aura_session_id: Option<String>,
+    /// Project-agent UUID for the `X-Aura-Agent-Id` billing header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aura_agent_id: Option<String>,
+}
+
+/// Response body of `POST /v1/run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRunResponse {
+    /// Stable identifier for the spawned run.
+    pub run_id: String,
+    /// The relative WS path the client should open to attach to the run.
+    pub event_stream_url: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn session_init_serializes() {
-        let msg = InboundMessage::SessionInit(SessionInit {
-            system_prompt: Some("You are helpful".into()),
-            model: Some("claude-opus-4-6-20250514".into()),
-            ..Default::default()
-        });
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"session_init\""));
-        assert!(json.contains("\"system_prompt\":\"You are helpful\""));
+    fn chat_runtime_request_serializes_and_round_trips() {
+        let req = RuntimeRequest::chat("user-123")
+            .with_auth_jwt("jwt-abc")
+            .with_model(ModelSelection {
+                id: Some("claude-opus-4-7".into()),
+                ..Default::default()
+            });
+
+        let json = serde_json::to_string(&req).unwrap();
+        // The discriminated-union body must use the harness `type`/`kind`/`params` shape.
+        assert!(
+            json.contains("\"type\":{\"kind\":\"chat\""),
+            "unexpected chat tag shape: {json}"
+        );
+        assert!(json.contains("\"conversation_messages\":[]"), "{json}");
+        assert!(json.contains("\"user_id\":\"user-123\""), "{json}");
+        assert!(json.contains("\"auth_jwt\":\"jwt-abc\""), "{json}");
+        // Opaque bundles the swarm never builds must be omitted entirely.
+        assert!(!json.contains("agent_permissions"), "{json}");
+        assert!(!json.contains("agent_capabilities"), "{json}");
+
+        let back: RuntimeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.user_id, "user-123");
+        assert_eq!(back.auth_jwt.as_deref(), Some("jwt-abc"));
+        assert!(matches!(
+            back.r#type,
+            RuntimeRequestType::Chat { ref conversation_messages } if conversation_messages.is_empty()
+        ));
+    }
+
+    #[test]
+    fn runtime_run_response_round_trips() {
+        let json = r#"{"run_id":"run-9","event_stream_url":"/stream/run-9"}"#;
+        let resp: RuntimeRunResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.run_id, "run-9");
+        assert_eq!(resp.event_stream_url, "/stream/run-9");
     }
 
     #[test]

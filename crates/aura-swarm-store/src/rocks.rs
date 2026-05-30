@@ -540,6 +540,7 @@ mod tests {
             user_id,
             status: SessionStatus::Active,
             config: SessionConfig::default(),
+            run_id: None,
             created_at: chrono::Utc::now(),
             closed_at: None,
         };
@@ -582,6 +583,7 @@ mod tests {
                 user_id,
                 status: SessionStatus::Active,
                 config: SessionConfig::default(),
+                run_id: None,
                 created_at: chrono::Utc::now(),
                 closed_at: None,
             };
@@ -595,6 +597,7 @@ mod tests {
             user_id,
             status: SessionStatus::Active,
             config: SessionConfig::default(),
+            run_id: None,
             created_at: chrono::Utc::now(),
             closed_at: None,
         };

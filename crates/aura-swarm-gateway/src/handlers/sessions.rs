@@ -30,8 +30,11 @@ pub(crate) struct CreateSessionResponse {
     pub(crate) session_id: String,
     /// Agent ID.
     pub(crate) agent_id: String,
-    /// WebSocket URL for connecting to this session.
-    pub(crate) ws_url: String,
+    /// Entry point for driving this agent: with the migration to the
+    /// `POST /v1/run` contract there is no per-session WebSocket. Clients
+    /// start a run here (which returns a `run_id` + the swarm-facing
+    /// `event_stream_url`) and then attach to that stream.
+    pub(crate) run_url: String,
     /// Creation timestamp.
     pub(crate) created_at: DateTime<Utc>,
 }
@@ -116,7 +119,7 @@ where
     let response = CreateSessionResponse {
         session_id: session.session_id.to_string(),
         agent_id: session.agent_id.to_string(),
-        ws_url: format!("/v1/sessions/{}/ws", session.session_id),
+        run_url: format!("/v1/agents/{}/run", session.agent_id),
         created_at: session.created_at,
     };
 

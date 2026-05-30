@@ -22,6 +22,7 @@ aura-swarm-core = { path = "../aura-swarm-core" }
 aura-swarm-auth = { path = "../aura-swarm-auth" }
 aura-swarm-control = { path = "../aura-swarm-control" }
 aura-swarm-store = { path = "../aura-swarm-store" }
+aura-swarm-protocol = { path = "../aura-swarm-protocol" }
 
 # Web framework
 axum = { workspace = true, features = ["ws", "macros"] }

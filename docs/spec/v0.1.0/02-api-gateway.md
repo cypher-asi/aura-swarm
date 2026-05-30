@@ -481,7 +481,12 @@ where
 }
 ```
 
-### 4.4 WebSocket Handler
+### 4.4 WebSocket Run-Attach Handler
+
+A run is first created via `POST /v1/agents/:agent_id/run` (which proxies the
+pod's `POST /v1/run` and returns a `run_id`). The client then attaches to
+`GET /v1/agents/:agent_id/stream/:run_id`, which the gateway proxies to the
+pod's `ws://{pod}/stream/{run_id}`.
 
 ```rust
 use axum::{
@@ -490,33 +495,34 @@ use axum::{
 };
 use tokio_tungstenite::connect_async;
 
-pub async fn websocket_handler(
+pub async fn run_attach_handler(
     ws: WebSocketUpgrade,
-    Path(session_id): Path<String>,
+    Path((agent_id, run_id)): Path<(String, String)>,
     State(state): State<Arc<GatewayState>>,
     user: AuthUser,
 ) -> Result<Response, ApiError> {
-    // Validate session ownership
-    let session = state.control.get_session(&session_id).await?;
-    if session.user_id != user.user_id {
-        return Err(ApiError::Forbidden);
-    }
-    
+    // Verify agent ownership and resolve the run's swarm session.
+    let session = state.control
+        .find_session_by_run(&user.user_id, &agent_id, &run_id)
+        .await?
+        .ok_or(ApiError::NotFound("active run".into()))?;
+
     // Get agent endpoint
-    let endpoint = state.control.resolve_agent_endpoint(&session.agent_id).await?;
-    
+    let endpoint = state.control.resolve_agent_endpoint(&agent_id).await?;
+
     Ok(ws.on_upgrade(move |socket| {
-        handle_websocket(socket, endpoint, session_id)
+        handle_websocket(socket, endpoint, run_id, session.session_id)
     }))
 }
 
 async fn handle_websocket(
     client_socket: WebSocket,
     agent_endpoint: String,
-    session_id: String,
+    run_id: String,
+    session_id: SessionId,
 ) {
-    // Connect to agent
-    let agent_url = format!("ws://{}/stream", agent_endpoint);
+    // Connect to the pod's per-run stream
+    let agent_url = format!("ws://{}/stream/{}", agent_endpoint, run_id);
     let (agent_socket, _) = match connect_async(&agent_url).await {
         Ok(conn) => conn,
         Err(e) => {

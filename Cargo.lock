@@ -263,6 +263,7 @@ dependencies = [
  "aura-swarm-auth",
  "aura-swarm-control",
  "aura-swarm-core",
+ "aura-swarm-protocol",
  "aura-swarm-store",
  "axum",
  "axum-test",

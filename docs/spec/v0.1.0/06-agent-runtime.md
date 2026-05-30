@@ -112,15 +112,22 @@ Agent is considered:
 
 ## 4. Interaction Contract
 
-### 4.1 WebSocket Session Endpoint
+### 4.1 Run Creation + WebSocket Attach
 
-Aura must expose:
+Aura must expose a two-step interface for user interaction:
 
 ```
-WS /stream
+POST /v1/run        # create a run, returns { run_id, event_stream_url }
+WS   /stream/:run_id # attach to that run's event stream
 ```
 
-This is the primary interface for user interaction.
+A run is created by `POST /v1/run` with a `RuntimeRequest` body (session
+configuration now lives in this body rather than in a `session_init` first
+frame). The response carries the `run_id` and the `event_stream_url`
+(`/stream/:run_id`) the client then opens. Chat runs keep the socket open for
+bidirectional `user_message` / streaming frames; automaton runs are
+event-only. This replaces the previous `WS /stream` first-frame `session_init`
+handshake and the `/automaton/*` route family.
 
 ### 4.2 Message Protocol
 
@@ -417,14 +424,22 @@ pub trait Store: Send + Sync {
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/health` | GET | Health check (required) |
-| `/stream` | WS | Interactive session stream (required) |
+| `/v1/run` | POST | Create a run (chat / dev-loop / task); returns `{ run_id, event_stream_url }` (auth-gated) |
+| `/stream/:run_id` | WS | Attach to a run's event stream (chat = bidirectional, automaton = event-only; auth-gated) |
+| `/v1/run/list` | GET | List runs |
+| `/v1/run/:run_id/status` | GET | Fetch run status |
+| `/v1/run/:run_id/pause` | POST | Pause a run |
+| `/v1/run/:run_id/stop` | POST | Stop a run |
 | `/ws/terminal` | WS | Terminal transport |
 | `/api/files` | GET | List workspace files |
 | `/api/read-file` | GET | Read a single file |
 | `/workspace/resolve` | GET | Resolve named workspaces |
-| `/automaton/start` | POST | Start an automaton run |
-| `/automaton/:automaton_id/status` | GET | Fetch automaton status |
-| `/stream/automaton/:automaton_id` | WS | Automaton event stream |
+
+A run is created by `POST /v1/run` with a `RuntimeRequest` body (discriminated
+on `type.kind` over `chat` / `dev_loop` / `task_run`). The response carries the
+`run_id` and the `event_stream_url` (`/stream/:run_id`) the client then opens.
+This replaces the previous `/stream` first-frame `session_init` handshake and
+the `/automaton/*` route family.
 
 ---
 

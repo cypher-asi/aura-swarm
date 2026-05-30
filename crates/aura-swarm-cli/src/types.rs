@@ -125,23 +125,6 @@ pub struct LifecycleResponse {
 }
 
 // =============================================================================
-// Session Types
-// =============================================================================
-
-/// Response for creating a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateSessionResponse {
-    /// Session ID.
-    pub session_id: String,
-    /// Agent ID.
-    pub agent_id: String,
-    /// WebSocket URL for connecting.
-    pub ws_url: String,
-    /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
-}
-
-// =============================================================================
 // WebSocket Message Types
 // =============================================================================
 

@@ -7,6 +7,7 @@ pub(crate) mod automaton;
 pub(crate) mod files;
 pub(crate) mod health;
 pub(crate) mod internal;
+pub(crate) mod run;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
 pub(crate) mod ws;

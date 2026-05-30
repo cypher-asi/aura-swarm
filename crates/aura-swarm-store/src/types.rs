@@ -3,7 +3,6 @@
 //! These types represent the persisted state of agents, sessions, and users.
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
-pub use aura_swarm_protocol::ExternalToolDef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +146,12 @@ pub struct Session {
     /// Per-session configuration for the harness runtime.
     #[serde(default)]
     pub config: SessionConfig,
+    /// Harness `run_id` this session is attached to, set once the gateway has
+    /// created the run via `POST /v1/run`. The WS-attach path resolves the
+    /// owning session from this id so the Running -> Idle transition still
+    /// fires when the run's stream closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// When the session was closed (if closed).
@@ -166,8 +171,10 @@ pub enum SessionStatus {
 
 /// Per-session configuration for the harness runtime.
 ///
-/// Stored alongside the session record so the gateway can construct
-/// a `session_init` message when proxying the WebSocket connection.
+/// Stored alongside the session record. With the migration to the
+/// `POST /v1/run` contract the gateway populates a
+/// [`aura_swarm_protocol::RuntimeRequest`] from the run request body rather
+/// than from this struct, so these fields are advisory metadata only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// System prompt override for this session.
@@ -185,9 +192,6 @@ pub struct SessionConfig {
     /// Workspace configuration for file operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceConfig>,
-    /// External tool definitions registered for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub external_tools: Vec<ExternalToolDef>,
 }
 
 /// Workspace configuration for a session.
