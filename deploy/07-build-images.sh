@@ -28,6 +28,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# Force plain, line-streamed BuildKit output so long `docker build` runs show
+# real-time progress instead of an interactive TUI that looks frozen in many
+# terminals (Docker 29.x defaults to --progress=auto).
+export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
+
 # Parse arguments
 BUILD_PLATFORM=true
 DEV_MODE=false
@@ -94,6 +99,46 @@ if [[ "$DEV_MODE" == "true" ]]; then
     echo "  - No ZID server required"
     echo ""
 fi
+
+#------------------------------------------------------------------------------
+# Preflight: verify credentials BEFORE doing a long build.
+#
+# Build + push can take many minutes. AWS session tokens (esp. STS / SSO)
+# routinely expire mid-script, which historically left us with a pushed
+# image but a failed scheduler restart. Fail fast instead.
+#------------------------------------------------------------------------------
+
+echo "Running preflight credential checks..."
+
+if ! AWS_CALLER_ARN=$(aws sts get-caller-identity --output text --query Arn 2>&1); then
+    echo -e "${RED}✗${NC} AWS credentials are missing or expired."
+    echo "  aws sts get-caller-identity said:"
+    echo "    ${AWS_CALLER_ARN}"
+    echo ""
+    echo "  Refresh your AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /"
+    echo "  AWS_SESSION_TOKEN env vars (or your SSO session) and re-run."
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} AWS identity: ${AWS_CALLER_ARN}"
+
+if [[ "$REFRESH_K8S" == "true" ]]; then
+    if ! command -v kubectl &>/dev/null; then
+        echo -e "${RED}✗${NC} kubectl not found on PATH but --refresh was requested."
+        exit 1
+    fi
+    if ! kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" &>/dev/null; then
+        echo -e "${RED}✗${NC} kubectl cannot authenticate to the cluster."
+        echo "  EKS uses the active AWS identity to mint a token; if AWS creds"
+        echo "  are fine but this still fails, your kubeconfig is stale."
+        echo ""
+        echo "  Refresh with:"
+        echo "    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓${NC} kubectl authenticated to ${EKS_CLUSTER_NAME}"
+fi
+
+echo ""
 
 cd "${PROJECT_ROOT}"
 
@@ -163,6 +208,7 @@ if [[ "$BUILD_PLATFORM" == "true" ]]; then
         
         # Multi-stage build: compile Rust in container, then create minimal runtime image
         docker build \
+            --progress=plain \
             --no-cache \
             --build-arg SERVICE="${service}" \
             --build-arg CARGO_FEATURES="${CARGO_FEATURES}" \
@@ -202,20 +248,13 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
         exit 1
     fi
 
-    if [[ -z "${AURA_OS_PATH}" ]]; then
-        AURA_OS_PATH="$(cd "${AURA_HARNESS_PATH}/.." && pwd)/aura-os"
-    fi
-
-    if [[ ! -d "${AURA_OS_PATH}" ]]; then
-        echo -e "${RED}✗${NC} Aura OS not found at: ${AURA_OS_PATH}"
-        echo "Use --aura-os-path to specify the location"
-        exit 1
-    fi
-
-    if [[ ! -d "${AURA_OS_PATH}/crates/aura-protocol" ]]; then
-        echo -e "${RED}✗${NC} aura-protocol crate not found in aura-os"
-        echo "Expected: ${AURA_OS_PATH}/crates/aura-protocol"
-        exit 1
+    # The harness workspace is now self-contained: its Dockerfile copies
+    # only ./Cargo.toml, ./src, and ./crates (which includes its own
+    # aura-protocol crate). The build context is therefore the harness
+    # directory itself — no sibling aura-os checkout is required anymore.
+    # (--aura-os-path is accepted but ignored for backward compatibility.)
+    if [[ -n "${AURA_OS_PATH}" ]]; then
+        echo -e "${YELLOW}⚠${NC} --aura-os-path is deprecated and ignored: the harness build is self-contained."
     fi
     
     # Create ECR repo for aura-harness if it doesn't exist
@@ -231,11 +270,12 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
     
     echo "Building aura-harness image..."
     docker build \
+        --progress=plain \
         --no-cache \
         -f "${AURA_HARNESS_PATH}/Dockerfile" \
         -t "${HARNESS_REPO_NAME}:${IMAGE_TAG}" \
         -t "${HARNESS_IMAGE}" \
-        "$(cd "${AURA_HARNESS_PATH}/.." && pwd)"
+        "${AURA_HARNESS_PATH}"
     
     echo -e "${GREEN}✓${NC} Built ${HARNESS_REPO_NAME}:${IMAGE_TAG}"
     
