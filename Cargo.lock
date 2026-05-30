@@ -210,12 +210,15 @@ dependencies = [
 name = "aura-swarm-client"
 version = "0.1.0"
 dependencies = [
+ "aura-swarm-protocol",
  "chrono",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "wiremock",
 ]

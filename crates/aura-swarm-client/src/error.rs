@@ -23,6 +23,10 @@ pub enum SwarmClientError {
     /// Failed to deserialize the response body.
     #[error("Failed to parse response: {0}")]
     Parse(String),
+
+    /// WebSocket transport failure while attaching to a run event stream.
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
 }
 
 impl SwarmClientError {

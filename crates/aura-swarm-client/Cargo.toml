@@ -17,6 +17,10 @@ serde_json.workspace = true
 # HTTP client
 reqwest.workspace = true
 
+# WebSocket client (run event stream)
+tokio-tungstenite.workspace = true
+futures.workspace = true
+
 # Error handling
 thiserror.workspace = true
 
@@ -25,6 +29,9 @@ chrono.workspace = true
 
 # Tracing
 tracing.workspace = true
+
+# Protocol types (shared with gateway + harness)
+aura-swarm-protocol = { path = "../aura-swarm-protocol" }
 
 [dev-dependencies]
 wiremock = ">=0.6, <0.6.5"

@@ -8,7 +8,8 @@
 //! # Usage
 //!
 //! ```no_run
-//! use aura_swarm_client::{SwarmClient, CreateSessionRequest};
+//! use aura_swarm_client::SwarmClient;
+//! use aura_swarm_client::ws::connect_run_stream;
 //!
 //! # async fn example() -> Result<(), aura_swarm_client::SwarmClientError> {
 //! let client = SwarmClient::new("http://localhost:8080", "my-jwt-token")?;
@@ -22,11 +23,15 @@
 //! let state = client.get_remote_agent_state(&agent.agent_id).await?;
 //! println!("Agent state: {:?}", state.state);
 //!
-//! // Open a session
-//! let session = client
-//!     .create_session(&agent.agent_id, CreateSessionRequest::default())
-//!     .await?;
-//! println!("WebSocket URL: {}", client.ws_url(&session.session_id));
+//! // Start a run, then attach to its event stream
+//! let run = client.create_run(&agent.agent_id).await?;
+//! let ws_url = client.run_ws_url(&agent.agent_id, &run.run_id);
+//! let (sender, mut events) = connect_run_stream(&ws_url, client.token()).await?;
+//!
+//! sender.send_user_message("Hello, agent!").await?;
+//! while let Some(event) = events.recv().await {
+//!     println!("event: {event:?}");
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -39,11 +44,19 @@
 pub mod client;
 pub mod error;
 pub mod types;
+pub mod ws;
 
 pub use client::SwarmClient;
 pub use error::SwarmClientError;
+pub use ws::{connect_run_stream, RunStreamSender};
 pub use types::{
     CreateRemoteAgentRequest, CreateSessionRequest, CreateSessionResponse,
     ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentSpec, RemoteAgentState,
     RemoteAgentStateResponse, RemoteIsolationLevel, SessionConfig, SessionResponse, SessionStatus,
+};
+
+// Re-export the protocol message types so consumers can drive a run stream
+// without taking a direct dependency on `aura-swarm-protocol`.
+pub use aura_swarm_protocol::{
+    InboundMessage, OutboundMessage, RuntimeRunResponse, ToolCallbackRequest, ToolCallbackResponse,
 };

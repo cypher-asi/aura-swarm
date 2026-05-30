@@ -193,14 +193,19 @@ pub struct CreateSessionRequest {
 }
 
 /// Response for a created session.
+///
+/// With the migration to the `POST /v1/run` contract there is no per-session
+/// WebSocket. A created session points the caller at the agent's
+/// run-creation endpoint (`run_url`); the caller starts a run there and then
+/// attaches to that run's event stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     /// Session ID.
     pub session_id: String,
     /// Agent ID the session belongs to.
     pub agent_id: String,
-    /// Relative WebSocket URL for connecting.
-    pub ws_url: String,
+    /// Relative run-creation URL (`/v1/agents/:agent_id/run`).
+    pub run_url: String,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
 }
@@ -476,12 +481,12 @@ mod tests {
         let json = r#"{
             "session_id": "sess-1",
             "agent_id": "agent-1",
-            "ws_url": "/v1/sessions/sess-1/ws",
+            "run_url": "/v1/agents/agent-1/run",
             "created_at": "2026-01-01T00:00:00Z"
         }"#;
         let resp: CreateSessionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.session_id, "sess-1");
-        assert_eq!(resp.ws_url, "/v1/sessions/sess-1/ws");
+        assert_eq!(resp.run_url, "/v1/agents/agent-1/run");
     }
 
     #[test]
