@@ -365,13 +365,29 @@ async fn delete_agent_success_when_stopped() {
         .unwrap()
         .to_string();
 
-    // Transition to stopped via internal API
+    // Drive the agent to a terminal Stopped state via the real lifecycle. The
+    // scheduler can no longer force an arbitrary state straight to Stopped (a
+    // pod disappearing must not terminalize a logically-active agent), so we go
+    // Provisioning -> Running -> Stopping (user stop) -> Stopped (scheduler).
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    server
+        .post(&format!("/v1/agents/{agent_id}/stop"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status_ok();
+
     server
         .patch(&format!("/internal/agents/{agent_id}/status"))
         .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "stopped"}))
         .await
-        .assert_status_ok();
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
 
     let resp = server
         .delete(&format!("/v1/agents/{agent_id}"))
@@ -520,7 +536,7 @@ async fn lifecycle_start_stop() {
         .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await
-        .assert_status_ok();
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
 
     // Stop should succeed from Running
     let resp = server
@@ -554,7 +570,7 @@ async fn lifecycle_hibernate_wake() {
         .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "idle"}))
         .await
-        .assert_status_ok();
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
 
     // Hibernate from Idle
     let resp = server
@@ -1018,7 +1034,7 @@ async fn get_agent_state_running_has_uptime() {
         .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "running"}))
         .await
-        .assert_status_ok();
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
 
     let resp = server
         .get(&format!("/v1/agents/{agent_id}/state"))
@@ -1051,7 +1067,7 @@ async fn get_agent_state_includes_error_message() {
         .add_header(internal_hdr.clone(), internal_val.clone())
         .json(&json!({"status": "error", "message": "OOM killed"}))
         .await
-        .assert_status_ok();
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
 
     let resp = server
         .get(&format!("/v1/agents/{agent_id}/state"))
