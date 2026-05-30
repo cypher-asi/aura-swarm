@@ -220,7 +220,9 @@ pub struct ToolCallbackResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeRequest {
     /// Discriminated union carrying the data unique to each request type.
-    #[serde(rename = "type")]
+    /// Defaults to a chat run so the gateway can accept an empty / partial
+    /// body on `POST /v1/agents/:id/run`.
+    #[serde(rename = "type", default)]
     pub r#type: RuntimeRequestType,
     /// Who is this agent — template + partition + persona + skills + prompt.
     #[serde(default)]
@@ -248,8 +250,11 @@ pub struct RuntimeRequest {
     /// valid only in dev (auth disabled on the pod).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_jwt: Option<String>,
-    /// Originating end-user id. REQUIRED and must be non-empty, or the harness
-    /// rejects the request with code `invalid_workspace`.
+    /// Originating end-user id. The harness rejects an empty value with code
+    /// `invalid_workspace`, but the gateway always overrides it from the
+    /// authenticated caller, so it carries a serde default to let an
+    /// untrusted client body omit it.
+    #[serde(default)]
     pub user_id: String,
 }
 
@@ -461,6 +466,54 @@ mod tests {
             back.r#type,
             RuntimeRequestType::Chat { ref conversation_messages } if conversation_messages.is_empty()
         ));
+    }
+
+    #[test]
+    fn runtime_request_deserializes_empty_body_as_chat_with_blank_user() {
+        // The gateway accepts an empty `POST /v1/agents/:id/run` body and
+        // overrides user_id from the authed caller, so both `type` and
+        // `user_id` must carry serde defaults.
+        let req: RuntimeRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.user_id.is_empty());
+        assert!(matches!(req.r#type, RuntimeRequestType::Chat { .. }));
+    }
+
+    #[test]
+    fn runtime_request_forwards_opaque_policy_and_billing_bundles() {
+        // Fields the swarm never authors (permissions / capabilities /
+        // project) must round-trip verbatim so the gateway forwards them
+        // to the pod instead of dropping them.
+        let body = serde_json::json!({
+            "type": {"kind": "chat", "params": {"conversation_messages": []}},
+            "user_id": "client-supplied",
+            "agent_permissions": {"capabilities": ["fs_read"]},
+            "tool_permissions": {"fs_write": false},
+            "agent_capabilities": {"installed_tools": [{"name": "search"}]},
+            "project": {
+                "project_id": "proj-1",
+                "aura_org_id": "org-1",
+                "aura_session_id": "sess-1",
+                "aura_agent_id": "agent-1"
+            }
+        });
+
+        let mut req: RuntimeRequest = serde_json::from_value(body).unwrap();
+        // Gateway override step.
+        req.user_id = "authed-user".to_string();
+        req.auth_jwt = Some("jwt".to_string());
+
+        let forwarded = serde_json::to_value(&req).unwrap();
+        assert_eq!(forwarded["user_id"], "authed-user");
+        assert_eq!(forwarded["auth_jwt"], "jwt");
+        assert_eq!(forwarded["agent_permissions"]["capabilities"][0], "fs_read");
+        assert_eq!(forwarded["tool_permissions"]["fs_write"], false);
+        assert_eq!(
+            forwarded["agent_capabilities"]["installed_tools"][0]["name"],
+            "search"
+        );
+        assert_eq!(forwarded["project"]["aura_org_id"], "org-1");
+        assert_eq!(forwarded["project"]["aura_session_id"], "sess-1");
+        assert_eq!(forwarded["project"]["aura_agent_id"], "agent-1");
     }
 
     #[test]

@@ -21,11 +21,7 @@ use axum::Json;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 use aura_swarm_core::AgentId;
-use aura_swarm_protocol::{
-    AgentIdentity, ModelSelection, RuntimeRequest, RuntimeRequestType, RuntimeRunResponse,
-    WorkspaceLocation,
-};
-use serde::Deserialize;
+use aura_swarm_protocol::{RuntimeRequest, RuntimeRunResponse};
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
@@ -124,46 +120,27 @@ async fn forward_response(resp: reqwest::Response) -> Result<Response, ApiError>
 }
 
 // ---------------------------------------------------------------------------
-// Request body
-// ---------------------------------------------------------------------------
-
-/// Body accepted by `POST /v1/agents/:agent_id/run`.
-///
-/// All fields are optional: an empty body starts a chat run with default
-/// model/workspace selection. The gateway always overrides `user_id` and
-/// `auth_jwt` from the authenticated caller, so clients cannot spoof them.
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct RunRequestBody {
-    /// Run discriminator (chat / dev_loop / task_run). Defaults to chat.
-    #[serde(default, rename = "type")]
-    r#type: Option<RuntimeRequestType>,
-    /// Agent identity bundle.
-    #[serde(default)]
-    agent_identity: Option<AgentIdentity>,
-    /// Model selection.
-    #[serde(default)]
-    model: Option<ModelSelection>,
-    /// Workspace location.
-    #[serde(default)]
-    workspace: Option<WorkspaceLocation>,
-}
-
-// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/agents/:agent_id/run`
 ///
-/// Builds a [`RuntimeRequest`] from the body (chat by default), stamps the
-/// authenticated `user_id` + `auth_jwt`, POSTs it to the pod's `/v1/run`,
-/// tracks a swarm session keyed to the returned `run_id`, and returns the
+/// Forwards the caller's [`RuntimeRequest`] body to the pod's `/v1/run`
+/// verbatim, stamping only the authenticated `user_id` + `auth_jwt` so
+/// clients cannot spoof identity. Every other field — including the
+/// kernel policy bundles (`agent_permissions`, `tool_permissions`,
+/// `agent_capabilities`) and the billing `project` context — round-trips
+/// through unchanged (they are modeled as opaque values in
+/// [`aura_swarm_protocol`]). An empty body starts a default chat run.
+///
+/// Tracks a swarm session keyed to the returned `run_id` and returns the
 /// harness [`RuntimeRunResponse`] with `event_stream_url` rewritten to the
 /// swarm-facing WS path.
 pub(crate) async fn run_start<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     Path(agent_id): Path<String>,
     user: AuthUser,
-    body: Option<Json<RunRequestBody>>,
+    body: Option<Json<RuntimeRequest>>,
 ) -> Result<Response, ApiError>
 where
     C: ControlPlane + 'static,
@@ -173,21 +150,12 @@ where
     let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
     let endpoint = resolve_endpoint(&state, &agent_id).await?;
 
-    let body = body.map(|b| b.0).unwrap_or_default();
-
-    let mut request = RuntimeRequest::chat(user.user_id.to_string());
-    if let Some(kind) = body.r#type {
-        request.r#type = kind;
-    }
-    if let Some(identity) = body.agent_identity {
-        request.agent_identity = identity;
-    }
-    if let Some(model) = body.model {
-        request.model = model;
-    }
-    if let Some(workspace) = body.workspace {
-        request.workspace = workspace;
-    }
+    let mut request = body
+        .map(|b| b.0)
+        .unwrap_or_else(|| RuntimeRequest::chat(user.user_id.to_string()));
+    // Always override identity from the authenticated caller; never trust
+    // a client-supplied user_id / auth_jwt.
+    request.user_id = user.user_id.to_string();
     request.auth_jwt = Some(user.token.clone());
 
     let payload = serde_json::to_vec(&request)
