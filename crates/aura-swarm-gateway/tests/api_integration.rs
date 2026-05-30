@@ -632,11 +632,11 @@ async fn create_session_success() {
     resp.assert_status(axum::http::StatusCode::CREATED);
     let body: Value = resp.json();
     assert!(body.get("session_id").is_some());
-    assert!(body["ws_url"]
-        .as_str()
-        .unwrap()
-        .starts_with("/v1/sessions/"));
-    assert!(body["ws_url"].as_str().unwrap().ends_with("/ws"));
+    // With the migration to the POST /v1/run contract, a created session points
+    // clients at the agent's run-creation endpoint rather than a per-session WS.
+    let run_url = body["run_url"].as_str().unwrap();
+    assert!(run_url.starts_with("/v1/agents/"), "run_url: {run_url}");
+    assert!(run_url.ends_with("/run"), "run_url: {run_url}");
 }
 
 #[tokio::test]

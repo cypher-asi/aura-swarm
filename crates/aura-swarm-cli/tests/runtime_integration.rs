@@ -173,6 +173,7 @@ async fn attach_to_run(
 > {
     let url = format!("{}/stream/{run_id}", runtime_ws_base());
     let mut request = url
+        .as_str()
         .into_client_request()
         .map_err(|e| format!("invalid ws url {url}: {e}"))?;
     if let Some(token) = get_token().await {
