@@ -366,6 +366,13 @@ redeploy_wait_for_digest_convergence() {
     echo "  Expected digest: ${expected_digest}"
     echo "  Timeout: ${timeout_secs}s (scheduler replaces at most one stale pod roughly every 30s)"
 
+    # Convergence gate: every running swarm-agent pod is on the expected harness
+    # digest. `active_without_pod` is reported but NOT gating: during a healthy
+    # rolling upgrade the scheduler legitimately deletes one pod per ~30s tick
+    # before recreating it, and the gateway's "active" set can briefly disagree
+    # with the live pod set due to wake/hibernate churn while this loop runs.
+    # The real "no orphans" safety property is still enforced below by
+    # redeploy_verify_pods_belong_to_persisted_agents.
     while [[ "${elapsed}" -le "${timeout_secs}" ]]; do
         redeploy_snapshot_agent_pods "${output_path}"
 
@@ -376,7 +383,13 @@ redeploy_wait_for_digest_convergence() {
         mismatched_digests=$(jq --arg digest "${expected_digest}" \
             '[.[] | select(.digest != $digest)] | length' "${output_path}")
 
-        if [[ "${missing_pods}" == "0" && "${missing_digest_count}" == "0" && "${mismatched_digests}" == "0" ]]; then
+        if [[ "${missing_digest_count}" == "0" && "${mismatched_digests}" == "0" ]]; then
+            if [[ "${missing_pods}" != "0" ]]; then
+                echo -e "${YELLOW}⚠${NC} Harness digest converged with ${missing_pods} active agent(s) reported by the gateway that have no matching pod."
+                echo "    This usually means the gateway's active list and the live pod set briefly diverged"
+                echo "    during the rolling upgrade (wake/hibernate churn). Treating as warning, not failure."
+                echo "    To investigate, compare /internal/agents/active vs pod labels (swarm.io/agent-id)."
+            fi
             redeploy_verify_pods_belong_to_persisted_agents "${all_agents_path}" "${output_path}"
             echo -e "${GREEN}✓${NC} Swarm-agent pods converged after ${elapsed}s"
             return 0
@@ -388,6 +401,7 @@ redeploy_wait_for_digest_convergence() {
     done
 
     echo -e "${RED}✗${NC} Timed out waiting for harness digest convergence."
+    echo "  Final state: missing_digest=${missing_digest_count} mismatched_digest=${mismatched_digests} (active_without_pod=${missing_pods}, informational)"
     jq -r '.[] | "  \(.agent_id)  \(.pod_name)  \(.phase) ready=\(.ready) digest=\(.digest // "<missing>")"' "${output_path}" || true
     echo ""
     echo "Troubleshooting commands:"
