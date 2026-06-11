@@ -2,12 +2,19 @@
 //!
 //! This module defines the shared state that is available to all request handlers.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
 use crate::config::GatewayConfig;
+
+/// Cache of harness build info (`git_sha` from the pod `/health` endpoint),
+/// keyed by agent endpoint (`ip:port`). A pod restart yields a new endpoint,
+/// which naturally invalidates stale entries. `None` means the pod was
+/// reachable but reported no `git_sha` (older harness image).
+pub type HarnessInfoCache = Arc<Mutex<HashMap<String, Option<String>>>>;
 
 /// Shared application state for the gateway.
 ///
@@ -23,6 +30,8 @@ where
     pub jwt_validator: Arc<V>,
     /// Gateway configuration.
     pub config: GatewayConfig,
+    /// Per-endpoint cache of harness git SHAs reported by pod `/health`.
+    pub harness_info_cache: HarnessInfoCache,
 }
 
 impl<C, V> GatewayState<C, V>
@@ -37,6 +46,7 @@ where
             control,
             jwt_validator,
             config,
+            harness_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -51,6 +61,7 @@ where
             control: Arc::clone(&self.control),
             jwt_validator: Arc::clone(&self.jwt_validator),
             config: self.config.clone(),
+            harness_info_cache: Arc::clone(&self.harness_info_cache),
         }
     }
 }

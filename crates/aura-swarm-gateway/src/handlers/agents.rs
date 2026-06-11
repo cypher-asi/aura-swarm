@@ -501,6 +501,11 @@ pub(crate) struct AgentStateResponse {
     pub(crate) memory_mb: u32,
     /// Runtime version.
     pub(crate) runtime_version: String,
+    /// Git commit of the harness build running in the pod, as reported by
+    /// the harness `/health` endpoint. Absent if the pod is unreachable or
+    /// runs an older image without baked-in build metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) harness_git_sha: Option<String>,
     /// Isolation level ("container" or "micro_vm").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) isolation: Option<String>,
@@ -554,6 +559,10 @@ where
         .count_active_sessions(&agent.agent_id)
         .await
         .unwrap_or(0);
+    let harness_git_sha = match endpoint.as_deref() {
+        Some(ep) => harness_git_sha_for_endpoint(&state.harness_info_cache, ep).await,
+        None => None,
+    };
 
     Ok(Json(AgentStateResponse {
         state: agent.status,
@@ -566,10 +575,68 @@ where
         cpu_millicores: agent.spec.cpu_millicores,
         memory_mb: agent.spec.memory_mb,
         runtime_version: agent.spec.runtime_version,
+        harness_git_sha,
         isolation,
         endpoint,
         created_at: agent.created_at,
     }))
+}
+
+/// Resolve the harness git SHA for a pod endpoint, using the per-endpoint
+/// cache to avoid probing the pod on every state poll.
+///
+/// Reachable pods are cached (including a `None` answer from older harness
+/// images that lack build metadata). Network failures are *not* cached so a
+/// pod that is still starting up gets retried on the next poll.
+async fn harness_git_sha_for_endpoint(
+    cache: &crate::state::HarnessInfoCache,
+    endpoint: &str,
+) -> Option<String> {
+    if let Some(cached) = cache
+        .lock()
+        .expect("harness info cache lock poisoned")
+        .get(endpoint)
+    {
+        return cached.clone();
+    }
+
+    match probe_harness_git_sha(endpoint).await {
+        Ok(sha) => {
+            cache
+                .lock()
+                .expect("harness info cache lock poisoned")
+                .insert(endpoint.to_string(), sha.clone());
+            sha
+        }
+        Err(()) => None,
+    }
+}
+
+/// Fetch `git_sha` from the harness `/health` endpoint on the pod.
+///
+/// Returns `Ok(None)` when the pod responded but reported no SHA, and
+/// `Err(())` when the pod could not be reached or returned garbage.
+async fn probe_harness_git_sha(endpoint: &str) -> Result<Option<String>, ()> {
+    let url = format!("http://{endpoint}/health");
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| ())?
+        .get(&url)
+        .timeout(std::time::Duration::from_millis(1500))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::debug!(url = %url, error = %e, "harness health probe failed");
+        })?;
+    if !resp.status().is_success() {
+        return Err(());
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|_| ())?;
+    Ok(body
+        .get("git_sha")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
 // =============================================================================

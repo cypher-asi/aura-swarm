@@ -161,6 +161,9 @@ pub struct RemoteAgentStateResponse {
     /// Error message if the agent is in an error state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Git commit of the harness build running in the pod, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_git_sha: Option<String>,
 }
 
 // =============================================================================
@@ -408,12 +411,17 @@ mod tests {
             active_sessions: 2,
             last_heartbeat_at: Some(chrono::Utc::now()),
             error_message: None,
+            harness_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: RemoteAgentStateResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.state, RemoteAgentState::Running);
         assert_eq!(parsed.uptime_seconds, 3600);
         assert_eq!(parsed.active_sessions, 2);
+        assert_eq!(
+            parsed.harness_git_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
     }
 
     #[test]

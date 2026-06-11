@@ -274,11 +274,24 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
     fi
     
     HARNESS_IMAGE="${ECR_REGISTRY}/${HARNESS_REPO_NAME}:${IMAGE_TAG}"
-    
+
+    # Bake the harness git commit into the image so the /health endpoint
+    # (and the aura-os env popup) can report which commit a pod is running.
+    HARNESS_GIT_SHA=$(git -C "${AURA_HARNESS_PATH}" rev-parse HEAD 2>/dev/null || echo "")
+    if [[ -z "${HARNESS_GIT_SHA}" ]]; then
+        echo -e "${YELLOW}⚠${NC} Could not resolve git commit for ${AURA_HARNESS_PATH}; image will report no git_sha"
+    else
+        echo "Harness git commit: ${HARNESS_GIT_SHA}"
+        if [[ -n "$(git -C "${AURA_HARNESS_PATH}" status --porcelain 2>/dev/null)" ]]; then
+            echo -e "${YELLOW}⚠${NC} aura-harness working tree is dirty; baked git_sha may not match image contents"
+        fi
+    fi
+
     echo "Building aura-harness image..."
     docker build \
         --progress=plain \
         --no-cache \
+        --build-arg GIT_SHA="${HARNESS_GIT_SHA}" \
         -f "${AURA_HARNESS_PATH}/Dockerfile" \
         -t "${HARNESS_REPO_NAME}:${IMAGE_TAG}" \
         -t "${HARNESS_IMAGE}" \
@@ -305,6 +318,7 @@ if [[ "$BUILD_HARNESS" == "true" ]]; then
             echo "AURA_HARNESS_IMAGE=${HARNESS_PINNED_IMAGE}"
             echo "AURA_HARNESS_TAGGED_IMAGE=${HARNESS_IMAGE}"
             echo "AURA_HARNESS_DIGEST=${HARNESS_DIGEST}"
+            echo "AURA_HARNESS_GIT_SHA=${HARNESS_GIT_SHA}"
         } > "${HARNESS_STATE_FILE}"
         echo -e "${GREEN}✓${NC} Resolved digest: ${HARNESS_DIGEST}"
         echo -e "${GREEN}✓${NC} Persisted deploy state: ${HARNESS_STATE_FILE}"
