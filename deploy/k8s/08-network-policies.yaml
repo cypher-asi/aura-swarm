@@ -97,7 +97,13 @@ spec:
             cidr: 10.0.4.0/24
       ports:
         - port: 2049
-    # Allow external APIs (via NAT gateway) - HTTPS only
+    # Allow external internet egress on ALL ports (via NAT gateway).
+    # Agents are a root-capable dev environment and need to install
+    # packages (apt/pip/npm over HTTP :80 and HTTPS :443), reach custom
+    # registries, clone over SSH, etc. RFC1918 ranges stay excluded so
+    # agents cannot reach internal/cluster services or other tenants;
+    # the separate deny-agent-to-agent policy keeps agents isolated
+    # from each other.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -105,8 +111,6 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
-      ports:
-        - port: 443
 ---
 # Deny agent-to-agent communication
 apiVersion: networking.k8s.io/v1

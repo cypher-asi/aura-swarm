@@ -22,6 +22,7 @@ use aura_swarm_core::AgentId;
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
+use crate::handlers::ws::{keepalive_interval, next_keepalive_tick};
 use crate::state::GatewayState;
 
 fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
@@ -52,10 +53,13 @@ where
         .ok_or(ApiError::AgentUnavailable)?;
 
     let timeout = state.config.websocket_timeout();
+    let keepalive = state.config.websocket_keepalive();
     let agent_id_str = agent_id.to_string();
     let token = user.token;
 
-    Ok(ws.on_upgrade(move |socket| proxy_terminal(socket, endpoint, agent_id_str, token, timeout)))
+    Ok(ws.on_upgrade(move |socket| {
+        proxy_terminal(socket, endpoint, agent_id_str, token, timeout, keepalive)
+    }))
 }
 
 async fn proxy_terminal(
@@ -64,6 +68,7 @@ async fn proxy_terminal(
     agent_id_str: String,
     token: String,
     timeout: std::time::Duration,
+    keepalive: Option<std::time::Duration>,
 ) {
     let agent_url = format!("ws://{agent_endpoint}/ws/terminal");
 
@@ -106,8 +111,8 @@ async fn proxy_terminal(
     let (client_write, client_read) = client_socket.split();
     let (agent_write, agent_read) = agent_socket.split();
 
-    let c2a = forward_client_to_agent(client_read, agent_write);
-    let a2c = forward_agent_to_client(agent_read, client_write);
+    let c2a = forward_client_to_agent(client_read, agent_write, keepalive);
+    let a2c = forward_agent_to_client(agent_read, client_write, keepalive);
 
     tokio::select! {
         _ = c2a => {}
@@ -123,17 +128,29 @@ async fn forward_client_to_agent(
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         TungsteniteMessage,
     >,
+    keepalive: Option<std::time::Duration>,
 ) {
-    while let Some(Ok(msg)) = rx.next().await {
-        let tung = match msg {
-            Message::Text(t) => TungsteniteMessage::Text(t),
-            Message::Binary(b) => TungsteniteMessage::Binary(b),
-            Message::Ping(p) => TungsteniteMessage::Ping(p),
-            Message::Pong(p) => TungsteniteMessage::Pong(p),
-            Message::Close(_) => break,
-        };
-        if tx.send(tung).await.is_err() {
-            break;
+    let mut ping = keepalive_interval(keepalive);
+    loop {
+        tokio::select! {
+            next = rx.next() => {
+                let Some(Ok(msg)) = next else { break };
+                let tung = match msg {
+                    Message::Text(t) => TungsteniteMessage::Text(t),
+                    Message::Binary(b) => TungsteniteMessage::Binary(b),
+                    Message::Ping(p) => TungsteniteMessage::Ping(p),
+                    Message::Pong(p) => TungsteniteMessage::Pong(p),
+                    Message::Close(_) => break,
+                };
+                if tx.send(tung).await.is_err() {
+                    break;
+                }
+            }
+            () = next_keepalive_tick(&mut ping) => {
+                if tx.send(TungsteniteMessage::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -143,21 +160,33 @@ async fn forward_agent_to_client(
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     >,
     mut tx: futures::stream::SplitSink<WebSocket, Message>,
+    keepalive: Option<std::time::Duration>,
 ) {
-    while let Some(Ok(msg)) = rx.next().await {
-        let axum_msg = match &msg {
-            TungsteniteMessage::Text(t) => Some(Message::Text(t.clone())),
-            TungsteniteMessage::Binary(b) => Some(Message::Binary(b.clone())),
-            TungsteniteMessage::Ping(p) => Some(Message::Ping(p.clone())),
-            TungsteniteMessage::Pong(p) => Some(Message::Pong(p.clone())),
-            TungsteniteMessage::Close(_) | TungsteniteMessage::Frame(_) => None,
-        };
-        if let Some(m) = axum_msg {
-            if tx.send(m).await.is_err() {
-                break;
+    let mut ping = keepalive_interval(keepalive);
+    loop {
+        tokio::select! {
+            next = rx.next() => {
+                let Some(Ok(msg)) = next else { break };
+                let axum_msg = match &msg {
+                    TungsteniteMessage::Text(t) => Some(Message::Text(t.clone())),
+                    TungsteniteMessage::Binary(b) => Some(Message::Binary(b.clone())),
+                    TungsteniteMessage::Ping(p) => Some(Message::Ping(p.clone())),
+                    TungsteniteMessage::Pong(p) => Some(Message::Pong(p.clone())),
+                    TungsteniteMessage::Close(_) | TungsteniteMessage::Frame(_) => None,
+                };
+                if let Some(m) = axum_msg {
+                    if tx.send(m).await.is_err() {
+                        break;
+                    }
+                } else if matches!(msg, TungsteniteMessage::Close(_)) {
+                    break;
+                }
             }
-        } else if matches!(msg, TungsteniteMessage::Close(_)) {
-            break;
+            () = next_keepalive_tick(&mut ping) => {
+                if tx.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }

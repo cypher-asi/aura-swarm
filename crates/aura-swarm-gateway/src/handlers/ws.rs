@@ -74,6 +74,7 @@ where
         .ok_or(ApiError::AgentUnavailable)?;
 
     let timeout = state.config.websocket_timeout();
+    let keepalive = state.config.websocket_keepalive();
     let agent_id_str = agent_id.to_string();
     let session_id = session.session_id;
     let session_id_str = session_id.to_string();
@@ -101,6 +102,7 @@ where
             user_id_str,
             token,
             timeout,
+            keepalive,
             control,
         )
     }))
@@ -123,6 +125,7 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     user_id_str: String,
     token: String,
     timeout: std::time::Duration,
+    keepalive: Option<std::time::Duration>,
     control: Arc<C>,
 ) {
     let agent_url = format!("ws://{agent_endpoint}/stream/{run_id}");
@@ -148,8 +151,10 @@ async fn handle_websocket<C: ControlPlane + 'static>(
     let (client_write, client_read) = client_socket.split();
     let (agent_write, agent_read) = agent_socket.split();
 
-    let client_to_agent = forward_client_to_agent(client_read, agent_write, &session_id_str);
-    let agent_to_client = forward_agent_to_client(agent_read, client_write, &session_id_str);
+    let client_to_agent =
+        forward_client_to_agent(client_read, agent_write, keepalive, &session_id_str);
+    let agent_to_client =
+        forward_agent_to_client(agent_read, client_write, keepalive, &session_id_str);
 
     tokio::select! {
         result = client_to_agent => {
@@ -250,71 +255,122 @@ async fn connect_to_agent(
     }
 }
 
-/// Forward messages from client to agent (transparent).
+/// Await the next keepalive tick, or never resolve when keepalive is
+/// disabled. Lets a `tokio::select!` branch stay inert without a
+/// dedicated code path.
+pub(crate) async fn next_keepalive_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Build the optional keepalive interval, skipping the immediate first
+/// tick so we don't fire a ping the instant the proxy starts.
+pub(crate) fn keepalive_interval(
+    keepalive: Option<std::time::Duration>,
+) -> Option<tokio::time::Interval> {
+    keepalive.map(|period| {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.reset(); // first tick after `period`, not immediately
+        interval
+    })
+}
+
+/// Forward messages from client to agent (transparent), originating a
+/// periodic Ping toward the agent to keep the path warm.
 async fn forward_client_to_agent(
     mut client_read: SplitStream<WebSocket>,
     mut agent_write: SplitSink<
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         TungsteniteMessage,
     >,
+    keepalive: Option<std::time::Duration>,
     session_id: &str,
 ) -> Result<(), String> {
-    while let Some(msg_result) = client_read.next().await {
-        match msg_result {
-            Ok(msg) => {
-                let tungstenite_msg = match msg {
-                    Message::Text(text) => TungsteniteMessage::Text(text.clone()),
-                    Message::Binary(data) => TungsteniteMessage::Binary(data.clone()),
-                    Message::Ping(data) => TungsteniteMessage::Ping(data.clone()),
-                    Message::Pong(data) => TungsteniteMessage::Pong(data.clone()),
-                    Message::Close(_) => {
-                        tracing::debug!(session_id = %session_id, "Client closed connection");
-                        break;
-                    }
-                };
+    let mut ping = keepalive_interval(keepalive);
+    loop {
+        tokio::select! {
+            msg_result = client_read.next() => {
+                let Some(msg_result) = msg_result else { break };
+                match msg_result {
+                    Ok(msg) => {
+                        let tungstenite_msg = match msg {
+                            Message::Text(text) => TungsteniteMessage::Text(text.clone()),
+                            Message::Binary(data) => TungsteniteMessage::Binary(data.clone()),
+                            Message::Ping(data) => TungsteniteMessage::Ping(data.clone()),
+                            Message::Pong(data) => TungsteniteMessage::Pong(data.clone()),
+                            Message::Close(_) => {
+                                tracing::debug!(session_id = %session_id, "Client closed connection");
+                                break;
+                            }
+                        };
 
-                if let Err(e) = agent_write.send(tungstenite_msg).await {
-                    return Err(format!("Failed to send to agent: {e}"));
+                        if let Err(e) = agent_write.send(tungstenite_msg).await {
+                            return Err(format!("Failed to send to agent: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("Error reading from client: {e}"));
+                    }
                 }
             }
-            Err(e) => {
-                return Err(format!("Error reading from client: {e}"));
+            () = next_keepalive_tick(&mut ping) => {
+                if let Err(e) = agent_write.send(TungsteniteMessage::Ping(Vec::new())).await {
+                    return Err(format!("Keepalive ping to agent failed: {e}"));
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Forward messages from agent to client (transparent, no side effects).
+/// Forward messages from agent to client (transparent, no side effects),
+/// originating a periodic Ping toward the client to keep the path warm.
 async fn forward_agent_to_client(
     mut agent_read: SplitStream<
         tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     >,
     mut client_write: SplitSink<WebSocket, Message>,
+    keepalive: Option<std::time::Duration>,
     session_id: &str,
 ) -> Result<(), String> {
-    while let Some(msg_result) = agent_read.next().await {
-        match msg_result {
-            Ok(msg) => {
-                let axum_msg = match &msg {
-                    TungsteniteMessage::Text(text) => Some(Message::Text(text.clone())),
-                    TungsteniteMessage::Binary(data) => Some(Message::Binary(data.clone())),
-                    TungsteniteMessage::Ping(data) => Some(Message::Ping(data.clone())),
-                    TungsteniteMessage::Pong(data) => Some(Message::Pong(data.clone())),
-                    TungsteniteMessage::Close(_) | TungsteniteMessage::Frame(_) => None,
-                };
+    let mut ping = keepalive_interval(keepalive);
+    loop {
+        tokio::select! {
+            msg_result = agent_read.next() => {
+                let Some(msg_result) = msg_result else { break };
+                match msg_result {
+                    Ok(msg) => {
+                        let axum_msg = match &msg {
+                            TungsteniteMessage::Text(text) => Some(Message::Text(text.clone())),
+                            TungsteniteMessage::Binary(data) => Some(Message::Binary(data.clone())),
+                            TungsteniteMessage::Ping(data) => Some(Message::Ping(data.clone())),
+                            TungsteniteMessage::Pong(data) => Some(Message::Pong(data.clone())),
+                            TungsteniteMessage::Close(_) | TungsteniteMessage::Frame(_) => None,
+                        };
 
-                if let Some(axum_msg) = axum_msg {
-                    if let Err(e) = client_write.send(axum_msg).await {
-                        return Err(format!("Failed to send to client: {e}"));
+                        if let Some(axum_msg) = axum_msg {
+                            if let Err(e) = client_write.send(axum_msg).await {
+                                return Err(format!("Failed to send to client: {e}"));
+                            }
+                        } else if matches!(msg, TungsteniteMessage::Close(_)) {
+                            tracing::debug!(session_id = %session_id, "Agent closed connection");
+                            break;
+                        }
                     }
-                } else if matches!(msg, TungsteniteMessage::Close(_)) {
-                    tracing::debug!(session_id = %session_id, "Agent closed connection");
-                    break;
+                    Err(e) => {
+                        return Err(format!("Error reading from agent: {e}"));
+                    }
                 }
             }
-            Err(e) => {
-                return Err(format!("Error reading from agent: {e}"));
+            () = next_keepalive_tick(&mut ping) => {
+                if let Err(e) = client_write.send(Message::Ping(Vec::new())).await {
+                    return Err(format!("Keepalive ping to client failed: {e}"));
+                }
             }
         }
     }

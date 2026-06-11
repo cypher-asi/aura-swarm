@@ -4,11 +4,11 @@
 //! for Aura agent pods with all necessary configuration.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{AgentSpec, IsolationLevel};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
-    ResourceRequirements, SecretKeySelector, Volume, VolumeMount,
+    ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -141,11 +141,12 @@ fn build_pod_spec(
             spec,
             config,
             &config.image,
+            isolation,
         )],
         volumes: Some(vec![build_state_volume(config)]),
         restart_policy: Some("Always".to_string()),
         termination_grace_period_seconds: Some(30),
-        security_context: Some(build_security_context()),
+        security_context: Some(build_security_context(isolation)),
         ..Default::default()
     }
 }
@@ -156,6 +157,7 @@ fn build_container(
     spec: &AgentSpec,
     config: &SchedulerConfig,
     image: &str,
+    isolation: IsolationLevel,
 ) -> Container {
     Container {
         name: "aura".to_string(),
@@ -170,6 +172,7 @@ fn build_container(
         volume_mounts: Some(vec![build_state_mount(agent_id_hex)]),
         readiness_probe: Some(build_readiness_probe()),
         liveness_probe: Some(build_liveness_probe()),
+        security_context: Some(build_container_security_context(isolation)),
         ..Default::default()
     }
 }
@@ -342,12 +345,56 @@ fn build_liveness_probe() -> Probe {
     }
 }
 
-fn build_security_context() -> PodSecurityContext {
-    PodSecurityContext {
-        run_as_non_root: Some(true),
-        run_as_user: Some(1000),
-        fs_group: Some(1000),
-        ..Default::default()
+/// Build the pod-level security context for an agent.
+///
+/// The security posture is gated on the isolation level:
+///
+/// - `MicroVM` (Kata/Firecracker): the guest kernel is the multi-tenant
+///   boundary, so it is safe to give the user a root-capable dev
+///   environment inside the VM — they can `apt install`, manage
+///   services, and modify the OS. Runs as root (uid 0); `fs_group`
+///   stays 1000 so the `/state` PVC (EFS access point owned by 1000)
+///   remains group-accessible.
+/// - `Container` (shared-kernel runc): root would be a host-compromise
+///   risk in a multi-tenant cluster, so the locked-down non-root
+///   posture is preserved.
+fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
+    match isolation {
+        IsolationLevel::MicroVM => PodSecurityContext {
+            run_as_non_root: Some(false),
+            run_as_user: Some(0),
+            fs_group: Some(1000),
+            ..Default::default()
+        },
+        IsolationLevel::Container => PodSecurityContext {
+            run_as_non_root: Some(true),
+            run_as_user: Some(1000),
+            fs_group: Some(1000),
+            ..Default::default()
+        },
+    }
+}
+
+/// Build the container-level security context for an agent.
+///
+/// Mirrors [`build_security_context`]: microVM agents run as root with
+/// privilege escalation allowed (so `sudo` works for OS modification),
+/// while runc-isolated agents stay non-root with privilege escalation
+/// denied.
+fn build_container_security_context(isolation: IsolationLevel) -> SecurityContext {
+    match isolation {
+        IsolationLevel::MicroVM => SecurityContext {
+            run_as_non_root: Some(false),
+            run_as_user: Some(0),
+            allow_privilege_escalation: Some(true),
+            ..Default::default()
+        },
+        IsolationLevel::Container => SecurityContext {
+            run_as_non_root: Some(true),
+            run_as_user: Some(1000),
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        },
     }
 }
 
@@ -523,6 +570,49 @@ mod tests {
         let pod_spec = pod.spec.as_ref().unwrap();
 
         assert_eq!(pod_spec.runtime_class_name, None);
+    }
+
+    #[test]
+    fn microvm_pod_runs_as_root_for_dev_env() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::MicroVM),
+            ..test_spec()
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        let sec = pod_spec.security_context.as_ref().unwrap();
+        assert_eq!(sec.run_as_non_root, Some(false));
+        assert_eq!(sec.run_as_user, Some(0));
+        assert_eq!(sec.fs_group, Some(1000));
+
+        let container_sec = pod_spec.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(container_sec.run_as_user, Some(0));
+        assert_eq!(container_sec.allow_privilege_escalation, Some(true));
+    }
+
+    #[test]
+    fn container_pod_stays_non_root() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::Container),
+            ..test_spec()
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        let sec = pod_spec.security_context.as_ref().unwrap();
+        assert_eq!(sec.run_as_non_root, Some(true));
+        assert_eq!(sec.run_as_user, Some(1000));
+
+        let container_sec = pod_spec.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(container_sec.run_as_user, Some(1000));
+        assert_eq!(container_sec.allow_privilege_escalation, Some(false));
     }
 
     #[test]

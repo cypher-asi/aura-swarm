@@ -21,9 +21,27 @@ pub struct GatewayConfig {
     #[serde(default = "GatewayConfig::default_rate_limit")]
     pub rate_limit_rps: u32,
 
-    /// WebSocket idle timeout in seconds.
+    /// WebSocket *connect* timeout in seconds.
+    ///
+    /// This bounds only the initial `connect_async` handshake to the
+    /// agent pod (see `handlers::ws` / `handlers::terminal`). It is NOT
+    /// an idle timeout on an established stream — long-lived agent
+    /// sessions are intentionally not capped here. Keepalive of an
+    /// established stream is handled separately via
+    /// [`Self::websocket_keepalive`].
     #[serde(default = "GatewayConfig::default_ws_timeout")]
     pub websocket_timeout_seconds: u64,
+
+    /// Interval in seconds between gateway-originated WebSocket keepalive
+    /// pings on an established proxy stream. `0` disables keepalive.
+    ///
+    /// tokio-tungstenite/axum do not send pings on their own, so a quiet
+    /// agent session (model thinking, user reading) can be silently
+    /// reaped by an intermediary NAT/load balancer. The proxy sends a
+    /// periodic Ping toward both the client and the agent to keep the
+    /// path warm independent of client behavior.
+    #[serde(default = "GatewayConfig::default_ws_keepalive")]
+    pub ws_keepalive_seconds: u64,
 
     /// Maximum request body size in bytes.
     #[serde(default = "GatewayConfig::default_max_body")]
@@ -52,6 +70,10 @@ impl GatewayConfig {
         300 // 5 minutes
     }
 
+    const fn default_ws_keepalive() -> u64 {
+        20 // keep NAT/LB paths warm without flooding the stream
+    }
+
     const fn default_max_body() -> usize {
         1024 * 1024 // 1 MB
     }
@@ -60,10 +82,20 @@ impl GatewayConfig {
         30
     }
 
-    /// Get the WebSocket timeout as a `Duration`.
+    /// Get the WebSocket connect timeout as a `Duration`.
     #[must_use]
     pub fn websocket_timeout(&self) -> Duration {
         Duration::from_secs(self.websocket_timeout_seconds)
+    }
+
+    /// Get the WebSocket keepalive ping interval as a `Duration`, or
+    /// `None` when keepalive is disabled (`ws_keepalive_seconds == 0`).
+    #[must_use]
+    pub fn websocket_keepalive(&self) -> Option<Duration> {
+        match self.ws_keepalive_seconds {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
     }
 
     /// Get the request timeout as a `Duration`.
@@ -80,6 +112,7 @@ impl Default for GatewayConfig {
             cors_origins: vec!["*".to_string()],
             rate_limit_rps: Self::default_rate_limit(),
             websocket_timeout_seconds: Self::default_ws_timeout(),
+            ws_keepalive_seconds: Self::default_ws_keepalive(),
             max_body_bytes: Self::default_max_body(),
             request_timeout_seconds: Self::default_request_timeout(),
             internal_token: std::env::var("INTERNAL_TOKEN")
@@ -111,6 +144,11 @@ impl GatewayConfig {
                 config.websocket_timeout_seconds = n;
             }
         }
+        if let Ok(val) = std::env::var("WS_KEEPALIVE_SECONDS") {
+            if let Ok(n) = val.parse() {
+                config.ws_keepalive_seconds = n;
+            }
+        }
         if let Ok(val) = std::env::var("MAX_BODY_BYTES") {
             if let Ok(n) = val.parse() {
                 config.max_body_bytes = n;
@@ -131,6 +169,7 @@ mod tests {
         assert_eq!(config.listen_addr, "0.0.0.0:8080");
         assert_eq!(config.rate_limit_rps, 100);
         assert_eq!(config.websocket_timeout_seconds, 300);
+        assert_eq!(config.ws_keepalive_seconds, 20);
         assert_eq!(config.max_body_bytes, 1024 * 1024);
     }
 
@@ -139,5 +178,13 @@ mod tests {
         let config = GatewayConfig::default();
         assert_eq!(config.websocket_timeout(), Duration::from_secs(300));
         assert_eq!(config.request_timeout(), Duration::from_secs(30));
+        assert_eq!(config.websocket_keepalive(), Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn keepalive_disabled_when_zero() {
+        let mut config = GatewayConfig::default();
+        config.ws_keepalive_seconds = 0;
+        assert_eq!(config.websocket_keepalive(), None);
     }
 }
