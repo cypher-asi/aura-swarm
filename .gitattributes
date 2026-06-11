@@ -1,0 +1,5 @@
+# Shell scripts must use LF. core.autocrlf=true is set at the system level on
+# Windows, which rewrites these to CRLF on checkout; bash (Git Bash/WSL) then
+# fails to parse them (e.g. `syntax error near unexpected token '('`). Forcing
+# eol=lf keeps deploy scripts runnable regardless of the host autocrlf setting.
+*.sh text eol=lf

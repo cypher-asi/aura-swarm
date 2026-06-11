@@ -108,7 +108,25 @@ fi
 # image but a failed scheduler restart. Fail fast instead.
 #------------------------------------------------------------------------------
 
-echo "Running preflight credential checks..."
+echo "Running preflight checks..."
+
+# Docker must be up before anything else. `docker info` blocks indefinitely
+# when the daemon is mid-startup or the pipe is unreachable, so wrap it in a
+# timeout to FAIL FAST instead of stalling the whole script. Falls back to a
+# plain check when `timeout` is unavailable on PATH.
+DOCKER_INFO_TIMEOUT=15
+if command -v timeout &>/dev/null; then
+    docker_ready() { timeout "${DOCKER_INFO_TIMEOUT}" docker info >/dev/null 2>&1; }
+else
+    docker_ready() { docker info >/dev/null 2>&1; }
+fi
+if ! docker_ready; then
+    echo -e "${RED}✗${NC} Docker is not running (or not responding within ${DOCKER_INFO_TIMEOUT}s)."
+    echo ""
+    echo "  Start Docker Desktop, wait until it reports 'running', then re-run this script."
+    exit 1
+fi
+echo -e "${GREEN}✓${NC} Docker daemon is responding"
 
 if ! AWS_CALLER_ARN=$(aws sts get-caller-identity --output text --query Arn 2>&1); then
     echo -e "${RED}✗${NC} AWS credentials are missing or expired."
@@ -152,17 +170,6 @@ ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 echo "ECR Registry: ${ECR_REGISTRY}"
 echo "Image Tag: ${IMAGE_TAG}"
 echo ""
-
-#------------------------------------------------------------------------------
-# Verify Docker is running
-#------------------------------------------------------------------------------
-
-if ! docker info &> /dev/null; then
-    echo -e "${RED}✗ Docker is not running.${NC}"
-    echo ""
-    echo "  Start Docker Desktop and wait for it to be ready, then re-run this script."
-    exit 1
-fi
 
 #------------------------------------------------------------------------------
 # Authenticate with ECR
