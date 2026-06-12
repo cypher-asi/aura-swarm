@@ -1,5 +1,7 @@
 # MicroVM Agent Platform Specification v0.1.0
 
+> **SUPERSEDED.** This spec set describes the original Firecracker microVM (`kata-fc`) architecture, which was fully replaced by the Swarm TEE upgrade: every agent is now a confidential SEV-SNP VM with sealed per-agent storage and tier-based pricing. See **[docs/spec/v0.2.0](../v0.2.0/README.md)** for the current specification. v0.1.0 is retained for historical reference only.
+
 This directory contains the comprehensive specification for the MicroVM Agent Platform v0.1.0, a multi-user platform for running isolated AI agents in microVMs.
 
 ## Document Index
@@ -155,6 +157,7 @@ For infrastructure focus:
 | Version | Date | Description |
 |---------|------|-------------|
 | 0.1.0 | 2026-01 | Initial specification |
+| 0.2.0 | 2026-06 | [Current spec](../v0.2.0/README.md): all-TEE fleet (SEV-SNP, tiers, sealed storage) — supersedes this set |
 
 ## Open Questions
 
