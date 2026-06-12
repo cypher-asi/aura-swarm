@@ -23,7 +23,7 @@ fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
 }
 
-fn require_internal_auth<C, V>(
+pub(crate) fn require_internal_auth<C, V>(
     state: &GatewayState<C, V>,
     headers: &HeaderMap,
 ) -> Result<(), ApiError>

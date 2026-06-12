@@ -14,7 +14,7 @@ use rocksdb::{
 use crate::error::{Result, StoreError};
 use crate::keys;
 use crate::schema::{all_column_families, cf};
-use crate::types::{Agent, AgentState, Session, SessionStatus, User};
+use crate::types::{Agent, AgentState, ProcessTrigger, Session, SessionStatus, User};
 use crate::Store;
 
 /// RocksDB-backed storage implementation.
@@ -384,6 +384,152 @@ impl Store for RocksStore {
             .map(|data| Self::deserialize(&data))
             .transpose()
     }
+
+    // =========================================================================
+    // Process Trigger Operations (Swarm TEE upgrade phase 8)
+    // =========================================================================
+
+    fn put_process_trigger(&self, trigger: &ProcessTrigger) -> Result<()> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+        let key = keys::process_trigger_key(&trigger.agent_id, &trigger.process_id);
+        let value = Self::serialize(trigger)?;
+
+        self.db
+            .put_cf(&cf, key, value)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn get_process_trigger(
+        &self,
+        agent_id: &AgentId,
+        process_id: &str,
+    ) -> Result<Option<ProcessTrigger>> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+        let key = keys::process_trigger_key(agent_id, process_id);
+
+        self.db
+            .get_cf(&cf, key)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .map(|data| Self::deserialize(&data))
+            .transpose()
+    }
+
+    fn list_process_triggers_by_agent(&self, agent_id: &AgentId) -> Result<Vec<ProcessTrigger>> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+        let prefix = keys::agent_prefix(agent_id);
+
+        let mut triggers = Vec::new();
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            triggers.push(Self::deserialize(&value)?);
+        }
+
+        Ok(triggers)
+    }
+
+    fn list_all_process_triggers(&self) -> Result<Vec<ProcessTrigger>> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+
+        let mut triggers = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (_, value) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            triggers.push(Self::deserialize(&value)?);
+        }
+
+        Ok(triggers)
+    }
+
+    fn delete_process_trigger(&self, agent_id: &AgentId, process_id: &str) -> Result<()> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+        let key = keys::process_trigger_key(agent_id, process_id);
+
+        if self
+            .db
+            .get_cf(&cf, &key)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .is_none()
+        {
+            return Err(StoreError::NotFound);
+        }
+
+        self.db
+            .delete_cf(&cf, key)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn delete_process_triggers_for_agent(&self, agent_id: &AgentId) -> Result<u32> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+        let prefix = keys::agent_prefix(agent_id);
+
+        let mut batch = WriteBatch::default();
+        let mut count = 0u32;
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete_cf(&cf, key);
+            count += 1;
+        }
+
+        self.db
+            .write(batch)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(count)
+    }
+
+    fn replace_process_triggers(
+        &self,
+        agent_id: &AgentId,
+        triggers: Vec<ProcessTrigger>,
+    ) -> Result<Vec<ProcessTrigger>> {
+        let cf = self.cf(cf::PROCESS_TRIGGERS)?;
+
+        // Existing set, for bookkeeping preservation + removal of
+        // triggers absent from the new desired set.
+        let existing = self.list_process_triggers_by_agent(agent_id)?;
+
+        let mut batch = WriteBatch::default();
+        let mut stored = Vec::with_capacity(triggers.len());
+
+        for old in &existing {
+            if !triggers.iter().any(|t| t.process_id == old.process_id) {
+                batch.delete_cf(&cf, keys::process_trigger_key(agent_id, &old.process_id));
+            }
+        }
+
+        for mut trigger in triggers {
+            trigger.agent_id = *agent_id;
+            if let Some(old) = existing.iter().find(|o| o.process_id == trigger.process_id) {
+                // Re-registration of a known trigger: keep gateway-side
+                // bookkeeping, take the agent-supplied schedule fields.
+                trigger.registered_at = old.registered_at;
+                trigger.last_run_at = old.last_run_at;
+            }
+            let key = keys::process_trigger_key(agent_id, &trigger.process_id);
+            batch.put_cf(&cf, key, Self::serialize(&trigger)?);
+            stored.push(trigger);
+        }
+
+        self.db
+            .write(batch)
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(stored)
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +824,148 @@ mod tests {
 
         let all = store.list_all_agents().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    fn create_test_trigger(agent_id: &AgentId, process_id: &str) -> ProcessTrigger {
+        let now = chrono::Utc::now();
+        ProcessTrigger {
+            agent_id: *agent_id,
+            process_id: process_id.to_string(),
+            cron: "0 * * * *".to_string(),
+            enabled: true,
+            next_run_at: Some(now + chrono::Duration::hours(1)),
+            last_run_at: None,
+            registered_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn process_trigger_crud() {
+        let (store, _dir) = create_test_store();
+        let agent_id = AgentId::generate();
+        let trigger = create_test_trigger(&agent_id, "proc-1");
+
+        // Upsert + get
+        store.put_process_trigger(&trigger).unwrap();
+        let got = store
+            .get_process_trigger(&agent_id, "proc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, trigger);
+
+        // Upsert overwrites
+        let mut updated = trigger.clone();
+        updated.enabled = false;
+        store.put_process_trigger(&updated).unwrap();
+        let got = store
+            .get_process_trigger(&agent_id, "proc-1")
+            .unwrap()
+            .unwrap();
+        assert!(!got.enabled);
+
+        // Delete
+        store.delete_process_trigger(&agent_id, "proc-1").unwrap();
+        assert!(store
+            .get_process_trigger(&agent_id, "proc-1")
+            .unwrap()
+            .is_none());
+
+        // Delete of unknown trigger is NotFound
+        let result = store.delete_process_trigger(&agent_id, "proc-1");
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn process_triggers_list_by_agent_and_all() {
+        let (store, _dir) = create_test_store();
+        let agent1 = AgentId::generate();
+        let agent2 = AgentId::generate();
+
+        store
+            .put_process_trigger(&create_test_trigger(&agent1, "a"))
+            .unwrap();
+        store
+            .put_process_trigger(&create_test_trigger(&agent1, "b"))
+            .unwrap();
+        store
+            .put_process_trigger(&create_test_trigger(&agent2, "c"))
+            .unwrap();
+
+        assert_eq!(store.list_process_triggers_by_agent(&agent1).unwrap().len(), 2);
+        assert_eq!(store.list_process_triggers_by_agent(&agent2).unwrap().len(), 1);
+        assert_eq!(store.list_all_process_triggers().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn delete_process_triggers_for_agent_scoped() {
+        let (store, _dir) = create_test_store();
+        let agent1 = AgentId::generate();
+        let agent2 = AgentId::generate();
+
+        store
+            .put_process_trigger(&create_test_trigger(&agent1, "a"))
+            .unwrap();
+        store
+            .put_process_trigger(&create_test_trigger(&agent1, "b"))
+            .unwrap();
+        store
+            .put_process_trigger(&create_test_trigger(&agent2, "c"))
+            .unwrap();
+
+        let removed = store.delete_process_triggers_for_agent(&agent1).unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.list_process_triggers_by_agent(&agent1).unwrap().is_empty());
+        // Other agent untouched
+        assert_eq!(store.list_process_triggers_by_agent(&agent2).unwrap().len(), 1);
+
+        // No-op for an agent with no triggers
+        assert_eq!(store.delete_process_triggers_for_agent(&agent1).unwrap(), 0);
+    }
+
+    #[test]
+    fn replace_process_triggers_semantics() {
+        let (store, _dir) = create_test_store();
+        let agent_id = AgentId::generate();
+
+        // Seed: triggers "a" (with cron-service bookkeeping) and "b".
+        let mut a = create_test_trigger(&agent_id, "a");
+        let original_registered_at = a.registered_at - chrono::Duration::days(1);
+        a.registered_at = original_registered_at;
+        a.last_run_at = Some(a.registered_at + chrono::Duration::hours(1));
+        store.put_process_trigger(&a).unwrap();
+        store
+            .put_process_trigger(&create_test_trigger(&agent_id, "b"))
+            .unwrap();
+
+        // Replace with desired set { a (new cron, disabled), c }:
+        // "b" must vanish, "a" must keep registered_at / last_run_at.
+        let mut new_a = create_test_trigger(&agent_id, "a");
+        new_a.cron = "*/5 * * * *".to_string();
+        new_a.enabled = false;
+        let new_c = create_test_trigger(&agent_id, "c");
+
+        let stored = store
+            .replace_process_triggers(&agent_id, vec![new_a, new_c])
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+
+        let listed = store.list_process_triggers_by_agent(&agent_id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(store.get_process_trigger(&agent_id, "b").unwrap().is_none());
+
+        let got_a = store.get_process_trigger(&agent_id, "a").unwrap().unwrap();
+        assert_eq!(got_a.cron, "*/5 * * * *");
+        assert!(!got_a.enabled);
+        assert_eq!(got_a.registered_at, original_registered_at);
+        assert_eq!(got_a.last_run_at, a.last_run_at);
+
+        assert!(store.get_process_trigger(&agent_id, "c").unwrap().is_some());
+
+        // Replace with the empty set clears everything.
+        let stored = store.replace_process_triggers(&agent_id, vec![]).unwrap();
+        assert!(stored.is_empty());
+        assert!(store.list_process_triggers_by_agent(&agent_id).unwrap().is_empty());
     }
 
     #[test]

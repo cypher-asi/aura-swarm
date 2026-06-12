@@ -421,6 +421,41 @@ impl SessionStatus {
     }
 }
 
+/// Trigger metadata registered by an agent for one of its processes
+/// (Swarm TEE upgrade phase 8, "trigger outside, data inside").
+///
+/// # Trust boundary
+///
+/// This record is the **only** process-derived data the control plane
+/// ever persists. The process prompt, config, and run history stay
+/// sealed inside the agent VM; what lives here is just enough for the
+/// external cron service to fire a content-free trigger: which
+/// process, on what schedule, whether it is active, and when it fires
+/// next. Registration paths must never widen this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessTrigger {
+    /// Agent that owns the process (the VM the trigger fires into).
+    pub agent_id: AgentId,
+    /// Process id (opaque off-VM; assigned inside the agent).
+    pub process_id: String,
+    /// Cron expression (UTC) — schedule only, no payload.
+    pub cron: String,
+    /// Whether the cron service should fire this trigger.
+    pub enabled: bool,
+    /// Next fire time computed inside the agent, if the schedule has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// When the control-plane cron service last fired this trigger.
+    /// Owned by the gateway side; preserved across re-registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// When this trigger was first registered (preserved across
+    /// re-registrations of the same `(agent_id, process_id)`).
+    pub registered_at: DateTime<Utc>,
+    /// When this trigger was last (re-)registered or updated.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A user record stored in the database (synced from zOS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {

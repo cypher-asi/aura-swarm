@@ -43,8 +43,8 @@ pub mod types;
 pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
 pub use types::{
-    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, Session, SessionConfig, SessionStatus,
-    StorageEncryption, UnknownBoxTier, User, WorkspaceConfig,
+    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, ProcessTrigger, Session, SessionConfig,
+    SessionStatus, StorageEncryption, UnknownBoxTier, User, WorkspaceConfig,
 };
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
@@ -196,4 +196,82 @@ pub trait Store: Send + Sync {
     ///
     /// Returns an error if the database operation fails.
     fn get_user(&self, user_id: &UserId) -> Result<Option<User>>;
+
+    // =========================================================================
+    // Process Trigger Operations (Swarm TEE upgrade phase 8)
+    // =========================================================================
+    //
+    // Trust boundary: a `ProcessTrigger` carries only the trigger
+    // metadata an agent exported (`process_id`, `cron`, `enabled`,
+    // `next_run_at`) plus control-plane bookkeeping. Process payloads
+    // never reach this store.
+
+    /// Insert or update a process trigger (keyed by
+    /// `agent_id || process_id`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn put_process_trigger(&self, trigger: &ProcessTrigger) -> Result<()>;
+
+    /// Get a process trigger by agent and process id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn get_process_trigger(
+        &self,
+        agent_id: &AgentId,
+        process_id: &str,
+    ) -> Result<Option<ProcessTrigger>>;
+
+    /// List all triggers registered for an agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn list_process_triggers_by_agent(&self, agent_id: &AgentId) -> Result<Vec<ProcessTrigger>>;
+
+    /// List every registered trigger across all agents.
+    ///
+    /// Used by the control-plane cron service to scan for due triggers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn list_all_process_triggers(&self) -> Result<Vec<ProcessTrigger>>;
+
+    /// Delete a single process trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::NotFound` if no such trigger is registered.
+    fn delete_process_trigger(&self, agent_id: &AgentId, process_id: &str) -> Result<()>;
+
+    /// Delete every trigger registered for an agent (agent destroy:
+    /// triggers must not outlive the agent). Returns the number of
+    /// triggers removed; deleting for an agent with none is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn delete_process_triggers_for_agent(&self, agent_id: &AgentId) -> Result<u32>;
+
+    /// Atomically replace the full trigger set for an agent with the
+    /// given desired set (replace-semantics sync from the agent VM).
+    ///
+    /// Triggers absent from `triggers` are removed; for triggers that
+    /// already exist, the control-plane bookkeeping (`registered_at`,
+    /// `last_run_at`) is preserved while `cron` / `enabled` /
+    /// `next_run_at` / `updated_at` are taken from the new record.
+    /// Returns the stored set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn replace_process_triggers(
+        &self,
+        agent_id: &AgentId,
+        triggers: Vec<ProcessTrigger>,
+    ) -> Result<Vec<ProcessTrigger>>;
 }

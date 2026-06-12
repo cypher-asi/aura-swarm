@@ -16,7 +16,8 @@ use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
 use crate::handlers::{
-    agents, automaton, files, health, internal, run, secrets, sessions, terminal, ws,
+    agents, automaton, files, health, internal, process_triggers, run, secrets, sessions,
+    terminal, ws,
 };
 use crate::state::GatewayState;
 
@@ -70,10 +71,15 @@ use crate::state::GatewayState;
 /// - `GET /v1/agents/:agent_id/stream/:run_id` - Attach to a run's event stream (WS)
 /// - `GET /v1/agents/:agent_id/workspace/resolve` - Resolve a workspace path
 ///
+/// ## Process triggers (Swarm TEE phase 8 — metadata only, never payloads)
+/// - `GET /v1/agents/:agent_id/process-triggers` - Owner read of registered trigger metadata
+///
 /// ## Internal (service-token authenticated, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
 /// - `GET /internal/agents/active` - List agents expected to have pods (scheduler reconciler)
 /// - `GET /internal/agents/all` - List all persisted agents (deploy verification)
+/// - `PUT /internal/agents/:agent_id/process-triggers` - Replace-sync trigger metadata (harness)
+/// - `DELETE /internal/agents/:agent_id/process-triggers/:process_id` - Unregister one trigger
 /// - `GET /internal/health` - Internal health check
 pub fn create_router<C, V>(state: GatewayState<C, V>) -> Router
 where
@@ -196,7 +202,20 @@ where
             "/v1/agents/:agent_id/workspace/resolve",
             get(automaton::workspace_resolve::<C, V>),
         )
+        // Process-trigger metadata (owner read; registration is internal)
+        .route(
+            "/v1/agents/:agent_id/process-triggers",
+            get(process_triggers::list_triggers::<C, V>),
+        )
         // Internal endpoints (service-token authenticated; not user API)
+        .route(
+            "/internal/agents/:agent_id/process-triggers",
+            axum::routing::put(process_triggers::replace_triggers::<C, V>),
+        )
+        .route(
+            "/internal/agents/:agent_id/process-triggers/:process_id",
+            axum::routing::delete(process_triggers::delete_trigger::<C, V>),
+        )
         .route(
             "/internal/agents/:agent_id/status",
             patch(internal::update_agent_status::<C, V>),

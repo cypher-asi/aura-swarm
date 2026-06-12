@@ -207,6 +207,54 @@ pub trait ControlPlane: Send + Sync {
     /// Used by deploy verification to prove that redeploys preserved machine
     /// identities, including hibernating, stopped, and error agents.
     async fn list_all_agents(&self) -> Result<Vec<Agent>>;
+
+    // =========================================================================
+    // Process Triggers (Swarm TEE upgrade phase 8)
+    // =========================================================================
+
+    /// Replace the full registered trigger set for an agent with the
+    /// desired set pushed by the harness (replace-semantics sync).
+    ///
+    /// Internal operation: no ownership check — callers must be behind
+    /// internal-token auth. Validates every cron expression and
+    /// process id server-side before persisting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::AgentNotFound` if the agent doesn't exist.
+    /// Returns `ControlError::InvalidTrigger` for invalid input.
+    async fn replace_process_triggers_internal(
+        &self,
+        agent_id: &AgentId,
+        registrations: Vec<crate::triggers::TriggerRegistration>,
+    ) -> Result<Vec<aura_swarm_store::ProcessTrigger>>;
+
+    /// Delete one registered trigger for an agent.
+    ///
+    /// Internal operation: no ownership check — callers must be behind
+    /// internal-token auth.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::TriggerNotFound` if no such trigger exists.
+    async fn delete_process_trigger_internal(
+        &self,
+        agent_id: &AgentId,
+        process_id: &str,
+    ) -> Result<()>;
+
+    /// List the registered trigger metadata for an agent, verifying
+    /// ownership (owner-facing read).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::AgentNotFound` / `ControlError::NotOwner`
+    /// per the usual ownership rules.
+    async fn list_process_triggers(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+    ) -> Result<Vec<aura_swarm_store::ProcessTrigger>>;
 }
 
 /// The main control plane service implementation.
@@ -638,6 +686,9 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             for session in sessions {
                 s.delete_session(&session.session_id)?;
             }
+            // Registered process triggers must not outlive the agent —
+            // otherwise the cron service would keep waking a ghost.
+            s.delete_process_triggers_for_agent(&aid)?;
             s.delete_agent(&aid)?;
             Ok(())
         })
@@ -1098,6 +1149,87 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
 
     async fn list_all_agents(&self) -> Result<Vec<Agent>> {
         blocking_store(&self.store, move |s| Ok(s.list_all_agents()?)).await
+    }
+
+    // =========================================================================
+    // Process Triggers (Swarm TEE upgrade phase 8)
+    // =========================================================================
+
+    async fn replace_process_triggers_internal(
+        &self,
+        agent_id: &AgentId,
+        registrations: Vec<crate::triggers::TriggerRegistration>,
+    ) -> Result<Vec<aura_swarm_store::ProcessTrigger>> {
+        if registrations.len() > crate::triggers::MAX_TRIGGERS_PER_AGENT {
+            return Err(ControlError::InvalidTrigger(format!(
+                "too many triggers: {} (max {})",
+                registrations.len(),
+                crate::triggers::MAX_TRIGGERS_PER_AGENT
+            )));
+        }
+
+        // Validate the whole set up front so a bad entry rejects the
+        // sync atomically instead of half-applying it.
+        let triggers = registrations
+            .into_iter()
+            .map(|r| r.into_trigger(agent_id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let aid = *agent_id;
+        let stored = blocking_store(&self.store, move |s| {
+            if s.get_agent(&aid)?.is_none() {
+                return Err(ControlError::AgentNotFound(aid));
+            }
+            Ok(s.replace_process_triggers(&aid, triggers)?)
+        })
+        .await?;
+
+        tracing::info!(
+            agent_id = %agent_id,
+            count = stored.len(),
+            "Registered process triggers"
+        );
+
+        Ok(stored)
+    }
+
+    async fn delete_process_trigger_internal(
+        &self,
+        agent_id: &AgentId,
+        process_id: &str,
+    ) -> Result<()> {
+        crate::triggers::validate_process_id(process_id)?;
+
+        let aid = *agent_id;
+        let pid = process_id.to_string();
+        blocking_store(&self.store, move |s| {
+            match s.delete_process_trigger(&aid, &pid) {
+                Ok(()) => Ok(()),
+                Err(aura_swarm_store::StoreError::NotFound) => {
+                    Err(ControlError::TriggerNotFound(pid.clone()))
+                }
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await?;
+
+        tracing::info!(agent_id = %agent_id, process_id = %process_id, "Deleted process trigger");
+
+        Ok(())
+    }
+
+    async fn list_process_triggers(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+    ) -> Result<Vec<aura_swarm_store::ProcessTrigger>> {
+        self.get_and_verify(user_id, agent_id).await?;
+
+        let aid = *agent_id;
+        blocking_store(&self.store, move |s| {
+            Ok(s.list_process_triggers_by_agent(&aid)?)
+        })
+        .await
     }
 }
 
@@ -2109,5 +2241,163 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.status, SessionStatus::Closed);
+    }
+
+    // =========================================================================
+    // Process triggers (Swarm TEE upgrade phase 8)
+    // =========================================================================
+
+    fn registration(process_id: &str, cron: &str) -> crate::triggers::TriggerRegistration {
+        serde_json::from_value(serde_json::json!({
+            "process_id": process_id,
+            "cron": cron,
+            "enabled": true,
+            "next_run_at": chrono::Utc::now(),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_triggers_sync_and_owner_read() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("cron-agent"))
+            .await
+            .unwrap();
+
+        // First sync: two triggers.
+        let stored = service
+            .replace_process_triggers_internal(
+                &agent.agent_id,
+                vec![registration("p1", "*/5 * * * *"), registration("p2", "0 0 * * *")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+
+        // Second sync drops p2, keeps p1: replace semantics.
+        let stored = service
+            .replace_process_triggers_internal(
+                &agent.agent_id,
+                vec![registration("p1", "*/10 * * * *")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+
+        let listed = service
+            .list_process_triggers(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].process_id, "p1");
+        assert_eq!(listed[0].cron, "*/10 * * * *");
+    }
+
+    #[tokio::test]
+    async fn replace_triggers_rejects_invalid_cron_atomically() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("cron-agent"))
+            .await
+            .unwrap();
+
+        let result = service
+            .replace_process_triggers_internal(
+                &agent.agent_id,
+                vec![registration("ok", "*/5 * * * *"), registration("bad", "not a cron")],
+            )
+            .await;
+        assert!(matches!(result, Err(ControlError::InvalidTrigger(_))));
+
+        // Nothing was applied — the sync is all-or-nothing.
+        let listed = service
+            .list_process_triggers(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_triggers_unknown_agent() {
+        let (service, _dir, _user_id) = setup();
+        let ghost = AgentId::generate();
+
+        let result = service
+            .replace_process_triggers_internal(&ghost, vec![registration("p1", "*/5 * * * *")])
+            .await;
+        assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn list_triggers_requires_ownership() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("cron-agent"))
+            .await
+            .unwrap();
+
+        let other = UserId::from_uuid(uuid::Uuid::new_v4());
+        let result = service.list_process_triggers(&other, &agent.agent_id).await;
+        assert!(matches!(result, Err(ControlError::NotOwner { .. })));
+    }
+
+    #[tokio::test]
+    async fn delete_trigger_internal_and_not_found() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("cron-agent"))
+            .await
+            .unwrap();
+
+        service
+            .replace_process_triggers_internal(
+                &agent.agent_id,
+                vec![registration("p1", "*/5 * * * *")],
+            )
+            .await
+            .unwrap();
+
+        service
+            .delete_process_trigger_internal(&agent.agent_id, "p1")
+            .await
+            .unwrap();
+
+        let result = service
+            .delete_process_trigger_internal(&agent.agent_id, "p1")
+            .await;
+        assert!(matches!(result, Err(ControlError::TriggerNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn destroy_agent_cleans_registered_triggers() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("cron-agent"))
+            .await
+            .unwrap();
+
+        service
+            .replace_process_triggers_internal(
+                &agent.agent_id,
+                vec![registration("p1", "*/5 * * * *"), registration("p2", "0 0 * * *")],
+            )
+            .await
+            .unwrap();
+
+        // Drive to a terminal state, then destroy.
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Stopped)
+            .unwrap();
+        service.delete_agent(&user_id, &agent.agent_id).await.unwrap();
+
+        // Triggers must not outlive the agent.
+        assert!(service
+            .store
+            .list_process_triggers_by_agent(&agent.agent_id)
+            .unwrap()
+            .is_empty());
+        assert!(service.store.list_all_process_triggers().unwrap().is_empty());
     }
 }

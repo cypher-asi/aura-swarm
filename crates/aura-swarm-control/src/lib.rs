@@ -78,6 +78,7 @@ pub mod lifecycle;
 pub mod scheduler_client;
 pub mod service;
 pub mod session;
+pub mod triggers;
 pub mod types;
 
 pub use billing::{BillingCheckError, BillingChecker, BillingConfig};
@@ -87,11 +88,12 @@ pub use scheduler_client::{
     HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient,
 };
 pub use service::{ControlPlane, ControlPlaneService};
+pub use triggers::TriggerRegistration;
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 
 // Re-export commonly used types from dependencies for convenience
 pub use aura_swarm_core::{AgentId, SessionId, UserId};
 pub use aura_swarm_store::{
-    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, Session, SessionConfig, SessionStatus,
-    StorageEncryption,
+    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, ProcessTrigger, Session, SessionConfig,
+    SessionStatus, StorageEncryption,
 };

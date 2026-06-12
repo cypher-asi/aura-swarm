@@ -67,6 +67,15 @@ pub enum ControlError {
     #[error("agent {0} is not in a runnable state")]
     AgentNotRunnable(AgentId),
 
+    /// A process-trigger registration carried an invalid process id or
+    /// cron expression.
+    #[error("invalid trigger registration: {0}")]
+    InvalidTrigger(String),
+
+    /// No registered process trigger matches the given process id.
+    #[error("process trigger not found: {0}")]
+    TriggerNotFound(String),
+
     /// A session is already active for this agent.
     #[error("agent {0} already has an active session")]
     SessionAlreadyActive(AgentId),
@@ -102,12 +111,12 @@ impl ControlError {
     #[must_use]
     pub const fn http_status_code(&self) -> u16 {
         match self {
-            Self::AgentNotFound(_) | Self::SessionNotFound(_) => 404,
+            Self::AgentNotFound(_) | Self::SessionNotFound(_) | Self::TriggerNotFound(_) => 404,
             Self::AgentAlreadyExists { .. } => 409,
             Self::QuotaExceeded { .. } => 429, // Too Many Requests
             Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => 402, // Payment Required
             Self::NotOwner { .. } => 403,
-            Self::InvalidTier(_) => 400,
+            Self::InvalidTier(_) | Self::InvalidTrigger(_) => 400,
             Self::InvalidState { .. }
             | Self::AgentNotRunnable(_)
             | Self::SessionAlreadyActive(_) => 409,

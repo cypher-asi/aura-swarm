@@ -163,6 +163,12 @@ impl From<ControlError> for ApiError {
             ControlError::InvalidTier(tier) => {
                 Self::BadRequest(format!("unknown tier: {tier} (expected small/standard/pro)"))
             }
+            ControlError::InvalidTrigger(msg) => {
+                Self::BadRequest(format!("invalid trigger registration: {msg}"))
+            }
+            ControlError::TriggerNotFound(process_id) => {
+                Self::NotFound(format!("process trigger {process_id}"))
+            }
             ControlError::InvalidState { from, to, .. } => {
                 Self::Conflict(format!("cannot transition from {from:?} to {to:?}"))
             }

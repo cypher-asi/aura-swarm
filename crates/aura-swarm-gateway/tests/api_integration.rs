@@ -1276,3 +1276,279 @@ async fn secrets_invalid_agent_id_rejected() {
         .await;
     resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// Process triggers (Swarm TEE phase 8)
+// ---------------------------------------------------------------------------
+
+/// Create an agent owned by `TEST_USER_UUID`, optionally with a fixed
+/// agent id, and return the agent id.
+async fn create_agent(server: &TestServer, agent_id: Option<&str>) -> String {
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let mut body = json!({"name": "trigger-agent"});
+    if let Some(id) = agent_id {
+        body["agent_id"] = json!(id);
+    }
+    let resp = server
+        .post("/v1/agents")
+        .add_header(hdr, val)
+        .json(&body)
+        .await;
+    resp.json::<Value>()["agent_id"].as_str().unwrap().to_string()
+}
+
+fn trigger_set() -> Value {
+    json!([
+        {"process_id": "p1", "cron": "*/5 * * * *", "enabled": true,
+         "next_run_at": "2030-01-01T00:00:00Z"},
+        {"process_id": "p2", "cron": "0 0 * * *", "enabled": false}
+    ])
+}
+
+#[tokio::test]
+async fn trigger_registration_requires_internal_token() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+
+    // No token → 401.
+    server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .json(&trigger_set())
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .delete(&format!("/internal/agents/{agent_id}/process-triggers/p1"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+    // An owner JWT is NOT an internal token → still 401.
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(hdr, val)
+        .json(&trigger_set())
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn trigger_replace_sync_and_owner_read() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    // Register two triggers.
+    let resp = server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&trigger_set())
+        .await;
+    resp.assert_status_ok();
+    assert_eq!(resp.json::<Value>()["registered"], 2);
+
+    // Owner read sees both, with only metadata fields.
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    let triggers = body["triggers"].as_array().unwrap();
+    assert_eq!(triggers.len(), 2);
+    let p1 = triggers.iter().find(|t| t["process_id"] == "p1").unwrap();
+    assert_eq!(p1["cron"], "*/5 * * * *");
+    assert_eq!(p1["enabled"], true);
+    assert_eq!(p1["next_run_at"], "2030-01-01T00:00:00Z");
+    assert!(p1.get("prompt").is_none());
+
+    // Replace with a smaller set: p2 must be unregistered.
+    let resp = server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!([
+            {"process_id": "p1", "cron": "*/10 * * * *", "enabled": true}
+        ]))
+        .await;
+    resp.assert_status_ok();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    let body: Value = resp.json();
+    let triggers = body["triggers"].as_array().unwrap();
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0]["process_id"], "p1");
+    assert_eq!(triggers[0]["cron"], "*/10 * * * *");
+}
+
+/// Extra fields beyond the allowed metadata (e.g. a prompt) are
+/// stripped at the trust boundary, never stored or echoed back.
+#[tokio::test]
+async fn trigger_registration_strips_unexpected_fields() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!([
+            {"process_id": "p1", "cron": "*/5 * * * *", "enabled": true,
+             "prompt": "IN-TEE-SECRET", "config": {"k": "v"}, "last_run_at": "2020-01-01T00:00:00Z"}
+        ]))
+        .await
+        .assert_status_ok();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr, val)
+        .await;
+    let raw = resp.text();
+    assert!(!raw.contains("IN-TEE-SECRET"));
+    assert!(!raw.contains("prompt"));
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    // The agent cannot inject gateway-side bookkeeping either.
+    assert!(body["triggers"][0].get("last_run_at").is_none());
+}
+
+#[tokio::test]
+async fn trigger_registration_validates_cron_and_agent() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    // Invalid cron → 400.
+    let resp = server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!([{"process_id": "p1", "cron": "not a cron", "enabled": true}]))
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // Invalid process id → 400.
+    let resp = server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!([{"process_id": "a/../b", "cron": "*/5 * * * *", "enabled": true}]))
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // Unknown agent → 404.
+    let ghost = "ee".repeat(16);
+    let resp = server
+        .put(&format!("/internal/agents/{ghost}/process-triggers"))
+        .add_header(internal_hdr, internal_val)
+        .json(&trigger_set())
+        .await;
+    resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trigger_internal_delete_single() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&trigger_set())
+        .await
+        .assert_status_ok();
+
+    server
+        .delete(&format!("/internal/agents/{agent_id}/process-triggers/p2"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // Deleting again → 404.
+    server
+        .delete(&format!("/internal/agents/{agent_id}/process-triggers/p2"))
+        .add_header(internal_hdr, internal_val)
+        .await
+        .assert_status(axum::http::StatusCode::NOT_FOUND);
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr, val)
+        .await;
+    assert_eq!(resp.json::<Value>()["triggers"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn trigger_owner_read_requires_auth_and_ownership() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+
+    // No token → 401.
+    server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+    // Different user → 403.
+    let (hdr2, val2) = auth_header(OTHER_USER_UUID);
+    server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr2, val2)
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+/// Destroying an agent must unregister its triggers: recreate an agent
+/// under the same (caller-supplied) id and verify the registered set
+/// is empty.
+#[tokio::test]
+async fn trigger_cleanup_on_agent_destroy() {
+    let (server, _tmp) = build_test_app();
+    let fixed_id = "ab".repeat(16);
+    let agent_id = create_agent(&server, Some(&fixed_id)).await;
+    let (internal_hdr, internal_val) = internal_auth_header();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    server
+        .put(&format!("/internal/agents/{agent_id}/process-triggers"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&trigger_set())
+        .await
+        .assert_status_ok();
+
+    // Drive to Stopped through the real lifecycle, then destroy.
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+    server
+        .post(&format!("/v1/agents/{agent_id}/stop"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status_ok();
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&json!({"status": "stopped"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+    server
+        .delete(&format!("/v1/agents/{agent_id}"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // Recreate with the same id: no stale triggers may survive.
+    let recreated = create_agent(&server, Some(&fixed_id)).await;
+    assert_eq!(recreated, agent_id);
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/process-triggers"))
+        .add_header(hdr, val)
+        .await;
+    resp.assert_status_ok();
+    assert_eq!(resp.json::<Value>()["triggers"], json!([]));
+}

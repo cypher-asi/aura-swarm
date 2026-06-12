@@ -55,6 +55,11 @@ zeroize = "1"
 kube = { version = "0.98", features = ["runtime", "client", "derive"] }
 k8s-openapi = { version = "0.24", features = ["v1_31"] }
 
+# Cron parsing (process-trigger registration; same crate family as
+# aura-harness, which uses 0.16 — 0.15 is the newest that builds on
+# this workspace's pinned Rust 1.85; expression semantics match)
+cron = "0.15"
+
 # Utilities
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
