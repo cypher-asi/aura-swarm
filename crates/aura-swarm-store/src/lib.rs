@@ -13,6 +13,8 @@
 //! - `sessions`: Primary session records, keyed by `session_id`
 //! - `sessions_by_agent`: Index for listing sessions by agent
 //! - `users`: User records synced from zOS
+//! - `process_triggers`: Trigger metadata registered by agents
+//! - `usage_events`: Usage/cost events keyed by agent and timestamp
 //!
 //! # Example
 //!
@@ -41,8 +43,8 @@ pub mod types;
 pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
 pub use types::{
-    Agent, AgentSpec, AgentState, IsolationLevel, Session, SessionConfig, SessionStatus, User,
-    WorkspaceConfig,
+    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, Session, SessionConfig, SessionStatus,
+    StorageEncryption, UnknownBoxTier, User, WorkspaceConfig,
 };
 
 use aura_swarm_core::{AgentId, SessionId, UserId};

@@ -21,9 +21,22 @@ pub mod cf {
 
     /// User records (synced from zOS), keyed by `user_id`.
     pub const USERS: &str = "users";
+
+    /// Process trigger metadata registered by agents, keyed by
+    /// `agent_id || process_id`. Holds only `(process_id, cron, enabled)`
+    /// style metadata — process payloads stay sealed inside the agent.
+    pub const PROCESS_TRIGGERS: &str = "process_triggers";
+
+    /// Usage events for cost/usage aggregation, keyed by
+    /// `agent_id || timestamp_millis` (big-endian for time-ordered scans).
+    pub const USAGE_EVENTS: &str = "usage_events";
 }
 
 /// Returns all column family names for database initialization.
+///
+/// Column families listed here are auto-created on database open
+/// (`create_missing_column_families`), so adding a new CF requires no
+/// explicit migration.
 #[must_use]
 pub fn all_column_families() -> Vec<&'static str> {
     vec![
@@ -33,6 +46,8 @@ pub fn all_column_families() -> Vec<&'static str> {
         cf::SESSIONS,
         cf::SESSIONS_BY_AGENT,
         cf::USERS,
+        cf::PROCESS_TRIGGERS,
+        cf::USAGE_EVENTS,
     ]
 }
 
@@ -52,6 +67,8 @@ mod tests {
                 cf::SESSIONS,
                 cf::SESSIONS_BY_AGENT,
                 cf::USERS,
+                cf::PROCESS_TRIGGERS,
+                cf::USAGE_EVENTS,
             ]
         );
     }

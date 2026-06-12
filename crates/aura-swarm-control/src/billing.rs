@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use aura_swarm_store::BoxTier;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +18,15 @@ pub struct BillingConfig {
     pub api_key: String,
     /// Whether billing is enabled.
     pub enabled: bool,
-    /// Minimum credit balance required for agent creation (in cents).
+    /// Legacy flat minimum credit balance for agent creation (in cents).
+    /// Tier-based creates use `agent_runway_hours` x the tier's hourly
+    /// price instead; this floor only backs the legacy flat check.
     pub min_credits_for_agent: i64,
     /// Minimum credit balance required for session creation (in cents).
     pub min_credits_for_session: i64,
+    /// Hours of runway (at the tier's hourly rate) a user must be able to
+    /// afford before an agent is created on that tier.
+    pub agent_runway_hours: i64,
     /// Whether to block operations when billing is unavailable.
     pub fail_closed: bool,
 }
@@ -33,6 +39,7 @@ impl Default for BillingConfig {
             enabled: true,
             min_credits_for_agent: 100,  // $1.00 minimum
             min_credits_for_session: 10, // $0.10 minimum
+            agent_runway_hours: 2,
             fail_closed: false,
         }
     }
@@ -61,6 +68,11 @@ impl BillingConfig {
         if let Ok(val) = std::env::var("Z_BILLING_MIN_SESSION_CREDITS") {
             if let Ok(n) = val.parse() {
                 config.min_credits_for_session = n;
+            }
+        }
+        if let Ok(val) = std::env::var("Z_BILLING_AGENT_RUNWAY_HOURS") {
+            if let Ok(n) = val.parse() {
+                config.agent_runway_hours = n;
             }
         }
         if let Ok(val) = std::env::var("Z_BILLING_FAIL_CLOSED") {
@@ -127,7 +139,11 @@ impl BillingChecker {
         self.config.is_configured()
     }
 
-    /// Check if the user has sufficient credits for agent creation.
+    /// Check if the user has sufficient credits for agent creation
+    /// (legacy flat-amount check).
+    ///
+    /// Prefer [`Self::check_agent_credits_for_tier`], which scales with the
+    /// tier's hourly price.
     ///
     /// # Errors
     ///
@@ -135,6 +151,21 @@ impl BillingChecker {
     pub async fn check_agent_credits(&self, user_id: &str) -> Result<(), BillingCheckError> {
         self.check_balance(user_id, self.config.min_credits_for_agent)
             .await
+    }
+
+    /// Check if the user can afford the configured runway (default ~2 hours)
+    /// at the tier's hourly rate before creating an agent on that tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if user has insufficient credits or billing service fails.
+    pub async fn check_agent_credits_for_tier(
+        &self,
+        user_id: &str,
+        tier: BoxTier,
+    ) -> Result<(), BillingCheckError> {
+        let required = i64::from(tier.hourly_price_cents()) * self.config.agent_runway_hours;
+        self.check_balance(user_id, required).await
     }
 
     /// Check if the user has sufficient credits for session creation.
@@ -248,7 +279,20 @@ mod tests {
         let config = BillingConfig::default();
         assert_eq!(config.min_credits_for_agent, 100);
         assert_eq!(config.min_credits_for_session, 10);
+        assert_eq!(config.agent_runway_hours, 2);
         assert!(!config.fail_closed);
+    }
+
+    #[test]
+    fn tier_check_required_amount_scales_with_price() {
+        // 2 hours of runway at the tier rate.
+        let config = BillingConfig::default();
+        for tier in BoxTier::ALL {
+            let required = i64::from(tier.hourly_price_cents()) * config.agent_runway_hours;
+            assert_eq!(required, i64::from(tier.hourly_price_cents()) * 2);
+        }
+        // Sanity: standard tier needs 16 cents, not the flat $1.00.
+        assert_eq!(i64::from(BoxTier::Standard.hourly_price_cents()) * 2, 16);
     }
 
     #[test]

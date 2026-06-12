@@ -9,6 +9,8 @@
 //! - `status_agent_key`: 17 bytes (1 byte status + AgentId)
 //! - `agent_session_key`: 32 bytes (AgentId + SessionId)
 //! - `user_key`: 16 bytes (UserId)
+//! - `process_trigger_key`: 16 bytes + process id length (`AgentId` + UTF-8 process id)
+//! - `usage_event_key`: 24 bytes (`AgentId` + big-endian `u64` timestamp millis)
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
 
@@ -105,6 +107,39 @@ pub fn user_key(user_id: &UserId) -> Vec<u8> {
     user_id.as_bytes().to_vec()
 }
 
+/// Encode a process-trigger key: `agent_id || process_id` (UTF-8).
+///
+/// Use [`agent_prefix`] to scan all registered triggers for an agent.
+#[must_use]
+pub fn process_trigger_key(agent_id: &AgentId, process_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + process_id.len());
+    key.extend_from_slice(agent_id.as_bytes());
+    key.extend_from_slice(process_id.as_bytes());
+    key
+}
+
+/// Extract the process ID from a process-trigger key.
+///
+/// Returns `None` if the key is too short or the suffix is not valid UTF-8.
+#[must_use]
+pub fn extract_process_id_from_trigger_key(key: &[u8]) -> Option<String> {
+    key.get(16..)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned)
+}
+
+/// Encode a usage-event key: `agent_id || timestamp_millis` (big-endian).
+///
+/// Big-endian millis keep events time-ordered under a prefix scan with
+/// [`agent_prefix`].
+#[must_use]
+pub fn usage_event_key(agent_id: &AgentId, timestamp_millis: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(24);
+    key.extend_from_slice(agent_id.as_bytes());
+    key.extend_from_slice(&timestamp_millis.to_be_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +193,30 @@ mod tests {
         assert_eq!(key.len(), 17);
         assert_eq!(key[0], 2);
         assert_eq!(&key[1..17], agent_id.as_bytes());
+    }
+
+    #[test]
+    fn process_trigger_key_roundtrip() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
+
+        let key = process_trigger_key(&agent_id, "proc-123");
+        assert!(key.starts_with(&agent_prefix(&agent_id)));
+        assert_eq!(
+            extract_process_id_from_trigger_key(&key).as_deref(),
+            Some("proc-123")
+        );
+    }
+
+    #[test]
+    fn usage_event_key_is_time_ordered() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
+
+        let k1 = usage_event_key(&agent_id, 1_000);
+        let k2 = usage_event_key(&agent_id, 2_000);
+        assert_eq!(k1.len(), 24);
+        assert!(k1.starts_with(&agent_prefix(&agent_id)));
+        assert!(k1 < k2, "earlier events must sort first");
     }
 }

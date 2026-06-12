@@ -11,7 +11,16 @@ use serde::{Deserialize, Serialize};
 pub struct CreateAgentRequest {
     /// Human-readable name for the agent.
     pub name: String,
-    /// Optional resource specification. Uses defaults if not provided.
+    /// Box tier name ("small" / "standard" / "pro").
+    ///
+    /// If omitted, the tier is derived from the legacy `spec` field (mapped
+    /// to the nearest tier) or defaults to `standard`. Every created agent
+    /// is confidential + sealed regardless of how the tier is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Legacy raw resource specification, still accepted for old callers
+    /// (aura-network/aura-os). Its resources are mapped to the nearest tier;
+    /// only the `runtime_version` is carried over verbatim.
     #[serde(default)]
     pub spec: Option<AgentSpec>,
     /// Optional caller-supplied agent ID (e.g. from aura-network).
@@ -21,24 +30,33 @@ pub struct CreateAgentRequest {
 }
 
 impl CreateAgentRequest {
-    /// Create a new request with the given name and default spec.
+    /// Create a new request with the given name and the default tier.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            tier: None,
             spec: None,
             agent_id: None,
         }
     }
 
-    /// Create a new request with a custom spec.
+    /// Create a new request with a legacy raw spec (mapped to a tier on create).
     #[must_use]
     pub fn with_spec(name: impl Into<String>, spec: AgentSpec) -> Self {
         Self {
             name: name.into(),
+            tier: None,
             spec: Some(spec),
             agent_id: None,
         }
+    }
+
+    /// Set the requested box tier name.
+    #[must_use]
+    pub fn with_tier(mut self, tier: impl Into<String>) -> Self {
+        self.tier = Some(tier.into());
+        self
     }
 
     /// Set a caller-supplied agent ID (e.g. propagated from aura-network).
@@ -155,6 +173,7 @@ mod tests {
     fn create_agent_request_new() {
         let req = CreateAgentRequest::new("my-agent");
         assert_eq!(req.name, "my-agent");
+        assert!(req.tier.is_none());
         assert!(req.spec.is_none());
         assert!(req.agent_id.is_none());
     }
@@ -166,11 +185,19 @@ mod tests {
             memory_mb: 1024,
             runtime_version: "v1.0.0".to_string(),
             isolation: None,
+            tier: None,
+            storage_encryption: None,
         };
         let req = CreateAgentRequest::with_spec("my-agent", spec.clone());
         assert_eq!(req.name, "my-agent");
         assert_eq!(req.spec.unwrap().cpu_millicores, 1000);
         assert!(req.agent_id.is_none());
+    }
+
+    #[test]
+    fn create_agent_request_with_tier() {
+        let req = CreateAgentRequest::new("my-agent").with_tier("pro");
+        assert_eq!(req.tier.as_deref(), Some("pro"));
     }
 
     #[test]

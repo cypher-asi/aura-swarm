@@ -360,7 +360,10 @@ fn build_liveness_probe() -> Probe {
 ///   posture is preserved.
 fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
     match isolation {
-        IsolationLevel::MicroVM => PodSecurityContext {
+        // ConfidentialVM shares the MicroVM posture: the (confidential)
+        // guest kernel is the multi-tenant boundary. SNP-specific pod
+        // wiring (node selector, KBS env) lands in a later phase.
+        IsolationLevel::MicroVM | IsolationLevel::ConfidentialVM => PodSecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
             fs_group: Some(1000),
@@ -383,7 +386,7 @@ fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
 /// denied.
 fn build_container_security_context(isolation: IsolationLevel) -> SecurityContext {
     match isolation {
-        IsolationLevel::MicroVM => SecurityContext {
+        IsolationLevel::MicroVM | IsolationLevel::ConfidentialVM => SecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
             allow_privilege_escalation: Some(true),
@@ -413,6 +416,8 @@ mod tests {
             memory_mb: 512,
             runtime_version: "latest".to_string(),
             isolation: None,
+            tier: None,
+            storage_encryption: None,
         }
     }
 
@@ -523,6 +528,7 @@ mod tests {
             memory_mb: 2048,
             runtime_version: "v1.0".to_string(),
             isolation: None,
+            ..test_spec()
         };
         let config = SchedulerConfig::default();
 

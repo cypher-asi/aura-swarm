@@ -89,4 +89,7 @@ pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
 
 // Re-export commonly used types from dependencies for convenience
 pub use aura_swarm_core::{AgentId, SessionId, UserId};
-pub use aura_swarm_store::{Agent, AgentSpec, AgentState, Session, SessionConfig, SessionStatus};
+pub use aura_swarm_store::{
+    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, Session, SessionConfig, SessionStatus,
+    StorageEncryption,
+};

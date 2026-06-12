@@ -59,6 +59,10 @@ pub enum ControlError {
         to: AgentState,
     },
 
+    /// The requested box tier does not exist.
+    #[error("unknown box tier: {0} (expected small/standard/pro)")]
+    InvalidTier(String),
+
     /// The agent is not in a runnable state.
     #[error("agent {0} is not in a runnable state")]
     AgentNotRunnable(AgentId),
@@ -103,6 +107,7 @@ impl ControlError {
             Self::QuotaExceeded { .. } => 429, // Too Many Requests
             Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => 402, // Payment Required
             Self::NotOwner { .. } => 403,
+            Self::InvalidTier(_) => 400,
             Self::InvalidState { .. }
             | Self::AgentNotRunnable(_)
             | Self::SessionAlreadyActive(_) => 409,

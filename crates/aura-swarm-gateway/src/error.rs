@@ -160,6 +160,9 @@ impl From<ControlError> for ApiError {
                 Self::Conflict(format!("agent quota exceeded: limit is {limit}"))
             }
             ControlError::NotOwner { .. } => Self::Forbidden,
+            ControlError::InvalidTier(tier) => {
+                Self::BadRequest(format!("unknown tier: {tier} (expected small/standard/pro)"))
+            }
             ControlError::InvalidState { from, to, .. } => {
                 Self::Conflict(format!("cannot transition from {from:?} to {to:?}"))
             }

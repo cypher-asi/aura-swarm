@@ -43,6 +43,15 @@ pub struct AgentSpec {
     /// If not specified, uses the scheduler's default.
     #[serde(default)]
     pub isolation: Option<IsolationLevel>,
+    /// Box tier this spec was derived from (e.g. "standard").
+    /// `None` means "legacy agent, pre-migration"; every agent created
+    /// after R1 of the TEE upgrade carries a tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Storage encryption mode for the agent's persistent state.
+    /// `None` means "legacy agent, pre-migration" (plaintext state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_encryption: Option<StorageEncryption>,
 }
 
 impl Default for AgentSpec {
@@ -52,38 +61,237 @@ impl Default for AgentSpec {
             memory_mb: 512,
             runtime_version: "latest".to_string(),
             isolation: None,
+            tier: None,
+            storage_encryption: None,
         }
     }
 }
 
+/// Storage encryption mode for an agent's persistent state volume.
+///
+/// Legacy agents (created before the TEE upgrade) carry no value here
+/// (`AgentSpec::storage_encryption == None`) and run with plaintext state;
+/// every agent created after R1 is `Sealed`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageEncryption {
+    /// State is encrypted inside the guest with a per-agent data encryption
+    /// key. For confidential VMs the key is released by the KBS only after
+    /// successful attestation; the host/EFS only ever sees ciphertext.
+    Sealed {
+        /// KBS key identifier for the per-agent state DEK
+        /// (see [`StorageEncryption::state_key_id`]).
+        key_id: String,
+    },
+}
+
+impl StorageEncryption {
+    /// Deterministic KBS key id for an agent's state DEK:
+    /// `swarm/agents/{agent_id}/state-key`.
+    #[must_use]
+    pub fn state_key_id(agent_id: &AgentId) -> String {
+        format!("swarm/agents/{agent_id}/state-key")
+    }
+
+    /// Build the sealed-storage descriptor for an agent, using the
+    /// deterministic per-agent key id.
+    #[must_use]
+    pub fn sealed_for(agent_id: &AgentId) -> Self {
+        Self::Sealed {
+            key_id: Self::state_key_id(agent_id),
+        }
+    }
+
+    /// The KBS key id backing this encryption mode.
+    #[must_use]
+    pub fn key_id(&self) -> &str {
+        match self {
+            Self::Sealed { key_id } => key_id,
+        }
+    }
+}
+
+/// Box tiers: the predefined VM SKUs a user can choose when creating an agent.
+///
+/// Every tier is a confidential SEV-SNP VM with sealed per-agent storage —
+/// tiers differ only in size and hourly price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BoxTier {
+    /// 500m CPU / 1Gi memory.
+    Small,
+    /// 1000m CPU / 2Gi memory. The default tier.
+    #[default]
+    Standard,
+    /// 2000m CPU / 4Gi memory.
+    Pro,
+}
+
+impl BoxTier {
+    /// All known tiers, smallest first.
+    pub const ALL: [Self; 3] = [Self::Small, Self::Standard, Self::Pro];
+
+    /// Short tier name used in APIs ("small" / "standard" / "pro").
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Standard => "standard",
+            Self::Pro => "pro",
+        }
+    }
+
+    /// Stable billing SKU identifier (e.g. "swarm.small").
+    #[must_use]
+    pub const fn sku(&self) -> &'static str {
+        match self {
+            Self::Small => "swarm.small",
+            Self::Standard => "swarm.standard",
+            Self::Pro => "swarm.pro",
+        }
+    }
+
+    /// Resolve a tier from its short name (case-insensitive).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "small" => Some(Self::Small),
+            "standard" => Some(Self::Standard),
+            "pro" => Some(Self::Pro),
+            _ => None,
+        }
+    }
+
+    /// Map a raw resource request to the nearest tier:
+    /// cpu <= 500m -> small, <= 1000m -> standard, else pro.
+    ///
+    /// Used to keep accepting the legacy `spec` create input during the
+    /// dual-mode window (and by the R2 store migration).
+    #[must_use]
+    pub const fn nearest_for_cpu(cpu_millicores: u32) -> Self {
+        if cpu_millicores <= 500 {
+            Self::Small
+        } else if cpu_millicores <= 1000 {
+            Self::Standard
+        } else {
+            Self::Pro
+        }
+    }
+
+    /// CPU allocation in millicores.
+    #[must_use]
+    pub const fn cpu_millis(&self) -> u32 {
+        match self {
+            Self::Small => 500,
+            Self::Standard => 1000,
+            Self::Pro => 2000,
+        }
+    }
+
+    /// Memory allocation in megabytes.
+    #[must_use]
+    pub const fn memory_mb(&self) -> u32 {
+        match self {
+            Self::Small => 1024,
+            Self::Standard => 2048,
+            Self::Pro => 4096,
+        }
+    }
+
+    /// Isolation level: always a confidential SEV-SNP VM.
+    #[must_use]
+    pub const fn isolation(&self) -> IsolationLevel {
+        IsolationLevel::ConfidentialVM
+    }
+
+    /// Platform price per hour of pod runtime, in cents.
+    #[must_use]
+    pub const fn hourly_price_cents(&self) -> u32 {
+        match self {
+            Self::Small => 4,
+            Self::Standard => 8,
+            Self::Pro => 15,
+        }
+    }
+
+    /// Build the full resource spec for an agent created on this tier:
+    /// tier-sized resources, confidential isolation, and sealed storage
+    /// keyed by the agent's deterministic state-key id.
+    #[must_use]
+    pub fn to_spec(self, agent_id: &AgentId, runtime_version: impl Into<String>) -> AgentSpec {
+        AgentSpec {
+            cpu_millicores: self.cpu_millis(),
+            memory_mb: self.memory_mb(),
+            runtime_version: runtime_version.into(),
+            isolation: Some(self.isolation()),
+            tier: Some(self.as_str().to_string()),
+            storage_encryption: Some(StorageEncryption::sealed_for(agent_id)),
+        }
+    }
+}
+
+impl std::fmt::Display for BoxTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for BoxTier {
+    type Err = UnknownBoxTier;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::from_name(s).ok_or_else(|| UnknownBoxTier(s.to_string()))
+    }
+}
+
+/// Error returned when parsing an unknown tier name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownBoxTier(pub String);
+
+impl std::fmt::Display for UnknownBoxTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown box tier: {} (expected small/standard/pro)", self.0)
+    }
+}
+
+impl std::error::Error for UnknownBoxTier {}
+
 /// Isolation level for agent execution.
 ///
-/// Determines whether the agent runs in a lightweight container
-/// or a more secure microVM with its own kernel.
+/// Determines whether the agent runs in a lightweight container,
+/// a microVM with its own kernel, or a confidential (TEE) VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     /// Run in a standard container (shared kernel).
     /// Faster startup, lower overhead, less isolation.
-    /// Use for trusted workloads or development.
+    /// Survives strictly for local dev-mode.
     Container,
     /// Run in a Firecracker microVM (dedicated kernel).
-    /// Stronger isolation, slightly higher overhead.
-    /// Default for production agent workloads.
+    ///
+    /// LEGACY ONLY: kept for agents created before the TEE upgrade during
+    /// the dual-mode window; no new agents are created at this level.
+    /// Removed entirely in R3 of the Swarm TEE Upgrade plan.
     #[default]
     MicroVM,
+    /// Run in a confidential SEV-SNP VM (`CoCo`: Kata + QEMU) with
+    /// attestation-gated sealed storage. The level for all new agents.
+    #[serde(rename = "confidential_vm")]
+    ConfidentialVM,
 }
 
 impl IsolationLevel {
     /// Get the Kubernetes `RuntimeClass` name for this isolation level.
     ///
     /// Returns `None` for container isolation (uses default runtime),
-    /// or `Some("kata-fc")` for microVM isolation.
+    /// `Some("kata-fc")` for microVM isolation, or
+    /// `Some("kata-qemu-snp")` for confidential VM isolation.
     #[must_use]
     pub const fn runtime_class(&self) -> Option<&'static str> {
         match self {
             Self::Container => None, // Use default container runtime
             Self::MicroVM => Some("kata-fc"),
+            Self::ConfidentialVM => Some("kata-qemu-snp"),
         }
     }
 }
@@ -268,6 +476,18 @@ mod tests {
     fn isolation_level_runtime_class() {
         assert_eq!(IsolationLevel::Container.runtime_class(), None);
         assert_eq!(IsolationLevel::MicroVM.runtime_class(), Some("kata-fc"));
+        assert_eq!(
+            IsolationLevel::ConfidentialVM.runtime_class(),
+            Some("kata-qemu-snp")
+        );
+    }
+
+    #[test]
+    fn isolation_level_serde_names() {
+        let json = serde_json::to_string(&IsolationLevel::ConfidentialVM).unwrap();
+        assert_eq!(json, "\"confidential_vm\"");
+        let parsed: IsolationLevel = serde_json::from_str("\"confidential_vm\"").unwrap();
+        assert_eq!(parsed, IsolationLevel::ConfidentialVM);
     }
 
     #[test]
@@ -295,6 +515,8 @@ mod tests {
                 memory_mb: 2048,
                 runtime_version: "v2".to_string(),
                 isolation: Some(IsolationLevel::MicroVM),
+                tier: None,
+                storage_encryption: None,
             },
             created_at: now,
             updated_at: now,
@@ -313,5 +535,146 @@ mod tests {
         assert_eq!(parsed.spec.memory_mb, 2048);
         assert_eq!(parsed.spec.runtime_version, "v2");
         assert_eq!(parsed.error_message, Some("test error".to_string()));
+    }
+
+    #[test]
+    fn box_tier_lineup() {
+        assert_eq!(BoxTier::ALL, [BoxTier::Small, BoxTier::Standard, BoxTier::Pro]);
+        assert_eq!(BoxTier::default(), BoxTier::Standard);
+
+        assert_eq!(BoxTier::Small.cpu_millis(), 500);
+        assert_eq!(BoxTier::Small.memory_mb(), 1024);
+        assert_eq!(BoxTier::Small.hourly_price_cents(), 4);
+        assert_eq!(BoxTier::Small.sku(), "swarm.small");
+
+        assert_eq!(BoxTier::Standard.cpu_millis(), 1000);
+        assert_eq!(BoxTier::Standard.memory_mb(), 2048);
+        assert_eq!(BoxTier::Standard.hourly_price_cents(), 8);
+        assert_eq!(BoxTier::Standard.sku(), "swarm.standard");
+
+        assert_eq!(BoxTier::Pro.cpu_millis(), 2000);
+        assert_eq!(BoxTier::Pro.memory_mb(), 4096);
+        assert_eq!(BoxTier::Pro.hourly_price_cents(), 15);
+        assert_eq!(BoxTier::Pro.sku(), "swarm.pro");
+
+        // Every tier is confidential.
+        for tier in BoxTier::ALL {
+            assert_eq!(tier.isolation(), IsolationLevel::ConfidentialVM);
+        }
+    }
+
+    #[test]
+    fn box_tier_parse_display_serde() {
+        for tier in BoxTier::ALL {
+            // Display + FromStr roundtrip
+            let parsed: BoxTier = tier.to_string().parse().unwrap();
+            assert_eq!(parsed, tier);
+            // Case-insensitive parse
+            assert_eq!(BoxTier::from_name(&tier.as_str().to_uppercase()), Some(tier));
+            // Lowercase serde
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, format!("\"{tier}\""));
+            let roundtripped: BoxTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtripped, tier);
+        }
+        assert!("mega".parse::<BoxTier>().is_err());
+        assert_eq!(BoxTier::from_name("mega"), None);
+    }
+
+    #[test]
+    fn box_tier_nearest_for_cpu() {
+        assert_eq!(BoxTier::nearest_for_cpu(100), BoxTier::Small);
+        assert_eq!(BoxTier::nearest_for_cpu(500), BoxTier::Small);
+        assert_eq!(BoxTier::nearest_for_cpu(501), BoxTier::Standard);
+        assert_eq!(BoxTier::nearest_for_cpu(1000), BoxTier::Standard);
+        assert_eq!(BoxTier::nearest_for_cpu(1001), BoxTier::Pro);
+        assert_eq!(BoxTier::nearest_for_cpu(8000), BoxTier::Pro);
+    }
+
+    #[test]
+    fn box_tier_to_spec_is_confidential_and_sealed() {
+        let agent_id = AgentId::generate();
+        let spec = BoxTier::Standard.to_spec(&agent_id, "latest");
+
+        assert_eq!(spec.cpu_millicores, 1000);
+        assert_eq!(spec.memory_mb, 2048);
+        assert_eq!(spec.isolation, Some(IsolationLevel::ConfidentialVM));
+        assert_eq!(spec.tier.as_deref(), Some("standard"));
+
+        let enc = spec.storage_encryption.unwrap();
+        assert_eq!(enc.key_id(), format!("swarm/agents/{agent_id}/state-key"));
+        assert_eq!(enc, StorageEncryption::sealed_for(&agent_id));
+    }
+
+    #[test]
+    fn storage_encryption_key_id_is_deterministic() {
+        let agent_id = AgentId::generate();
+        assert_eq!(
+            StorageEncryption::state_key_id(&agent_id),
+            format!("swarm/agents/{agent_id}/state-key")
+        );
+        assert_eq!(
+            StorageEncryption::sealed_for(&agent_id),
+            StorageEncryption::sealed_for(&agent_id)
+        );
+    }
+
+    /// Regression test: a pre-upgrade agent record (CBOR serialized WITHOUT
+    /// the `tier` / `storage_encryption` fields) must still deserialize, with
+    /// the new fields defaulting to `None` ("legacy agent, pre-migration").
+    #[test]
+    fn legacy_cbor_agent_record_still_deserializes() {
+        use serde::Serialize;
+
+        // Exact shape of AgentSpec / Agent before the TEE upgrade.
+        #[derive(Serialize)]
+        struct LegacyAgentSpec {
+            cpu_millicores: u32,
+            memory_mb: u32,
+            runtime_version: String,
+            isolation: Option<IsolationLevel>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyAgent {
+            agent_id: AgentId,
+            user_id: UserId,
+            name: String,
+            status: AgentState,
+            spec: LegacyAgentSpec,
+            created_at: DateTime<Utc>,
+            updated_at: DateTime<Utc>,
+            last_heartbeat_at: Option<DateTime<Utc>>,
+        }
+
+        let now = chrono::Utc::now();
+        let legacy = LegacyAgent {
+            agent_id: AgentId::generate(),
+            user_id: UserId::from_uuid(uuid::Uuid::new_v4()),
+            name: "pre-upgrade-agent".to_string(),
+            status: AgentState::Hibernating,
+            spec: LegacyAgentSpec {
+                cpu_millicores: 1000,
+                memory_mb: 2048,
+                runtime_version: "v1".to_string(),
+                isolation: Some(IsolationLevel::MicroVM),
+            },
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: None,
+        };
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&legacy, &mut buf).unwrap();
+
+        let parsed: Agent = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(parsed.agent_id, legacy.agent_id);
+        assert_eq!(parsed.name, "pre-upgrade-agent");
+        assert_eq!(parsed.status, AgentState::Hibernating);
+        assert_eq!(parsed.spec.cpu_millicores, 1000);
+        assert_eq!(parsed.spec.isolation, Some(IsolationLevel::MicroVM));
+        assert_eq!(parsed.spec.tier, None, "legacy record must read as tier=None");
+        assert_eq!(parsed.spec.storage_encryption, None);
+        assert_eq!(parsed.error_message, None);
     }
 }

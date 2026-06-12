@@ -127,7 +127,7 @@ mod live {
 
     /// Returns true if the live billing keys are configured.
     fn has_billing_keys() -> bool {
-        std::env::var("Z_BILLING_API_KEY").map_or(false, |v| !v.is_empty())
+        std::env::var("Z_BILLING_API_KEY").is_ok_and(|v| !v.is_empty())
     }
 
     fn test_billing_config() -> BillingConfig {
@@ -137,6 +137,7 @@ mod live {
             enabled: true,
             min_credits_for_agent: 100,
             min_credits_for_session: 10,
+            agent_runway_hours: 2,
             fail_closed: true,
         }
     }
@@ -259,7 +260,9 @@ mod live {
             return;
         }
         let (user_id, user_str) = unique_user_id_and_str();
-        create_funded_account(&user_str, 50)
+        // Fund below 2 hours of runway at the standard tier rate
+        // (8 cents/hr x 2h = 16 cents required).
+        create_funded_account(&user_str, 5)
             .await
             .expect("Failed to create test account");
 

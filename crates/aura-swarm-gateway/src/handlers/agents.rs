@@ -32,6 +32,10 @@ pub(crate) struct AgentResponse {
     pub(crate) name: String,
     /// Current status.
     pub(crate) status: AgentState,
+    /// Resolved box tier ("small" / "standard" / "pro").
+    /// Absent for legacy agents created before tiers existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tier: Option<String>,
     /// Resource specification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) spec: Option<AgentSpec>,
@@ -53,6 +57,7 @@ impl From<Agent> for AgentResponse {
             agent_id: agent.agent_id.to_string(),
             name: agent.name,
             status: agent.status,
+            tier: agent.spec.tier.clone(),
             spec: Some(agent.spec),
             created_at: agent.created_at,
             updated_at: agent.updated_at,
@@ -74,7 +79,12 @@ pub(crate) struct ListAgentsResponse {
 pub(crate) struct CreateAgentBody {
     /// Human-readable name for the agent.
     pub(crate) name: String,
-    /// Optional resource specification.
+    /// Optional box tier ("small" / "standard" / "pro"). Defaults to
+    /// "standard". The legacy `spec` field is still accepted; its resources
+    /// are mapped to the nearest tier when no tier is given.
+    #[serde(default)]
+    pub(crate) tier: Option<String>,
+    /// Legacy raw resource specification (mapped to the nearest tier).
     #[serde(default)]
     pub(crate) spec: Option<AgentSpec>,
     /// Optional caller-supplied agent ID (e.g. from aura-network).
@@ -216,6 +226,10 @@ where
     } else {
         CreateAgentRequest::new(body.name)
     };
+
+    if let Some(tier) = body.tier {
+        request = request.with_tier(tier);
+    }
 
     if let Some(id_str) = body.agent_id {
         let id = parse_agent_id(&id_str)?;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_swarm_core::{AgentId, SessionId, UserId};
-use aura_swarm_store::{Agent, AgentState, Session, SessionConfig, SessionStatus, Store};
+use aura_swarm_store::{Agent, AgentState, BoxTier, Session, SessionConfig, SessionStatus, Store};
 use chrono::Utc;
 
 use crate::billing::BillingChecker;
@@ -313,10 +313,12 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
         self.billing.is_some()
     }
 
-    /// Check billing credits for agent creation.
-    async fn check_agent_credits(&self, user_id: &UserId) -> Result<()> {
+    /// Check billing credits for agent creation at the given tier's rate.
+    async fn check_agent_credits(&self, user_id: &UserId, tier: BoxTier) -> Result<()> {
         if let Some(billing) = &self.billing {
-            billing.check_agent_credits(&user_id.to_string()).await?;
+            billing
+                .check_agent_credits_for_tier(&user_id.to_string(), tier)
+                .await?;
         }
         Ok(())
     }
@@ -410,7 +412,21 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         user_id: &UserId,
         request: CreateAgentRequest,
     ) -> Result<(Agent, bool)> {
-        self.check_agent_credits(user_id).await?;
+        // Resolve the box tier first: explicit tier name wins, then the
+        // legacy raw spec is mapped to the nearest tier, then the default.
+        // Every new agent is confidential + sealed regardless of input.
+        let tier = match request.tier.as_deref() {
+            Some(name) => BoxTier::from_name(name)
+                .ok_or_else(|| ControlError::InvalidTier(name.to_string()))?,
+            None => request
+                .spec
+                .as_ref()
+                .map_or_else(BoxTier::default, |s| {
+                    BoxTier::nearest_for_cpu(s.cpu_millicores)
+                }),
+        };
+
+        self.check_agent_credits(user_id, tier).await?;
 
         let uid = *user_id;
         let max = self.config.max_agents_per_user;
@@ -446,8 +462,14 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             }
 
             let now = Utc::now();
-            let spec = request.spec.unwrap_or_default();
             let agent_id = request.agent_id.unwrap_or_else(AgentId::generate);
+            // The tier dictates resources, isolation (ConfidentialVM), and
+            // sealed storage with the agent's deterministic state-key id;
+            // only the runtime version carries over from a legacy spec.
+            let runtime_version = request
+                .spec
+                .map_or_else(|| "latest".to_string(), |s| s.runtime_version);
+            let spec = tier.to_spec(&agent_id, runtime_version);
 
             let agent = Agent {
                 agent_id,
@@ -487,6 +509,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             agent_id = %agent.agent_id,
             user_id = %user_id,
             name = %agent.name,
+            tier = %tier,
             "Created agent"
         );
 
@@ -1010,6 +1033,91 @@ mod tests {
         assert_eq!(agent.name, "test-agent");
         assert_eq!(agent.user_id, user_id);
         assert_eq!(agent.status, AgentState::Provisioning);
+    }
+
+    #[tokio::test]
+    async fn create_agent_defaults_to_standard_confidential_sealed() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+        assert_eq!(agent.spec.tier.as_deref(), Some("standard"));
+        assert_eq!(agent.spec.cpu_millicores, 1000);
+        assert_eq!(agent.spec.memory_mb, 2048);
+        assert_eq!(
+            agent.spec.isolation,
+            Some(aura_swarm_store::IsolationLevel::ConfidentialVM)
+        );
+        let enc = agent.spec.storage_encryption.expect("must be sealed");
+        assert_eq!(
+            enc.key_id(),
+            format!("swarm/agents/{}/state-key", agent.agent_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_agent_with_explicit_tier() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent").with_tier("pro");
+        let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+        assert_eq!(agent.spec.tier.as_deref(), Some("pro"));
+        assert_eq!(agent.spec.cpu_millicores, 2000);
+        assert_eq!(agent.spec.memory_mb, 4096);
+    }
+
+    #[tokio::test]
+    async fn create_agent_invalid_tier_rejected() {
+        let (service, _dir, user_id) = setup();
+
+        let request = CreateAgentRequest::new("test-agent").with_tier("mega");
+        let result = service.create_agent(&user_id, request).await;
+        assert!(matches!(result, Err(ControlError::InvalidTier(t)) if t == "mega"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_legacy_spec_maps_to_nearest_tier() {
+        let (service, _dir, user_id) = setup();
+
+        let cases = [(250u32, "small"), (500, "small"), (900, "standard"), (4000, "pro")];
+        for (cpu, expected_tier) in cases {
+            let spec = aura_swarm_store::AgentSpec {
+                cpu_millicores: cpu,
+                memory_mb: 512,
+                runtime_version: "v1".to_string(),
+                isolation: Some(aura_swarm_store::IsolationLevel::MicroVM),
+                tier: None,
+                storage_encryption: None,
+            };
+            let request = CreateAgentRequest::with_spec(format!("agent-{cpu}"), spec);
+            let (agent, _) = service.create_agent(&user_id, request).await.unwrap();
+
+            assert_eq!(
+                agent.spec.tier.as_deref(),
+                Some(expected_tier),
+                "cpu={cpu} should map to {expected_tier}"
+            );
+            // Legacy spec input still yields a confidential, sealed agent
+            // with tier resources — only runtime_version carries over.
+            assert_eq!(
+                agent.spec.isolation,
+                Some(aura_swarm_store::IsolationLevel::ConfidentialVM)
+            );
+            assert!(agent.spec.storage_encryption.is_some());
+            assert_eq!(agent.spec.runtime_version, "v1");
+
+            // Clean up to stay under the 3-agent test quota.
+            service
+                .store
+                .update_agent_status(&agent.agent_id, AgentState::Stopped)
+                .unwrap();
+            service
+                .delete_agent(&user_id, &agent.agent_id)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
