@@ -1,7 +1,7 @@
 # Terraform Backend Configuration
 #
 # Uncomment and configure this block to use S3 backend for remote state.
-# Run 01-init-terraform.sh to create the S3 bucket first.
+# Run legacy/01-init-terraform.sh to create the S3 bucket first.
 #
 # For local development, you can leave this commented out to use local state.
 

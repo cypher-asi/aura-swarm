@@ -15,7 +15,7 @@
 //! Trustee's admin API (resource registration/deletion) authenticates with
 //! a compact `EdDSA` JSON Web Token signed by the KBS admin Ed25519 private
 //! key (the public half is mounted into the KBS as the
-//! `kbs-auth-public-key` secret; see `deploy/08-deploy-k8s.sh`). The token
+//! `kbs-auth-public-key` secret; see `deploy/03-trustee-kbs.sh`). The token
 //! is sent as `Authorization: Bearer <jwt>` and carries only freshness
 //! claims (`exp`/`iat`/`nbf`), matching what `kbs-client` produces.
 //!

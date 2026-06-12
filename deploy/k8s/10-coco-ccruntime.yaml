@@ -1,7 +1,7 @@
 # Confidential Containers (CoCo) runtime install for SNP nodes
 #
 # Prerequisite: the CoCo operator must be installed first (done by
-# ./05-configure-eks.sh):
+# ./02-coco-operator.sh):
 #
 #   kubectl apply -k "github.com/confidential-containers/operator/config/default?ref=v0.17.0"
 #

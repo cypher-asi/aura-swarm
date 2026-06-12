@@ -8,7 +8,7 @@
 #   AURA_KBS_URL = http://kbs.swarm-system.svc.cluster.local:8080
 #
 # Admin auth: the kbs-auth-public-key secret (Ed25519 public key, kbs.pem) is
-# generated/created by ./08-deploy-k8s.sh; the matching private key stays in
+# generated/created by ./03-trustee-kbs.sh; the matching private key stays in
 # .secrets/kbs-admin.key and is used by kbs-client for policy/resource admin.
 #
 # Attestation policy and reference values are deliberately left at defaults
