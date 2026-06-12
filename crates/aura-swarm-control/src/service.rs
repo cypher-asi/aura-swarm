@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aura_swarm_core::{AgentId, SessionId, UserId};
 use aura_swarm_store::{
-    Agent, AgentState, BoxTier, Session, SessionConfig, SessionStatus, Store, UsageEvent,
-    UsageEventKind,
+    Agent, AgentLogSnapshot, AgentState, BoxTier, Session, SessionConfig, SessionStatus, Store,
+    UsageEvent, UsageEventKind,
 };
 use chrono::{DateTime, Utc};
 
@@ -19,7 +19,7 @@ use crate::kbs::KbsClient;
 use crate::lifecycle;
 use crate::scheduler_client::SchedulerClient;
 use crate::session;
-use crate::types::{ControlConfig, CreateAgentRequest};
+use crate::types::{AgentLogEntry, ControlConfig, CreateAgentRequest, LogSource};
 
 /// Tier name + hourly price to record on a usage event, captured from the
 /// agent's spec **at event time** so later re-pricing never rewrites usage
@@ -177,6 +177,42 @@ pub trait ControlPlane: Send + Sync {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<(Agent, crate::usage::UsageAggregation)>>;
+
+    // =========================================================================
+    // Per-VM Logs (Swarm TEE upgrade phase 12)
+    // =========================================================================
+
+    /// Merged VM/platform logs for an agent: the live pod stdout tail
+    /// (when a pod is running, fetched via the scheduler) interleaved
+    /// with stored termination snapshots, sorted by timestamp and capped
+    /// to the last `tail` entries. A scheduler failure degrades to
+    /// snapshots only — it never fails the read.
+    ///
+    /// These are host-visible platform logs (boot, attestation, health,
+    /// harness lifecycle). Detailed in-VM agent logs stay sealed inside
+    /// the guest and are not served here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the usual `AgentNotFound` / `NotOwner` ownership errors.
+    async fn get_agent_logs(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        tail: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AgentLogEntry>>;
+
+    /// Store a pod-log termination snapshot shipped by the scheduler.
+    ///
+    /// Internal operation: no ownership check — callers must be behind
+    /// internal-token auth. The per-agent snapshot cap is enforced by
+    /// the store (oldest snapshots pruned on insert).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::AgentNotFound` if the agent doesn't exist.
+    async fn store_log_snapshot_internal(&self, snapshot: AgentLogSnapshot) -> Result<()>;
 
     // =========================================================================
     // Session Operations
@@ -585,10 +621,12 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
         Ok(())
     }
 
-    /// Terminate an agent pod via the scheduler service.
-    async fn terminate_agent_pod(&self, agent_id: &AgentId) -> Result<()> {
+    /// Terminate an agent pod via the scheduler service. `reason` is
+    /// forwarded so the scheduler can label the final-tail log snapshot
+    /// it ships back before deleting the pod.
+    async fn terminate_agent_pod(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
         if let Some(scheduler) = &self.scheduler {
-            scheduler.terminate_agent(agent_id).await?;
+            scheduler.terminate_agent(agent_id, reason).await?;
             tracing::info!(
                 agent_id = %agent_id,
                 "Terminated agent pod via scheduler"
@@ -702,7 +740,7 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
 
         self.transition_state(agent, AgentState::Stopping).await?;
 
-        if let Err(e) = self.terminate_agent_pod(&agent_id).await {
+        if let Err(e) = self.terminate_agent_pod(&agent_id, "tier_change").await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
@@ -988,7 +1026,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         self.transition_state(&mut agent, AgentState::Stopping)
             .await?;
 
-        if let Err(e) = self.terminate_agent_pod(agent_id).await {
+        if let Err(e) = self.terminate_agent_pod(agent_id, "stop").await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
@@ -1055,7 +1093,7 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         self.transition_state(&mut agent, AgentState::Hibernating)
             .await?;
 
-        if let Err(e) = self.terminate_agent_pod(agent_id).await {
+        if let Err(e) = self.terminate_agent_pod(agent_id, "hibernate").await {
             tracing::error!(
                 agent_id = %agent_id,
                 error = %e,
@@ -1260,6 +1298,87 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             reports.push((agent, crate::usage::aggregate(&events, from, to)));
         }
         Ok(reports)
+    }
+
+    // =========================================================================
+    // Per-VM Logs (Swarm TEE upgrade phase 12)
+    // =========================================================================
+
+    async fn get_agent_logs(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        tail: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AgentLogEntry>> {
+        let agent = self.get_and_verify(user_id, agent_id).await?;
+
+        let aid = *agent_id;
+        let snapshots =
+            blocking_store(&self.store, move |s| Ok(s.list_log_snapshots_by_agent(&aid)?))
+                .await?;
+
+        let mut entries: Vec<AgentLogEntry> = snapshots
+            .into_iter()
+            .flat_map(|snapshot| snapshot.entries)
+            .map(|l| AgentLogEntry {
+                timestamp: l.timestamp,
+                line: l.line,
+                source: LogSource::Snapshot,
+            })
+            .collect();
+
+        // Live pod tail, only for states where a pod can exist.
+        // Best-effort: a scheduler hiccup degrades the read to stored
+        // snapshots instead of failing it.
+        let pod_active = matches!(
+            agent.status,
+            AgentState::Provisioning | AgentState::Running | AgentState::Idle
+        );
+        if pod_active {
+            if let Some(scheduler) = &self.scheduler {
+                match scheduler.get_pod_logs(agent_id, tail, since).await {
+                    Ok(Some(live)) => entries.extend(live.into_iter().map(|l| AgentLogEntry {
+                        timestamp: l.timestamp,
+                        line: l.line,
+                        source: LogSource::Live,
+                    })),
+                    Ok(None) => {
+                        tracing::debug!(agent_id = %agent_id, "No pod for live log tail");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Failed to fetch live pod logs; serving stored snapshots only"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(since) = since {
+            entries.retain(|e| e.timestamp >= since);
+        }
+        // Stable sort keeps within-snapshot ordering for equal timestamps.
+        entries.sort_by_key(|e| e.timestamp);
+        let skip = entries.len().saturating_sub(tail as usize);
+        Ok(entries.split_off(skip))
+    }
+
+    async fn store_log_snapshot_internal(&self, snapshot: AgentLogSnapshot) -> Result<()> {
+        let agent_id = snapshot.agent_id;
+        blocking_store(&self.store, move |s| {
+            // Snapshots must not outlive (or predate) the agent record.
+            if s.get_agent(&agent_id)?.is_none() {
+                return Err(ControlError::AgentNotFound(agent_id));
+            }
+            Ok(s.put_log_snapshot(&snapshot)?)
+        })
+        .await?;
+
+        tracing::debug!(agent_id = %agent_id, "Stored pod-log termination snapshot");
+        Ok(())
     }
 
     // =========================================================================
@@ -1706,11 +1825,15 @@ mod tests {
     }
 
     /// Mock scheduler client recording schedule/terminate calls (with the
-    /// spec each pod was scheduled with) to verify recreate flows.
+    /// spec each pod was scheduled with) to verify recreate flows, and
+    /// serving canned pod logs for the merge tests.
     #[derive(Default)]
     struct MockSchedulerClient {
         scheduled: Mutex<Vec<(AgentId, aura_swarm_store::AgentSpec)>>,
         terminated: Mutex<Vec<AgentId>>,
+        termination_reasons: Mutex<Vec<String>>,
+        /// Canned response for `get_pod_logs` (`None` = no pod).
+        pod_logs: Mutex<Option<Vec<aura_swarm_store::LogLine>>>,
     }
 
     impl MockSchedulerClient {
@@ -1720,6 +1843,14 @@ mod tests {
 
         fn terminated(&self) -> Vec<AgentId> {
             self.terminated.lock().unwrap().clone()
+        }
+
+        fn termination_reasons(&self) -> Vec<String> {
+            self.termination_reasons.lock().unwrap().clone()
+        }
+
+        fn set_pod_logs(&self, logs: Option<Vec<aura_swarm_store::LogLine>>) {
+            *self.pod_logs.lock().unwrap() = logs;
         }
     }
 
@@ -1736,9 +1867,25 @@ mod tests {
             Ok(())
         }
 
-        async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+        async fn terminate_agent(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
             self.terminated.lock().unwrap().push(*agent_id);
+            self.termination_reasons
+                .lock()
+                .unwrap()
+                .push(reason.to_string());
             Ok(())
+        }
+
+        async fn get_pod_logs(
+            &self,
+            _agent_id: &AgentId,
+            tail: u32,
+            _since: Option<DateTime<Utc>>,
+        ) -> Result<Option<Vec<aura_swarm_store::LogLine>>> {
+            Ok(self.pod_logs.lock().unwrap().clone().map(|logs| {
+                let skip = logs.len().saturating_sub(tail as usize);
+                logs.into_iter().skip(skip).collect()
+            }))
         }
 
         async fn get_pod_status(
@@ -3586,5 +3733,219 @@ mod tests {
         // range end.
         assert!(reports[0].1.awake_seconds <= 3600);
         assert!(reports[0].1.open_interval_started_at.is_some());
+    }
+
+    // =========================================================================
+    // Per-VM logs (phase 12)
+    // =========================================================================
+
+    fn log_line(millis: i64, line: &str) -> aura_swarm_store::LogLine {
+        aura_swarm_store::LogLine {
+            timestamp: chrono::DateTime::from_timestamp_millis(millis).unwrap(),
+            line: line.to_string(),
+        }
+    }
+
+    fn snapshot_for(
+        agent_id: AgentId,
+        captured_at_millis: i64,
+        reason: &str,
+        entries: Vec<aura_swarm_store::LogLine>,
+    ) -> AgentLogSnapshot {
+        AgentLogSnapshot {
+            agent_id,
+            captured_at: chrono::DateTime::from_timestamp_millis(captured_at_millis).unwrap(),
+            reason: reason.to_string(),
+            entries,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_agent_logs_merges_live_and_snapshots_sorted() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("logs-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+
+        // A stored snapshot from a previous pod (old timestamps)...
+        service
+            .store_log_snapshot_internal(snapshot_for(
+                aid,
+                2_000,
+                "hibernate",
+                vec![log_line(1_000, "old boot"), log_line(2_000, "old shutdown")],
+            ))
+            .await
+            .unwrap();
+
+        // ...and a running pod serving a live tail (newer timestamps).
+        scheduler.set_pod_logs(Some(vec![
+            log_line(5_000, "new boot"),
+            log_line(6_000, "ready"),
+        ]));
+
+        let entries = service
+            .get_agent_logs(&user_id, &aid, 100, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.line.as_str(), e.source))
+                .collect::<Vec<_>>(),
+            vec![
+                ("old boot", LogSource::Snapshot),
+                ("old shutdown", LogSource::Snapshot),
+                ("new boot", LogSource::Live),
+                ("ready", LogSource::Live),
+            ],
+            "snapshot + live entries merged and time-ordered"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_logs_tail_and_since_applied_to_merged_set() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tail-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+
+        service
+            .store_log_snapshot_internal(snapshot_for(
+                aid,
+                3_000,
+                "stop",
+                vec![
+                    log_line(1_000, "a"),
+                    log_line(2_000, "b"),
+                    log_line(3_000, "c"),
+                ],
+            ))
+            .await
+            .unwrap();
+        scheduler.set_pod_logs(Some(vec![log_line(4_000, "d")]));
+
+        // Tail caps the merged set, keeping the newest entries.
+        let entries = service.get_agent_logs(&user_id, &aid, 2, None).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.line.as_str()).collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+
+        // Since filters older snapshot entries too.
+        let since = chrono::DateTime::from_timestamp_millis(3_000).unwrap();
+        let entries = service
+            .get_agent_logs(&user_id, &aid, 100, Some(since))
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.line.as_str()).collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_logs_snapshots_only_when_no_pod_or_asleep() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("asleep-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+
+        service
+            .store_log_snapshot_internal(snapshot_for(
+                aid,
+                2_000,
+                "hibernate",
+                vec![log_line(1_000, "from snapshot")],
+            ))
+            .await
+            .unwrap();
+
+        // Pod-active state but the scheduler reports no pod (404 -> None).
+        scheduler.set_pod_logs(None);
+        let entries = service
+            .get_agent_logs(&user_id, &aid, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, LogSource::Snapshot);
+
+        // Hibernating agents never hit the scheduler.
+        service.store.update_agent_status(&aid, AgentState::Hibernating).unwrap();
+        scheduler.set_pod_logs(Some(vec![log_line(9_000, "must not appear")]));
+        let entries = service
+            .get_agent_logs(&user_id, &aid, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.line.as_str()).collect::<Vec<_>>(),
+            vec!["from snapshot"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_agent_logs_enforces_ownership() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("owned-agent"))
+            .await
+            .unwrap();
+
+        let other = UserId::from_uuid(uuid::Uuid::new_v4());
+        let result = service
+            .get_agent_logs(&other, &agent.agent_id, 100, None)
+            .await;
+        assert!(matches!(result, Err(ControlError::NotOwner { .. })));
+    }
+
+    #[tokio::test]
+    async fn store_log_snapshot_internal_requires_existing_agent() {
+        let (service, _dir, _user_id) = setup();
+        let result = service
+            .store_log_snapshot_internal(snapshot_for(
+                AgentId::generate(),
+                1_000,
+                "stop",
+                vec![log_line(1_000, "orphan")],
+            ))
+            .await;
+        assert!(matches!(result, Err(ControlError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_forwards_termination_reasons_to_scheduler() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("reasons-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.hibernate_agent(&user_id, &aid).await.unwrap();
+
+        service.wake_agent(&user_id, &aid).await.unwrap();
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.stop_agent(&user_id, &aid).await.unwrap();
+
+        assert_eq!(
+            scheduler.termination_reasons(),
+            vec!["hibernate".to_string(), "stop".to_string()]
+        );
     }
 }

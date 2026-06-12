@@ -555,6 +555,51 @@ pub enum UsageEventKind {
     },
 }
 
+/// A single pod-log line with the timestamp parsed from the Kubernetes
+/// log timestamp prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// When the line was emitted (from the K8s `timestamps=true` prefix).
+    pub timestamp: DateTime<Utc>,
+    /// The raw log line (timestamp prefix stripped).
+    pub line: String,
+}
+
+/// A pod-log tail snapshot captured on pod termination (Swarm TEE upgrade
+/// phase 12).
+///
+/// Pod stdout vanishes with the pod, so the scheduler captures a final
+/// tail on every termination path and ships it to the gateway, which
+/// stores it in the `agent_logs` CF keyed by
+/// `agent_id || captured_at_millis` (big-endian). Per-agent storage is
+/// capped — inserting a snapshot prunes the oldest beyond the cap.
+///
+/// Trust boundary: these are VM/platform logs (boot, attestation, health,
+/// harness lifecycle) that are host-visible by design. Detailed in-VM
+/// agent logs stay sealed inside the guest and never reach this store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogSnapshot {
+    /// Agent whose pod the snapshot was captured from.
+    pub agent_id: AgentId,
+    /// When the scheduler captured the tail.
+    pub captured_at: DateTime<Utc>,
+    /// Why the pod was terminated, as known by the scheduler
+    /// (e.g. `terminated` / `stale_image`) or the control plane
+    /// (`hibernate` / `stop` / `tier_change` / `destroy`).
+    pub reason: String,
+    /// The captured tail, oldest line first.
+    pub entries: Vec<LogLine>,
+}
+
+impl AgentLogSnapshot {
+    /// The capture timestamp as non-negative Unix millis (the storage-key
+    /// timestamp component).
+    #[must_use]
+    pub fn captured_at_millis(&self) -> u64 {
+        u64::try_from(self.captured_at.timestamp_millis()).unwrap_or(0)
+    }
+}
+
 /// A user record stored in the database (synced from zOS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {

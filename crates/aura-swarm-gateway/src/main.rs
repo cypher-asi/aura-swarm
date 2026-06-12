@@ -92,7 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduler_client = match scheduler_url {
         Some(url) => {
             tracing::info!(scheduler_url = %url, "Scheduler integration enabled");
-            Some(Arc::new(HttpSchedulerClient::new(url)?))
+            // The scheduler enforces the shared INTERNAL_TOKEN bearer on
+            // its /v1 API when configured; send it on every request.
+            let token = std::env::var("INTERNAL_TOKEN").ok().filter(|t| !t.is_empty());
+            Some(Arc::new(HttpSchedulerClient::new(url)?.with_token(token)))
         }
         None => None,
     };

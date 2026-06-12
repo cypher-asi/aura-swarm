@@ -14,8 +14,15 @@ use rocksdb::{
 use crate::error::{Result, StoreError};
 use crate::keys;
 use crate::schema::{all_column_families, cf};
-use crate::types::{Agent, AgentState, ProcessTrigger, Session, SessionStatus, UsageEvent, User};
+use crate::types::{
+    Agent, AgentLogSnapshot, AgentState, ProcessTrigger, Session, SessionStatus, UsageEvent, User,
+};
 use crate::Store;
+
+/// Maximum pod-log snapshots kept per agent. Inserting a snapshot prunes
+/// the oldest beyond this cap, so the `agent_logs` CF stays bounded even
+/// for agents that hibernate/wake on every cron tick.
+pub const LOG_SNAPSHOTS_PER_AGENT_CAP: usize = 5;
 
 /// RocksDB-backed storage implementation.
 pub struct RocksStore {
@@ -581,6 +588,84 @@ impl Store for RocksStore {
 
         Ok(events)
     }
+
+    // =========================================================================
+    // Agent Log Snapshot Operations (Swarm TEE upgrade phase 12)
+    // =========================================================================
+
+    fn put_log_snapshot(&self, snapshot: &AgentLogSnapshot) -> Result<()> {
+        let cf = self.cf(cf::AGENT_LOGS)?;
+        let value = Self::serialize(snapshot)?;
+
+        // Same collision strategy as usage events: nudge the millis
+        // forward so two snapshots in the same millisecond both survive.
+        let mut captured_at_millis = snapshot.captured_at_millis();
+        loop {
+            let key = keys::log_snapshot_key(&snapshot.agent_id, captured_at_millis);
+            let occupied = self
+                .db
+                .get_cf(&cf, &key)
+                .map_err(|e| StoreError::Database(e.to_string()))?
+                .is_some();
+            if !occupied {
+                self.db
+                    .put_cf(&cf, key, value)
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+                break;
+            }
+            captured_at_millis += 1;
+        }
+
+        // Prune the oldest snapshots beyond the per-agent cap. Keys are
+        // time-ordered under the agent prefix, so the first entries of the
+        // scan are the oldest.
+        let prefix = keys::agent_prefix(&snapshot.agent_id);
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut snapshot_keys = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            snapshot_keys.push(key);
+        }
+        if snapshot_keys.len() > LOG_SNAPSHOTS_PER_AGENT_CAP {
+            let excess = snapshot_keys.len() - LOG_SNAPSHOTS_PER_AGENT_CAP;
+            let mut batch = WriteBatch::default();
+            for key in snapshot_keys.into_iter().take(excess) {
+                batch.delete_cf(&cf, key);
+            }
+            self.db
+                .write(batch)
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn list_log_snapshots_by_agent(&self, agent_id: &AgentId) -> Result<Vec<AgentLogSnapshot>> {
+        let cf = self.cf(cf::AGENT_LOGS)?;
+        let prefix = keys::agent_prefix(agent_id);
+
+        let mut snapshots = Vec::new();
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            snapshots.push(Self::deserialize(&value)?);
+        }
+
+        Ok(snapshots)
+    }
 }
 
 #[cfg(test)]
@@ -1065,6 +1150,85 @@ mod tests {
             .list_usage_events_by_agent(&AgentId::generate())
             .unwrap()
             .is_empty());
+    }
+
+    fn log_snapshot(agent_id: &AgentId, millis: i64, reason: &str) -> crate::AgentLogSnapshot {
+        let captured_at = chrono::DateTime::from_timestamp_millis(millis).unwrap();
+        crate::AgentLogSnapshot {
+            agent_id: *agent_id,
+            captured_at,
+            reason: reason.to_string(),
+            entries: vec![crate::types::LogLine {
+                timestamp: captured_at,
+                line: format!("line at {millis}"),
+            }],
+        }
+    }
+
+    #[test]
+    fn log_snapshots_put_and_list_time_ordered() {
+        let (store, _dir) = create_test_store();
+        let agent1 = AgentId::generate();
+        let agent2 = AgentId::generate();
+
+        store.put_log_snapshot(&log_snapshot(&agent1, 2_000, "stop")).unwrap();
+        store.put_log_snapshot(&log_snapshot(&agent1, 1_000, "hibernate")).unwrap();
+        store.put_log_snapshot(&log_snapshot(&agent2, 1_500, "stop")).unwrap();
+
+        let snapshots = store.list_log_snapshots_by_agent(&agent1).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].reason, "hibernate");
+        assert_eq!(snapshots[1].reason, "stop");
+
+        // Scoped to the agent prefix.
+        assert_eq!(store.list_log_snapshots_by_agent(&agent2).unwrap().len(), 1);
+        assert!(store
+            .list_log_snapshots_by_agent(&AgentId::generate())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn log_snapshots_capped_per_agent_oldest_pruned() {
+        let (store, _dir) = create_test_store();
+        let agent_id = AgentId::generate();
+        let other = AgentId::generate();
+
+        store.put_log_snapshot(&log_snapshot(&other, 500, "stop")).unwrap();
+
+        let total = LOG_SNAPSHOTS_PER_AGENT_CAP + 3;
+        for i in 0..total {
+            let millis = 1_000 + i64::try_from(i).unwrap() * 1_000;
+            store
+                .put_log_snapshot(&log_snapshot(&agent_id, millis, &format!("r{i}")))
+                .unwrap();
+        }
+
+        let snapshots = store.list_log_snapshots_by_agent(&agent_id).unwrap();
+        assert_eq!(snapshots.len(), LOG_SNAPSHOTS_PER_AGENT_CAP);
+        // The newest CAP snapshots survive, oldest first.
+        assert_eq!(snapshots[0].reason, "r3");
+        assert_eq!(
+            snapshots[LOG_SNAPSHOTS_PER_AGENT_CAP - 1].reason,
+            format!("r{}", total - 1)
+        );
+
+        // Pruning is scoped to the agent: the other agent's snapshot survives.
+        assert_eq!(store.list_log_snapshots_by_agent(&other).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn log_snapshots_same_millisecond_are_not_overwritten() {
+        let (store, _dir) = create_test_store();
+        let agent_id = AgentId::generate();
+
+        store.put_log_snapshot(&log_snapshot(&agent_id, 1_000, "first")).unwrap();
+        store.put_log_snapshot(&log_snapshot(&agent_id, 1_000, "second")).unwrap();
+
+        let snapshots = store.list_log_snapshots_by_agent(&agent_id).unwrap();
+        assert_eq!(snapshots.len(), 2, "colliding keys must both be kept");
+        assert_eq!(snapshots[0].reason, "first");
+        assert_eq!(snapshots[1].reason, "second");
     }
 
     #[test]

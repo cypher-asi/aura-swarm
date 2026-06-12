@@ -11,14 +11,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Event, Pod};
-use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams};
 use kube::runtime::watcher::{self, watcher, Config as WatcherConfig};
 use kube::Client;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, AgentState, BoxTier};
+use aura_swarm_store::{AgentSpec, AgentState, BoxTier, LogLine};
 
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
@@ -44,10 +44,30 @@ pub trait Scheduler: Send + Sync {
 
     /// Terminate an agent pod.
     ///
+    /// `reason` records why the pod is going away (e.g. `terminated`,
+    /// `hibernate`, `stop`, `tier_change`, `stale_image`); it is attached
+    /// to the final-tail log snapshot shipped to the gateway.
+    ///
     /// # Errors
     ///
     /// Returns an error if pod deletion fails (except 404).
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()>;
+    async fn terminate_agent(&self, agent_id: &AgentId, reason: &str) -> Result<()>;
+
+    /// Fetch the stdout tail of an agent's pod via the K8s pod-logs API.
+    ///
+    /// Returns up to `tail_lines` parsed log lines, optionally limited to
+    /// lines emitted at or after `since`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::PodNotFound`] when the agent has no pod,
+    /// or an error if the logs cannot be retrieved.
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        tail_lines: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LogLine>>;
 
     /// Get the current status of an agent's pod.
     ///
@@ -97,6 +117,54 @@ const POD_STUCK_TIMEOUT: chrono::Duration = chrono::Duration::seconds(120);
 /// caught immediately by [`K8sScheduler::extract_container_error`], so anything
 /// reaching this grace window is legitimately in flight.
 const POD_IMAGE_PULL_TIMEOUT: chrono::Duration = chrono::Duration::seconds(600);
+
+/// Number of lines captured for the final-tail snapshot shipped to the
+/// gateway on pod termination. Pod stdout vanishes with the pod, so this
+/// is the only platform-log history that survives hibernate/stop.
+const FINAL_TAIL_LINES: u32 = 1000;
+
+/// Byte cap applied to pod-log reads. Keeps a snapshot payload safely
+/// under the gateway's request-body limit (1 MB by default) and bounds
+/// live tail responses.
+const POD_LOG_LIMIT_BYTES: i64 = 700_000;
+
+/// Upper bound on `tail_lines` accepted for a live pod-log read.
+const MAX_TAIL_LINES: u32 = 5000;
+
+/// Time budget for capturing the final tail during termination. The
+/// capture is strictly best-effort: exceeding this budget skips the
+/// snapshot rather than delaying pod deletion.
+const FINAL_TAIL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parse the raw output of the K8s pod-logs API (requested with
+/// `timestamps=true`) into structured entries.
+///
+/// Each line is prefixed with an RFC3339 timestamp followed by a single
+/// space; the prefix is stripped into [`LogLine::timestamp`]. Lines
+/// without a parsable prefix (shouldn't happen, but logs are untrusted
+/// input) are kept verbatim with `fallback` as their timestamp so no
+/// output is silently dropped.
+fn parse_pod_log_output(raw: &str, fallback: DateTime<Utc>) -> Vec<LogLine> {
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .map(|raw_line| match raw_line.split_once(' ') {
+            Some((prefix, rest)) => match DateTime::parse_from_rfc3339(prefix) {
+                Ok(ts) => LogLine {
+                    timestamp: ts.with_timezone(&Utc),
+                    line: rest.to_string(),
+                },
+                Err(_) => LogLine {
+                    timestamp: fallback,
+                    line: raw_line.to_string(),
+                },
+            },
+            None => LogLine {
+                timestamp: fallback,
+                line: raw_line.to_string(),
+            },
+        })
+        .collect()
+}
 
 /// Kubernetes-based scheduler for agent pods.
 ///
@@ -564,7 +632,7 @@ impl K8sScheduler {
                                 expected_image = %self.config.image,
                                 "Desired-state reconciler: deleting pod with stale image"
                             );
-                            if let Err(e) = self.terminate_agent(&agent_id).await {
+                            if let Err(e) = self.terminate_agent(&agent_id, "stale_image").await {
                                 error!(
                                     agent_id = %agent_info.agent_id,
                                     error = %e,
@@ -856,6 +924,125 @@ impl K8sScheduler {
             );
         } else {
             info!(agent_id = %agent_id, "Notified gateway of pod deletion");
+        }
+    }
+
+    /// Read a pod's stdout tail via the K8s pod-logs API and parse it
+    /// into structured entries.
+    async fn fetch_pod_logs(
+        &self,
+        pod_name: &str,
+        tail_lines: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LogLine>> {
+        let pods = self.pods_api();
+        let params = LogParams {
+            timestamps: true,
+            tail_lines: Some(i64::from(tail_lines.min(MAX_TAIL_LINES))),
+            since_time: since,
+            limit_bytes: Some(POD_LOG_LIMIT_BYTES),
+            ..LogParams::default()
+        };
+        let raw = pods.logs(pod_name, &params).await?;
+        Ok(parse_pod_log_output(&raw, Utc::now()))
+    }
+
+    /// Best-effort: capture the pod's final stdout tail and ship it to
+    /// the gateway as a termination snapshot.
+    ///
+    /// Pod logs vanish with the pod, so this runs on every termination
+    /// path *before* the delete. It must never block or fail termination:
+    /// the capture is bounded by [`FINAL_TAIL_CAPTURE_TIMEOUT`] and every
+    /// failure is logged and swallowed.
+    async fn capture_and_ship_final_tail(&self, agent_id: &AgentId, pod_name: &str, reason: &str) {
+        let captured = tokio::time::timeout(
+            FINAL_TAIL_CAPTURE_TIMEOUT,
+            self.fetch_pod_logs(pod_name, FINAL_TAIL_LINES, None),
+        )
+        .await;
+
+        let entries = match captured {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
+                warn!(
+                    agent_id = %agent_id,
+                    pod_name,
+                    error = %e,
+                    "Failed to capture final log tail; terminating without snapshot"
+                );
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    agent_id = %agent_id,
+                    pod_name,
+                    "Timed out capturing final log tail; terminating without snapshot"
+                );
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            debug!(agent_id = %agent_id, pod_name, "Pod produced no logs; skipping snapshot");
+            return;
+        }
+
+        if let Err(e) = self.ship_log_snapshot(agent_id, reason, entries).await {
+            warn!(
+                agent_id = %agent_id,
+                pod_name,
+                error = %e,
+                "Failed to ship final log snapshot to gateway"
+            );
+        } else {
+            info!(agent_id = %agent_id, pod_name, reason, "Shipped final log snapshot to gateway");
+        }
+    }
+
+    /// POST a captured log tail to the gateway's internal snapshot
+    /// endpoint (`POST /internal/agents/:id/log-snapshot`).
+    async fn ship_log_snapshot(
+        &self,
+        agent_id: &AgentId,
+        reason: &str,
+        entries: Vec<LogLine>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct LogSnapshotRequest<'a> {
+            captured_at: DateTime<Utc>,
+            reason: &'a str,
+            entries: Vec<LogLine>,
+        }
+
+        let url = format!(
+            "{}/internal/agents/{}/log-snapshot",
+            self.config.gateway_url,
+            agent_id.to_hex()
+        );
+
+        let body = LogSnapshotRequest {
+            captured_at: Utc::now(),
+            reason,
+            entries,
+        };
+
+        let response = self
+            .http_client
+            .post(&url)
+            .bearer_auth(&self.config.gateway_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SchedulerError::Config(format!("Failed to call gateway: {e}")))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status_code = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            Err(SchedulerError::Config(format!(
+                "Gateway returned {status_code}: {error_text}"
+            )))
         }
     }
 
@@ -1255,7 +1442,7 @@ impl Scheduler for K8sScheduler {
         Ok(())
     }
 
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+    async fn terminate_agent(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
         let pods = self.pods_api();
 
         // Unregister from billing reporter if configured
@@ -1275,6 +1462,12 @@ impl Scheduler for K8sScheduler {
             return Ok(());
         };
 
+        // Pod logs vanish with the pod: capture a final tail and ship it
+        // to the gateway first. Strictly best-effort — never blocks or
+        // fails the termination.
+        self.capture_and_ship_final_tail(agent_id, &pod_name, reason)
+            .await;
+
         match pods.delete(&pod_name, &DeleteParams::default()).await {
             Ok(_) => {
                 info!(agent_id = %agent_id, pod_name, "Terminated agent pod");
@@ -1286,6 +1479,20 @@ impl Scheduler for K8sScheduler {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        tail_lines: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LogLine>> {
+        let pod_name = self
+            .find_pod_name_by_agent(agent_id)
+            .await?
+            .ok_or_else(|| SchedulerError::PodNotFound(agent_id.to_hex()))?;
+
+        self.fetch_pod_logs(&pod_name, tail_lines, since).await
     }
 
     async fn get_pod_status(&self, agent_id: &AgentId) -> Result<PodStatus> {
@@ -1402,6 +1609,92 @@ mod tests {
     }
 
     #[test]
+    fn parse_pod_log_output_strips_timestamp_prefix() {
+        let fallback = Utc::now();
+        let raw = "2026-06-12T08:00:00.123456789Z booting harness\n\
+                   2026-06-12T08:00:01Z attestation ok\n";
+
+        let entries = parse_pod_log_output(raw, fallback);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line, "booting harness");
+        assert_eq!(
+            entries[0].timestamp.timestamp_millis(),
+            DateTime::parse_from_rfc3339("2026-06-12T08:00:00.123456789Z")
+                .unwrap()
+                .timestamp_millis()
+        );
+        assert_eq!(entries[1].line, "attestation ok");
+        assert!(entries[1].timestamp > entries[0].timestamp);
+    }
+
+    #[test]
+    fn parse_pod_log_output_keeps_unparsable_lines_with_fallback() {
+        let fallback = Utc::now();
+        let raw = "no-timestamp-prefix here\nbareline\n\n";
+
+        let entries = parse_pod_log_output(raw, fallback);
+        assert_eq!(entries.len(), 2, "empty lines dropped, content kept");
+        assert_eq!(entries[0].line, "no-timestamp-prefix here");
+        assert_eq!(entries[0].timestamp, fallback);
+        assert_eq!(entries[1].line, "bareline");
+    }
+
+    #[test]
+    fn parse_pod_log_output_preserves_spaces_in_message() {
+        let entries = parse_pod_log_output(
+            "2026-06-12T08:00:00Z msg with  spaces   kept\n",
+            Utc::now(),
+        );
+        assert_eq!(entries[0].line, "msg with  spaces   kept");
+    }
+
+    #[tokio::test]
+    async fn mock_scheduler_pod_logs() {
+        let scheduler = MockScheduler::new();
+        let agent_id = test_agent_id();
+
+        // No pod -> PodNotFound
+        assert!(matches!(
+            scheduler.get_pod_logs(&agent_id, 100, None).await,
+            Err(SchedulerError::PodNotFound(_))
+        ));
+
+        scheduler
+            .schedule_agent(&agent_id, "user-1", "test-agent", &test_spec())
+            .await
+            .unwrap();
+
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        scheduler.set_logs(
+            &agent_id,
+            vec![
+                aura_swarm_store::LogLine {
+                    timestamp: t0,
+                    line: "first".to_string(),
+                },
+                aura_swarm_store::LogLine {
+                    timestamp: t1,
+                    line: "second".to_string(),
+                },
+            ],
+        );
+
+        // Tail keeps the newest lines.
+        let logs = scheduler.get_pod_logs(&agent_id, 1, None).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].line, "second");
+
+        // Since filters older lines.
+        let logs = scheduler
+            .get_pod_logs(&agent_id, 100, Some(t1))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].line, "second");
+    }
+
+    #[test]
     fn pod_with_deletion_timestamp_is_recycling() {
         let pod = Pod {
             metadata: kube::api::ObjectMeta {
@@ -1453,7 +1746,7 @@ mod tests {
         assert!(!status.ready);
 
         // Terminate
-        scheduler.terminate_agent(&agent_id).await.unwrap();
+        scheduler.terminate_agent(&agent_id, "terminated").await.unwrap();
         assert_eq!(scheduler.pod_count(), 0);
 
         // Status should error
@@ -1548,7 +1841,7 @@ mod tests {
         let scheduler = MockScheduler::new();
         let agent_id = test_agent_id();
 
-        let result = scheduler.terminate_agent(&agent_id).await;
+        let result = scheduler.terminate_agent(&agent_id, "terminated").await;
         assert!(result.is_ok());
         assert_eq!(scheduler.pod_count(), 0);
     }

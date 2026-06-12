@@ -39,7 +39,7 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/hibernate` - Hibernate agent
 /// - `POST /v1/agents/:agent_id/wake` - Wake agent
 /// - `POST /v1/agents/:agent_id/tier` - Change box tier (upgrade/downgrade)
-/// - `GET /v1/agents/:agent_id/logs` - Get agent logs
+/// - `GET /v1/agents/:agent_id/logs?tail&since` - VM/platform logs (live tail + termination snapshots)
 /// - `GET /v1/agents/:agent_id/status` - Get agent status (real usage-derived metrics)
 /// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
 ///
@@ -81,6 +81,7 @@ use crate::state::GatewayState;
 ///
 /// ## Internal (service-token authenticated, cluster-only)
 /// - `PATCH /internal/agents/:agent_id/status` - Update agent status (scheduler callback)
+/// - `POST /internal/agents/:agent_id/log-snapshot` - Store a pod-log termination snapshot (scheduler)
 /// - `GET /internal/agents/active` - List agents expected to have pods (scheduler reconciler)
 /// - `GET /internal/agents/all` - List all persisted agents (deploy verification)
 /// - `PUT /internal/agents/:agent_id/process-triggers` - Replace-sync trigger metadata (harness)
@@ -234,6 +235,10 @@ where
         .route(
             "/internal/agents/:agent_id/status",
             patch(internal::update_agent_status::<C, V>),
+        )
+        .route(
+            "/internal/agents/:agent_id/log-snapshot",
+            post(internal::store_log_snapshot::<C, V>),
         )
         .route(
             "/internal/agents/active",

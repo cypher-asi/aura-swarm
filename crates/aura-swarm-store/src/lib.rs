@@ -15,6 +15,7 @@
 //! - `users`: User records synced from zOS
 //! - `process_triggers`: Trigger metadata registered by agents
 //! - `usage_events`: Usage/cost events keyed by agent and timestamp
+//! - `agent_logs`: Capped pod-log snapshots captured on pod termination
 //!
 //! # Example
 //!
@@ -42,10 +43,11 @@ pub mod types;
 
 pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
+pub use rocks::LOG_SNAPSHOTS_PER_AGENT_CAP;
 pub use types::{
-    Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, ProcessTrigger, Session, SessionConfig,
-    SessionStatus, StorageEncryption, UnknownBoxTier, UsageEvent, UsageEventKind, User,
-    WorkspaceConfig,
+    Agent, AgentLogSnapshot, AgentSpec, AgentState, BoxTier, IsolationLevel, LogLine,
+    ProcessTrigger, Session, SessionConfig, SessionStatus, StorageEncryption, UnknownBoxTier,
+    UsageEvent, UsageEventKind, User, WorkspaceConfig,
 };
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
@@ -297,4 +299,27 @@ pub trait Store: Send + Sync {
     ///
     /// Returns an error if the database operation fails.
     fn list_usage_events_by_agent(&self, agent_id: &AgentId) -> Result<Vec<UsageEvent>>;
+
+    // =========================================================================
+    // Agent Log Snapshot Operations (Swarm TEE upgrade phase 12)
+    // =========================================================================
+
+    /// Store a pod-log snapshot, pruning the agent's oldest snapshots
+    /// beyond [`LOG_SNAPSHOTS_PER_AGENT_CAP`].
+    ///
+    /// Keys are `agent_id || captured_at_millis`; an existing key (two
+    /// snapshots in the same millisecond) must not be overwritten —
+    /// implementations nudge the key forward instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn put_log_snapshot(&self, snapshot: &AgentLogSnapshot) -> Result<()>;
+
+    /// List the stored log snapshots for an agent, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn list_log_snapshots_by_agent(&self, agent_id: &AgentId) -> Result<Vec<AgentLogSnapshot>>;
 }

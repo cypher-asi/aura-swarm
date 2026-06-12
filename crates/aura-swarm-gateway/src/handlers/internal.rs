@@ -9,12 +9,13 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentState;
+use aura_swarm_store::{AgentLogSnapshot, AgentState, LogLine};
 
 use crate::error::ApiError;
 use crate::state::GatewayState;
@@ -76,6 +77,50 @@ where
     state
         .control
         .update_agent_status_internal(&agent_id, body.status, body.error_message)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request body for a pod-log termination snapshot shipped by the
+/// scheduler (Swarm TEE upgrade phase 12).
+#[derive(Debug, Deserialize)]
+pub(crate) struct LogSnapshotRequest {
+    /// When the scheduler captured the tail.
+    pub captured_at: DateTime<Utc>,
+    /// Why the pod was terminated.
+    pub reason: String,
+    /// The captured tail, oldest line first.
+    pub entries: Vec<LogLine>,
+}
+
+/// `POST /internal/agents/:agent_id/log-snapshot`
+///
+/// Called by the scheduler with the pod's final stdout tail before it
+/// deletes the pod. Stored in the capped `agent_logs` CF so platform
+/// logs survive hibernate/stop. Requires the internal bearer token.
+pub(crate) async fn store_log_snapshot<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    Json(body): Json<LogSnapshotRequest>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    require_internal_auth(&state, &headers)?;
+
+    let agent_id = parse_agent_id(&agent_id)?;
+
+    state
+        .control
+        .store_log_snapshot_internal(AgentLogSnapshot {
+            agent_id,
+            captured_at: body.captured_at,
+            reason: body.reason,
+            entries: body.entries,
+        })
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

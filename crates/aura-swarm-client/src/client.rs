@@ -14,8 +14,8 @@ use aura_swarm_protocol::RuntimeRunResponse;
 use crate::error::SwarmClientError;
 use crate::types::{
     ApiErrorResponse, CreateRemoteAgentRequest, CreateSessionRequest, CreateSessionResponse,
-    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentSpec,
-    RemoteAgentStateResponse, SessionResponse,
+    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentLogEntry,
+    RemoteAgentLogsResponse, RemoteAgentSpec, RemoteAgentStateResponse, SessionResponse,
 };
 
 /// Typed HTTP client for the aura-swarm gateway.
@@ -222,6 +222,48 @@ impl SwarmClient {
             .json()
             .await
             .map_err(|e| SwarmClientError::Parse(e.to_string()))
+    }
+
+    /// Get a remote agent's VM/platform logs.
+    ///
+    /// Returns the live pod stdout tail (when a pod is running) merged
+    /// with stored termination snapshots, each entry tagged with its
+    /// [`crate::types::RemoteLogSource`] and sorted by timestamp.
+    ///
+    /// * `tail` — keep only the last N merged entries (server default 100)
+    /// * `since` — RFC3339 timestamp; only entries at or after it
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent is not found or the request fails.
+    pub async fn get_agent_logs(
+        &self,
+        remote_agent_id: &str,
+        tail: Option<u32>,
+        since: Option<&str>,
+    ) -> Result<Vec<RemoteAgentLogEntry>, SwarmClientError> {
+        let url = format!("{}/v1/agents/{}/logs", self.base_url, remote_agent_id);
+
+        let mut request = self.client.get(&url).headers(self.auth_headers()?);
+        if let Some(tail) = tail {
+            request = request.query(&[("tail", tail.to_string())]);
+        }
+        if let Some(since) = since {
+            request = request.query(&[("since", since)]);
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            return Err(Self::extract_error(response).await);
+        }
+
+        let body: RemoteAgentLogsResponse = response
+            .json()
+            .await
+            .map_err(|e| SwarmClientError::Parse(e.to_string()))?;
+
+        Ok(body.logs)
     }
 
     // =========================================================================
@@ -625,6 +667,64 @@ mod tests {
             let state = client.get_remote_agent_state("agent-42").await.unwrap();
             assert_eq!(state.state, RemoteAgentState::Running);
             assert_eq!(state.uptime_seconds, 120);
+        }
+
+        #[tokio::test]
+        async fn get_agent_logs_path_and_query() {
+            use wiremock::matchers::query_param;
+
+            use crate::types::RemoteLogSource;
+
+            let (server, client) = setup().await;
+
+            Mock::given(method("GET"))
+                .and(path("/v1/agents/agent-42/logs"))
+                .and(query_param("tail", "50"))
+                .and(query_param("since", "2026-06-12T08:00:00Z"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "logs": [
+                        {
+                            "timestamp": "2026-06-12T08:00:00Z",
+                            "line": "old shutdown",
+                            "source": "snapshot"
+                        },
+                        {
+                            "timestamp": "2026-06-12T08:01:00Z",
+                            "line": "booting harness",
+                            "source": "live"
+                        }
+                    ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let logs = client
+                .get_agent_logs("agent-42", Some(50), Some("2026-06-12T08:00:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(logs.len(), 2);
+            assert_eq!(logs[0].line, "old shutdown");
+            assert_eq!(logs[0].source, RemoteLogSource::Snapshot);
+            assert_eq!(logs[1].line, "booting harness");
+            assert_eq!(logs[1].source, RemoteLogSource::Live);
+        }
+
+        #[tokio::test]
+        async fn get_agent_logs_path_without_params() {
+            let (server, client) = setup().await;
+
+            Mock::given(method("GET"))
+                .and(path("/v1/agents/agent-42/logs"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "logs": [] })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let logs = client.get_agent_logs("agent-42", None, None).await.unwrap();
+            assert!(logs.is_empty());
         }
 
         #[tokio::test]

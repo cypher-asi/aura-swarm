@@ -1,12 +1,12 @@
 //! Mock scheduler for testing without a real Kubernetes cluster.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{AgentSpec, LogLine};
 
 use crate::types::{PodInfo, PodPhase, PodStatus};
 use crate::{Result, Scheduler, SchedulerError};
@@ -23,6 +23,7 @@ struct MockPod {
     spec: AgentSpec,
     status: PodStatus,
     endpoint: Option<String>,
+    logs: Vec<LogLine>,
 }
 
 impl MockScheduler {
@@ -43,6 +44,13 @@ impl MockScheduler {
     pub fn set_status(&self, agent_id: &AgentId, status: PodStatus) {
         if let Some(pod) = self.pods.lock().get_mut(agent_id) {
             pod.status = status;
+        }
+    }
+
+    /// Set the log lines a pod will return from [`Scheduler::get_pod_logs`].
+    pub fn set_logs(&self, agent_id: &AgentId, logs: Vec<LogLine>) {
+        if let Some(pod) = self.pods.lock().get_mut(agent_id) {
+            pod.logs = logs;
         }
     }
 
@@ -97,15 +105,37 @@ impl Scheduler for MockScheduler {
                     message: None,
                 },
                 endpoint: None,
+                logs: Vec::new(),
             },
         );
 
         Ok(())
     }
 
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+    async fn terminate_agent(&self, agent_id: &AgentId, _reason: &str) -> Result<()> {
         self.pods.lock().remove(agent_id);
         Ok(())
+    }
+
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        tail_lines: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LogLine>> {
+        let pods = self.pods.lock();
+        let pod = pods
+            .get(agent_id)
+            .ok_or_else(|| SchedulerError::PodNotFound(agent_id.to_hex()))?;
+
+        let filtered: Vec<LogLine> = pod
+            .logs
+            .iter()
+            .filter(|l| since.is_none_or(|s| l.timestamp >= s))
+            .cloned()
+            .collect();
+        let skip = filtered.len().saturating_sub(tail_lines as usize);
+        Ok(filtered.into_iter().skip(skip).collect())
     }
 
     async fn get_pod_status(&self, agent_id: &AgentId) -> Result<PodStatus> {

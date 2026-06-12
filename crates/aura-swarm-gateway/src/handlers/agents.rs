@@ -134,7 +134,7 @@ pub(crate) struct LogQuery {
     /// Number of lines to retrieve (default: 100).
     #[serde(default = "default_tail")]
     pub(crate) tail: u32,
-    /// Retrieve logs since this timestamp.
+    /// Retrieve logs since this timestamp (RFC3339).
     #[serde(default)]
     pub(crate) since: Option<String>,
 }
@@ -143,22 +143,13 @@ const fn default_tail() -> u32 {
     100
 }
 
-/// Response for agent logs.
+/// Response for agent logs: the live pod tail (when a pod is running)
+/// merged with stored termination snapshots, sorted by timestamp. The
+/// top-level `logs` key is kept from the placeholder response shape.
 #[derive(Debug, Serialize)]
 pub(crate) struct LogsResponse {
-    /// Log entries.
-    pub(crate) logs: Vec<LogEntry>,
-}
-
-/// A single log entry.
-#[derive(Debug, Serialize)]
-pub(crate) struct LogEntry {
-    /// Timestamp of the log.
-    pub(crate) timestamp: DateTime<Utc>,
-    /// Log level.
-    pub(crate) level: String,
-    /// Log message.
-    pub(crate) message: String,
+    /// Merged log entries, oldest first.
+    pub(crate) logs: Vec<aura_swarm_control::AgentLogEntry>,
 }
 
 /// Response for agent status, with real metrics derived from the agent's
@@ -496,16 +487,23 @@ where
     }))
 }
 
-/// Get agent logs.
+/// Get agent VM/platform logs (`GET /v1/agents/:agent_id/logs`).
 ///
-/// Note: This is a placeholder implementation. Real logs would come from
-/// the Kubernetes pod or a log aggregation service.
+/// Merges the live pod stdout tail (fetched from the scheduler when a
+/// pod is running) with stored termination snapshots; each entry is
+/// tagged `source: "live" | "snapshot"` and the merged set is sorted by
+/// timestamp and capped to the last `tail` entries.
+///
+/// Detailed in-VM agent logs stay sealed inside the guest — this serves
+/// only host-visible platform logs (boot, attestation, health, harness
+/// lifecycle).
 ///
 /// # Errors
 ///
-/// Returns an error if the agent ID is invalid.
+/// Returns 400 for an invalid agent ID or `since` timestamp, 404/403 per
+/// the usual ownership rules.
 pub(crate) async fn get_logs<C, V>(
-    State(_state): State<Arc<GatewayState<C, V>>>,
+    State(state): State<Arc<GatewayState<C, V>>>,
     user: AuthUser,
     Path(agent_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<LogQuery>,
@@ -514,19 +512,27 @@ where
     C: ControlPlane + 'static,
     V: JwtValidator + 'static,
 {
-    // Validate agent ID format
-    parse_agent_id(&agent_id)?;
+    let agent_id = parse_agent_id(&agent_id)?;
 
-    // Placeholder: In a real implementation, this would fetch logs from K8s or a log service
-    tracing::debug!(
-        agent_id = %agent_id,
-        user_id = %user.user_id,
-        tail = query.tail,
-        since = ?query.since,
-        "Fetching agent logs"
-    );
+    let since = match query.since.as_deref() {
+        Some(s) => Some(
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| {
+                    ApiError::BadRequest(
+                        "invalid `since`: expected an RFC3339 timestamp".to_string(),
+                    )
+                })?,
+        ),
+        None => None,
+    };
 
-    Ok(Json(LogsResponse { logs: vec![] }))
+    let logs = state
+        .control
+        .get_agent_logs(&user.user_id, &agent_id, query.tail, since)
+        .await?;
+
+    Ok(Json(LogsResponse { logs }))
 }
 
 /// Get agent status with real metrics derived from the agent's

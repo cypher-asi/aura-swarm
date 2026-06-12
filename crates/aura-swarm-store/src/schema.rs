@@ -30,6 +30,12 @@ pub mod cf {
     /// Usage events for cost/usage aggregation, keyed by
     /// `agent_id || timestamp_millis` (big-endian for time-ordered scans).
     pub const USAGE_EVENTS: &str = "usage_events";
+
+    /// Pod-log snapshots captured by the scheduler on pod termination,
+    /// keyed by `agent_id || captured_at_millis` (big-endian). Capped per
+    /// agent (oldest snapshots pruned on insert) — see
+    /// `LOG_SNAPSHOTS_PER_AGENT_CAP` in the rocks implementation.
+    pub const AGENT_LOGS: &str = "agent_logs";
 }
 
 /// Returns all column family names for database initialization.
@@ -48,6 +54,7 @@ pub fn all_column_families() -> Vec<&'static str> {
         cf::USERS,
         cf::PROCESS_TRIGGERS,
         cf::USAGE_EVENTS,
+        cf::AGENT_LOGS,
     ]
 }
 
@@ -69,6 +76,7 @@ mod tests {
                 cf::USERS,
                 cf::PROCESS_TRIGGERS,
                 cf::USAGE_EVENTS,
+                cf::AGENT_LOGS,
             ]
         );
     }

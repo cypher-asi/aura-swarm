@@ -85,6 +85,29 @@ pub struct TierChangeOutcome {
     pub pod_recreated: bool,
 }
 
+/// Where a merged log entry came from (Swarm TEE upgrade phase 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSource {
+    /// Read from the running pod's stdout via the scheduler.
+    Live,
+    /// Read from a stored termination snapshot (`agent_logs` CF).
+    Snapshot,
+}
+
+/// A single merged log entry returned by the agent-logs API: the live
+/// pod tail (when a pod is running) interleaved with stored termination
+/// snapshots, sorted by timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogEntry {
+    /// When the line was emitted.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// The raw log line.
+    pub line: String,
+    /// Whether the line came from the live pod or a stored snapshot.
+    pub source: LogSource,
+}
+
 /// Options for retrieving agent logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogOptions {

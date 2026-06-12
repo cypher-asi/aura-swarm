@@ -11,6 +11,7 @@
 //! - `user_key`: 16 bytes (UserId)
 //! - `process_trigger_key`: 16 bytes + process id length (`AgentId` + UTF-8 process id)
 //! - `usage_event_key`: 24 bytes (`AgentId` + big-endian `u64` timestamp millis)
+//! - `log_snapshot_key`: 24 bytes (`AgentId` + big-endian `u64` captured-at millis)
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
 
@@ -140,6 +141,18 @@ pub fn usage_event_key(agent_id: &AgentId, timestamp_millis: u64) -> Vec<u8> {
     key
 }
 
+/// Encode a log-snapshot key: `agent_id || captured_at_millis` (big-endian).
+///
+/// Big-endian millis keep snapshots time-ordered under a prefix scan with
+/// [`agent_prefix`], so the per-agent cap can prune the oldest entries.
+#[must_use]
+pub fn log_snapshot_key(agent_id: &AgentId, captured_at_millis: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(24);
+    key.extend_from_slice(agent_id.as_bytes());
+    key.extend_from_slice(&captured_at_millis.to_be_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +219,18 @@ mod tests {
             extract_process_id_from_trigger_key(&key).as_deref(),
             Some("proc-123")
         );
+    }
+
+    #[test]
+    fn log_snapshot_key_is_time_ordered() {
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test", 42);
+
+        let k1 = log_snapshot_key(&agent_id, 1_000);
+        let k2 = log_snapshot_key(&agent_id, 2_000);
+        assert_eq!(k1.len(), 24);
+        assert!(k1.starts_with(&agent_prefix(&agent_id)));
+        assert!(k1 < k2, "earlier snapshots must sort first");
     }
 
     #[test]

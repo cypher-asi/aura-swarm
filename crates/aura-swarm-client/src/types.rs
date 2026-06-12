@@ -167,6 +167,40 @@ pub struct RemoteAgentStateResponse {
 }
 
 // =============================================================================
+// Log Types
+// =============================================================================
+
+/// Where a merged log entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteLogSource {
+    /// Read from the running pod's stdout (live tail).
+    Live,
+    /// Read from a termination snapshot stored by the control plane.
+    Snapshot,
+}
+
+/// A single VM/platform log entry returned by
+/// `GET /v1/agents/:id/logs`: the live pod tail merged with stored
+/// termination snapshots, sorted by timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAgentLogEntry {
+    /// When the line was emitted.
+    pub timestamp: DateTime<Utc>,
+    /// The raw log line.
+    pub line: String,
+    /// Whether the line came from the live pod or a stored snapshot.
+    pub source: RemoteLogSource,
+}
+
+/// Response for the agent logs endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAgentLogsResponse {
+    /// Merged log entries, oldest first.
+    pub logs: Vec<RemoteAgentLogEntry>,
+}
+
+// =============================================================================
 // Session Types
 // =============================================================================
 

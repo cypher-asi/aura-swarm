@@ -51,8 +51,9 @@ pub use error::SwarmClientError;
 pub use ws::{connect_run_stream, RunStreamSender};
 pub use types::{
     CreateRemoteAgentRequest, CreateSessionRequest, CreateSessionResponse,
-    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentSpec, RemoteAgentState,
-    RemoteAgentStateResponse, RemoteIsolationLevel, SessionConfig, SessionResponse, SessionStatus,
+    ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentLogEntry,
+    RemoteAgentLogsResponse, RemoteAgentSpec, RemoteAgentState, RemoteAgentStateResponse,
+    RemoteIsolationLevel, RemoteLogSource, SessionConfig, SessionResponse, SessionStatus,
 };
 
 // Re-export the protocol message types so consumers can drive a run stream

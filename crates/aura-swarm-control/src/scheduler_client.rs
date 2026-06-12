@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{AgentSpec, LogLine};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ControlError, Result};
@@ -33,10 +34,29 @@ pub trait SchedulerClient: Send + Sync {
 
     /// Terminate an agent pod.
     ///
+    /// `reason` (e.g. `hibernate` / `stop` / `tier_change` / `destroy`)
+    /// is attached to the final-tail log snapshot the scheduler ships to
+    /// the gateway before deleting the pod.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()>;
+    async fn terminate_agent(&self, agent_id: &AgentId, reason: &str) -> Result<()>;
+
+    /// Fetch the live stdout tail of an agent's pod via the scheduler's
+    /// pod-logs endpoint.
+    ///
+    /// Returns `Ok(None)` when the agent has no pod (scheduler 404).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        tail: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Option<Vec<LogLine>>>;
 
     /// Get the status of an agent's pod.
     ///
@@ -76,6 +96,9 @@ pub struct PodStatusResponse {
 pub struct HttpSchedulerClient {
     client: reqwest::Client,
     base_url: String,
+    /// Bearer token for the scheduler API (`INTERNAL_TOKEN`). The
+    /// scheduler enforces it on every `/v1` route when configured.
+    token: Option<String>,
 }
 
 impl HttpSchedulerClient {
@@ -98,6 +121,7 @@ impl HttpSchedulerClient {
         Ok(Self {
             client,
             base_url: base_url.into(),
+            token: None,
         })
     }
 
@@ -107,13 +131,31 @@ impl HttpSchedulerClient {
         Self {
             client,
             base_url: base_url.into(),
+            token: None,
         }
+    }
+
+    /// Set the bearer token sent on every request (the shared
+    /// `INTERNAL_TOKEN`). Required against a scheduler that has token
+    /// enforcement enabled.
+    #[must_use]
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token.filter(|t| !t.is_empty());
+        self
     }
 
     /// Get the base URL of the scheduler service.
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Attach the bearer token to a request when configured.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 }
 
@@ -154,8 +196,7 @@ impl SchedulerClient for HttpSchedulerClient {
         };
 
         let response = self
-            .client
-            .post(&url)
+            .authorize(self.client.post(&url))
             .json(&request)
             .send()
             .await
@@ -182,12 +223,12 @@ impl SchedulerClient for HttpSchedulerClient {
         }
     }
 
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+    async fn terminate_agent(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
         let url = format!("{}/v1/agents/{}", self.base_url, agent_id.to_hex());
 
         let response = self
-            .client
-            .delete(&url)
+            .authorize(self.client.delete(&url))
+            .query(&[("reason", reason)])
             .send()
             .await
             .map_err(|e| ControlError::Internal(format!("Scheduler request failed: {e}")))?;
@@ -213,12 +254,56 @@ impl SchedulerClient for HttpSchedulerClient {
         }
     }
 
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        tail: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Option<Vec<LogLine>>> {
+        let url = format!("{}/v1/agents/{}/logs", self.base_url, agent_id.to_hex());
+
+        let mut request = self
+            .authorize(self.client.get(&url))
+            .query(&[("tail", tail.to_string())]);
+        if let Some(since) = since {
+            request = request.query(&[("since", since.to_rfc3339())]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ControlError::Internal(format!("Scheduler request failed: {e}")))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if response.status().is_success() {
+            #[derive(Deserialize)]
+            struct LogsResponse {
+                entries: Vec<LogLine>,
+            }
+            let resp: LogsResponse = response
+                .json()
+                .await
+                .map_err(|e| ControlError::Internal(format!("Failed to parse response: {e}")))?;
+            Ok(Some(resp.entries))
+        } else {
+            let status = response.status();
+            let error = response.json::<ErrorResponse>().await.map_or_else(
+                |_| format!("Scheduler returned status {status}"),
+                |e| e.error,
+            );
+
+            Err(ControlError::Internal(format!("Scheduler error: {error}")))
+        }
+    }
+
     async fn get_pod_status(&self, agent_id: &AgentId) -> Result<PodStatusResponse> {
         let url = format!("{}/v1/agents/{}/status", self.base_url, agent_id.to_hex());
 
         let response = self
-            .client
-            .get(&url)
+            .authorize(self.client.get(&url))
             .send()
             .await
             .map_err(|e| ControlError::Internal(format!("Scheduler request failed: {e}")))?;
@@ -245,8 +330,7 @@ impl SchedulerClient for HttpSchedulerClient {
         let url = format!("{}/v1/agents/{}/endpoint", self.base_url, agent_id.to_hex());
 
         let response = self
-            .client
-            .get(&url)
+            .authorize(self.client.get(&url))
             .send()
             .await
             .map_err(|e| ControlError::Internal(format!("Scheduler request failed: {e}")))?;
@@ -304,12 +388,26 @@ impl SchedulerClient for NoopSchedulerClient {
         Ok(())
     }
 
-    async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+    async fn terminate_agent(&self, agent_id: &AgentId, _reason: &str) -> Result<()> {
         tracing::warn!(
             agent_id = %agent_id,
             "NoopSchedulerClient: terminate_agent called but no scheduler configured"
         );
         Ok(())
+    }
+
+    async fn get_pod_logs(
+        &self,
+        agent_id: &AgentId,
+        _tail: u32,
+        _since: Option<DateTime<Utc>>,
+    ) -> Result<Option<Vec<LogLine>>> {
+        tracing::warn!(
+            agent_id = %agent_id,
+            "NoopSchedulerClient: get_pod_logs called but no scheduler configured"
+        );
+        // No scheduler -> no live pod logs.
+        Ok(None)
     }
 
     async fn get_pod_status(&self, agent_id: &AgentId) -> Result<PodStatusResponse> {

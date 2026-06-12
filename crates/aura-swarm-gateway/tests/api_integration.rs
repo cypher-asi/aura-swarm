@@ -930,11 +930,11 @@ async fn internal_update_status_with_error_message() {
 }
 
 // ---------------------------------------------------------------------------
-// Agent observability (placeholders)
+// Agent observability
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn get_logs_returns_empty() {
+async fn get_logs_empty_without_pod_or_snapshots() {
     let (server, _tmp) = build_test_app();
     let (hdr, val) = auth_header(TEST_USER_UUID);
 
@@ -955,6 +955,136 @@ async fn get_logs_returns_empty() {
     resp.assert_status_ok();
     let body: Value = resp.json();
     assert_eq!(body["logs"], json!([]));
+}
+
+#[tokio::test]
+async fn get_logs_requires_auth_and_ownership() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "logs-auth-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No token -> 401.
+    server
+        .get(&format!("/v1/agents/{agent_id}/logs"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+    // Another user -> not found/forbidden, never the logs.
+    let (other_hdr, other_val) = auth_header(OTHER_USER_UUID);
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/logs"))
+        .add_header(other_hdr, other_val)
+        .await;
+    assert!(
+        resp.status_code() == axum::http::StatusCode::NOT_FOUND
+            || resp.status_code() == axum::http::StatusCode::FORBIDDEN,
+        "expected 403/404 for non-owner, got {}",
+        resp.status_code()
+    );
+}
+
+#[tokio::test]
+async fn get_logs_rejects_invalid_since() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "logs-since-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .get(&format!("/v1/agents/{agent_id}/logs?since=not-a-timestamp"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn log_snapshot_roundtrip_via_internal_endpoint() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "snapshot-agent"}))
+        .await;
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let snapshot = json!({
+        "captured_at": "2026-06-12T08:00:05Z",
+        "reason": "hibernate",
+        "entries": [
+            { "timestamp": "2026-06-12T08:00:00Z", "line": "booting harness" },
+            { "timestamp": "2026-06-12T08:00:01Z", "line": "attestation ok" },
+        ]
+    });
+
+    // Without the internal token the snapshot is rejected.
+    server
+        .post(&format!("/internal/agents/{agent_id}/log-snapshot"))
+        .json(&snapshot)
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+    // With it, the snapshot is stored...
+    server
+        .post(&format!("/internal/agents/{agent_id}/log-snapshot"))
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&snapshot)
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // ...and served back through the owner-facing logs endpoint, tagged
+    // as snapshot entries (no scheduler configured -> no live plane).
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/logs"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[0]["line"], "booting harness");
+    assert_eq!(logs[0]["source"], "snapshot");
+    assert_eq!(logs[1]["line"], "attestation ok");
+
+    // Tail caps the merged set from the newest end.
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/logs?tail=1"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    let body: Value = resp.json();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["line"], "attestation ok");
+
+    // Unknown agent -> 404.
+    server
+        .post("/internal/agents/00000000000000000000000000000000/log-snapshot")
+        .add_header(internal_hdr.clone(), internal_val.clone())
+        .json(&snapshot)
+        .await
+        .assert_status(axum::http::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

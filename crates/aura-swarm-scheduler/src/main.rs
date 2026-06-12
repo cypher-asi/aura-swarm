@@ -11,8 +11,17 @@
 //!
 //! ## Agent Pod Management
 //! - `POST /v1/agents/:agent_id/schedule` - Schedule (create) an agent pod
-//! - `DELETE /v1/agents/:agent_id` - Terminate an agent pod
+//! - `DELETE /v1/agents/:agent_id?reason=` - Terminate an agent pod
 //! - `GET /v1/agents/:agent_id/status` - Get pod status
+//! - `GET /v1/agents/:agent_id/logs?tail=N&since=RFC3339` - Pod stdout tail
+//!
+//! # Authentication
+//!
+//! When `INTERNAL_TOKEN` is set (production), every `/v1` route requires
+//! `Authorization: Bearer <INTERNAL_TOKEN>` — the same shared service
+//! token used for the gateway's `/internal` endpoints. Without it (dev
+//! mode) the API is open, matching the gateway's dev-mode behavior; the
+//! scheduler is additionally protected by cluster network policies.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,14 +31,16 @@ use aura_swarm_scheduler::{
     ComputeUsageReporter, GatewayAuthError, K8sScheduler, Scheduler, SchedulerBillingConfig,
     SchedulerConfig, SchedulerError,
 };
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{AgentSpec, LogLine};
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tower_http::timeout::TimeoutLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,13 +48,55 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// Application state shared across handlers.
 struct AppState {
     scheduler: Arc<K8sScheduler>,
+    /// Bearer token required on `/v1` routes when set (`INTERNAL_TOKEN`).
+    api_token: Option<String>,
 }
 
 impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             scheduler: Arc::clone(&self.scheduler),
+            api_token: self.api_token.clone(),
         }
+    }
+}
+
+// ============================================================================
+// Authentication
+// ============================================================================
+
+/// Check a request's `Authorization` header against the expected bearer
+/// token. Open (`true`) when no token is configured (dev mode).
+fn is_request_authorized(expected: Option<&str>, authorization: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    matches!(
+        authorization.and_then(|v| v.strip_prefix("Bearer ")),
+        Some(provided) if provided == expected
+    )
+}
+
+/// Middleware enforcing the `INTERNAL_TOKEN` bearer on `/v1` routes.
+///
+/// The scheduler API can terminate and read logs of any agent pod, so it
+/// must not be callable by anything that merely has network reach. When
+/// `INTERNAL_TOKEN` is unset the check is skipped (dev mode).
+async fn require_api_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if is_request_authorized(state.api_token.as_deref(), authorization) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new("Unauthorized", 401)),
+        )
+            .into_response()
     }
 }
 
@@ -148,12 +201,22 @@ async fn schedule_handler(
     }
 }
 
+/// Query parameters for pod termination.
+#[derive(Debug, Deserialize)]
+struct TerminateQuery {
+    /// Why the pod is being terminated (attached to the final-tail log
+    /// snapshot), e.g. `hibernate` / `stop` / `tier_change` / `destroy`.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 /// Terminate an agent pod.
 ///
-/// `DELETE /v1/agents/:agent_id`
+/// `DELETE /v1/agents/:agent_id?reason=`
 async fn terminate_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    Query(query): Query<TerminateQuery>,
 ) -> impl IntoResponse {
     let agent_id = match AgentId::from_hex(&agent_id) {
         Ok(id) => id,
@@ -166,7 +229,9 @@ async fn terminate_handler(
         }
     };
 
-    match state.scheduler.terminate_agent(&agent_id).await {
+    let reason = query.reason.as_deref().unwrap_or("terminated");
+
+    match state.scheduler.terminate_agent(&agent_id, reason).await {
         Ok(()) => {
             tracing::info!(agent_id = %agent_id, "Terminated agent pod via HTTP API");
             StatusCode::ACCEPTED.into_response()
@@ -262,19 +327,114 @@ async fn endpoint_handler(
 }
 
 // ============================================================================
+// Pod Logs
+// ============================================================================
+
+/// Default tail size for a live log read.
+const DEFAULT_LOG_TAIL: u32 = 100;
+
+/// Query parameters for log retrieval.
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    /// Number of lines to retrieve from the end (default 100).
+    #[serde(default)]
+    tail: Option<u32>,
+    /// Only return lines emitted at or after this RFC3339 timestamp.
+    #[serde(default)]
+    since: Option<String>,
+}
+
+/// Response for the pod-logs endpoint.
+#[derive(Debug, Serialize)]
+struct LogsResponse {
+    /// Parsed log lines, oldest first.
+    entries: Vec<LogLine>,
+}
+
+/// Get the stdout tail of an agent's pod via the K8s pod-logs API.
+///
+/// `GET /v1/agents/:agent_id/logs?tail=N&since=RFC3339`
+async fn logs_handler(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let agent_id = match AgentId::from_hex(&agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(format!("Invalid agent ID: {e}"), 400)),
+            )
+                .into_response();
+        }
+    };
+
+    let since: Option<DateTime<Utc>> = match query.since.as_deref() {
+        Some(s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(ts) => Some(ts.with_timezone(&Utc)),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        format!("Invalid `since` (expected RFC3339): {e}"),
+                        400,
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let tail = query.tail.unwrap_or(DEFAULT_LOG_TAIL);
+
+    match state.scheduler.get_pod_logs(&agent_id, tail, since).await {
+        Ok(entries) => Json(LogsResponse { entries }).into_response(),
+        Err(SchedulerError::PodNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("Pod not found", 404)),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to fetch pod logs"
+            );
+            let code = e.http_status_code();
+            (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(ErrorResponse::new(e.to_string(), code)),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
 fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Health & readiness
-        .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
-        // Agent pod management
+    // `/v1` routes require the INTERNAL_TOKEN bearer when configured;
+    // health probes stay open.
+    let api_routes = Router::new()
         .route("/v1/agents/:agent_id/schedule", post(schedule_handler))
         .route("/v1/agents/:agent_id", delete(terminate_handler))
         .route("/v1/agents/:agent_id/status", get(status_handler))
         .route("/v1/agents/:agent_id/endpoint", get(endpoint_handler))
+        .route("/v1/agents/:agent_id/logs", get(logs_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_auth,
+        ));
+
+    Router::new()
+        // Health & readiness
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .merge(api_routes)
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .with_state(state)
 }
@@ -426,8 +586,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Started billing reporter background task");
     }
 
+    // The scheduler API can terminate/inspect any agent pod, so enforce
+    // the shared INTERNAL_TOKEN bearer on /v1 routes whenever it is
+    // configured (previously these routes relied on network policies
+    // alone). Dev mode (no token) stays open.
+    let api_token = match scheduler.gateway_token() {
+        "" => {
+            tracing::warn!(
+                "INTERNAL_TOKEN is not set; the scheduler /v1 API is UNAUTHENTICATED \
+                 (dev mode). Production must set INTERNAL_TOKEN."
+            );
+            None
+        }
+        token => {
+            tracing::info!("Scheduler /v1 API requires the INTERNAL_TOKEN bearer");
+            Some(token.to_string())
+        }
+    };
+
     // Create app state
-    let state = AppState { scheduler };
+    let state = AppState {
+        scheduler,
+        api_token,
+    };
 
     // Create router
     let app = create_router(state);
@@ -438,4 +619,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_open_when_no_token_configured() {
+        assert!(is_request_authorized(None, None));
+        assert!(is_request_authorized(None, Some("Bearer anything")));
+    }
+
+    #[test]
+    fn auth_enforced_when_token_configured() {
+        let expected = Some("secret-token");
+        assert!(is_request_authorized(
+            expected,
+            Some("Bearer secret-token")
+        ));
+        assert!(!is_request_authorized(expected, None));
+        assert!(!is_request_authorized(expected, Some("Bearer wrong")));
+        assert!(!is_request_authorized(expected, Some("secret-token")));
+        assert!(!is_request_authorized(
+            expected,
+            Some("Basic secret-token")
+        ));
+    }
 }
