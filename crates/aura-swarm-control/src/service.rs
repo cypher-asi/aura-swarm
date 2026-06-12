@@ -12,6 +12,7 @@ use chrono::Utc;
 
 use crate::billing::BillingChecker;
 use crate::error::{ControlError, Result};
+use crate::kbs::KbsClient;
 use crate::lifecycle;
 use crate::scheduler_client::SchedulerClient;
 use crate::session;
@@ -220,6 +221,7 @@ pub struct ControlPlaneService<
     config: ControlConfig,
     scheduler: Option<Arc<SC>>,
     billing: Option<Arc<BillingChecker>>,
+    kbs: Option<Arc<dyn KbsClient>>,
 }
 
 impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClient> {
@@ -231,6 +233,7 @@ impl<S: Store> ControlPlaneService<S, crate::scheduler_client::NoopSchedulerClie
             config,
             scheduler: None,
             billing: None,
+            kbs: None,
         }
     }
 
@@ -250,6 +253,7 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
             config,
             scheduler: Some(scheduler),
             billing: None,
+            kbs: None,
         }
     }
 
@@ -265,6 +269,7 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
             config,
             scheduler,
             billing: None,
+            kbs: None,
         }
     }
 
@@ -281,12 +286,21 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
             config,
             scheduler,
             billing,
+            kbs: None,
         }
     }
 
     /// Set the billing checker after construction.
     pub fn set_billing(&mut self, billing: Arc<BillingChecker>) {
         self.billing = Some(billing);
+    }
+
+    /// Set the KBS client used for the per-agent state DEK lifecycle.
+    ///
+    /// Use [`crate::kbs::HttpKbsClient`] in production and
+    /// [`crate::kbs::NoopKbsClient`] in dev mode.
+    pub fn set_kbs(&mut self, kbs: Arc<dyn KbsClient>) {
+        self.kbs = Some(kbs);
     }
 
     /// Get a reference to the store.
@@ -311,6 +325,66 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
     #[must_use]
     pub fn has_billing(&self) -> bool {
         self.billing.is_some()
+    }
+
+    /// Check if a KBS client is configured.
+    #[must_use]
+    pub fn has_kbs(&self) -> bool {
+        self.kbs.is_some()
+    }
+
+    /// Provision the per-agent state DEK in the KBS for a sealed agent.
+    ///
+    /// Legacy agents (no `storage_encryption`) make no KBS calls.
+    async fn provision_state_dek(&self, agent: &Agent) -> Result<()> {
+        let Some(encryption) = &agent.spec.storage_encryption else {
+            return Ok(());
+        };
+        if let Some(kbs) = &self.kbs {
+            kbs.provision_dek(encryption.key_id()).await?;
+            tracing::info!(
+                agent_id = %agent.agent_id,
+                key_id = %encryption.key_id(),
+                "Provisioned agent state DEK in KBS"
+            );
+        } else {
+            tracing::debug!(
+                agent_id = %agent.agent_id,
+                "No KBS client configured, skipping DEK provisioning"
+            );
+        }
+        Ok(())
+    }
+
+    /// Revoke the per-agent state DEK in the KBS (crypto-erase), tolerating
+    /// failures: destroy must still complete, but the failure is logged
+    /// loudly so the orphaned key can be cleaned up.
+    ///
+    /// Legacy agents (no `storage_encryption`) make no KBS calls.
+    async fn revoke_state_dek_best_effort(&self, agent: &Agent) {
+        let Some(encryption) = &agent.spec.storage_encryption else {
+            return;
+        };
+        if let Some(kbs) = &self.kbs {
+            match kbs.revoke_dek(encryption.key_id()).await {
+                Ok(()) => {
+                    tracing::info!(
+                        agent_id = %agent.agent_id,
+                        key_id = %encryption.key_id(),
+                        "Revoked agent state DEK in KBS (crypto-erase)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent.agent_id,
+                        key_id = %encryption.key_id(),
+                        error = %e,
+                        "Agent destroyed but DEK revocation in KBS failed; \
+                         the key must be deleted manually to complete crypto-erase"
+                    );
+                }
+            }
+        }
     }
 
     /// Check billing credits for agent creation at the given tier's rate.
@@ -488,6 +562,28 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         })
         .await?;
 
+        // Provision the per-agent state DEK in the KBS before scheduling:
+        // a confidential pod is useless (cannot open its sealed state) if
+        // the key it will request after attestation does not exist. On
+        // failure the just-created record is rolled back so the create
+        // fails cleanly with no half-created agent.
+        if let Err(e) = self.provision_state_dek(&agent).await {
+            tracing::error!(
+                agent_id = %agent.agent_id,
+                error = %e,
+                "Failed to provision state DEK in KBS, rolling back agent creation"
+            );
+            let aid = agent.agent_id;
+            blocking_store(&self.store, move |s| {
+                s.delete_agent(&aid).ok();
+                Ok(())
+            })
+            .await?;
+            return Err(ControlError::Internal(format!(
+                "failed to provision agent state DEK in KBS: {e}"
+            )));
+        }
+
         if let Err(e) = self.schedule_agent_pod(&agent).await {
             tracing::error!(
                 agent_id = %agent.agent_id,
@@ -546,6 +642,12 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             Ok(())
         })
         .await?;
+
+        // Crypto-erase: with the record gone (and the pod long terminated —
+        // delete requires a terminal state), revoke the state DEK so the
+        // sealed ciphertext on EFS is unrecoverable. Best-effort: a revoke
+        // failure is logged loudly but does not fail the destroy.
+        self.revoke_state_dek_best_effort(&agent).await;
 
         tracing::info!(
             agent_id = %agent_id,
@@ -1004,7 +1106,50 @@ mod tests {
     use super::*;
     use crate::scheduler_client::NoopSchedulerClient;
     use aura_swarm_store::RocksStore;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Mock KBS client recording provision/revoke calls, optionally failing
+    /// provisioning to exercise create rollback.
+    #[derive(Default)]
+    struct MockKbsClient {
+        provisioned: Mutex<Vec<String>>,
+        revoked: Mutex<Vec<String>>,
+        fail_provision: bool,
+    }
+
+    impl MockKbsClient {
+        fn failing() -> Self {
+            Self {
+                fail_provision: true,
+                ..Self::default()
+            }
+        }
+
+        fn provisioned(&self) -> Vec<String> {
+            self.provisioned.lock().unwrap().clone()
+        }
+
+        fn revoked(&self) -> Vec<String> {
+            self.revoked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl KbsClient for MockKbsClient {
+        async fn provision_dek(&self, key_id: &str) -> Result<()> {
+            if self.fail_provision {
+                return Err(ControlError::Internal("KBS unavailable".to_string()));
+            }
+            self.provisioned.lock().unwrap().push(key_id.to_string());
+            Ok(())
+        }
+
+        async fn revoke_dek(&self, key_id: &str) -> Result<()> {
+            self.revoked.lock().unwrap().push(key_id.to_string());
+            Ok(())
+        }
+    }
 
     fn setup() -> (
         ControlPlaneService<RocksStore, NoopSchedulerClient>,
@@ -1019,6 +1164,18 @@ mod tests {
         };
         let service = ControlPlaneService::new(store, config);
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        (service, dir, user_id)
+    }
+
+    fn setup_with_kbs(
+        kbs: Arc<MockKbsClient>,
+    ) -> (
+        ControlPlaneService<RocksStore, NoopSchedulerClient>,
+        TempDir,
+        UserId,
+    ) {
+        let (mut service, dir, user_id) = setup();
+        service.set_kbs(kbs);
         (service, dir, user_id)
     }
 
@@ -1118,6 +1275,101 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn create_provisions_dek_for_confidential_agent() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let (agent, created) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tee-agent"))
+            .await
+            .unwrap();
+        assert!(created);
+
+        let expected_key_id = format!("swarm/agents/{}/state-key", agent.agent_id);
+        assert_eq!(kbs.provisioned(), vec![expected_key_id]);
+        assert!(kbs.revoked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_fails_and_rolls_back_when_provision_fails() {
+        let kbs = Arc::new(MockKbsClient::failing());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let result = service
+            .create_agent(&user_id, CreateAgentRequest::new("tee-agent"))
+            .await;
+        assert!(matches!(result, Err(ControlError::Internal(_))));
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("DEK"), "error should mention the DEK: {msg}");
+
+        // No half-created agent must remain.
+        let agents = service.list_agents(&user_id).await.unwrap();
+        assert!(agents.is_empty(), "failed create must be rolled back");
+    }
+
+    #[tokio::test]
+    async fn destroy_revokes_dek_for_confidential_agent() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tee-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Stopped)
+            .unwrap();
+
+        service
+            .delete_agent(&user_id, &agent.agent_id)
+            .await
+            .unwrap();
+
+        let expected_key_id = format!("swarm/agents/{}/state-key", agent.agent_id);
+        assert_eq!(kbs.revoked(), vec![expected_key_id]);
+        assert!(service.store.get_agent(&agent.agent_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_makes_no_kbs_calls() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        // A legacy (pre-migration) agent can no longer be produced by the
+        // create API, so insert one directly: no tier, no storage
+        // encryption, plaintext state.
+        let now = Utc::now();
+        let legacy = Agent {
+            agent_id: AgentId::generate(),
+            user_id,
+            name: "legacy-agent".to_string(),
+            status: AgentState::Stopped,
+            spec: aura_swarm_store::AgentSpec {
+                cpu_millicores: 500,
+                memory_mb: 512,
+                runtime_version: "v1".to_string(),
+                isolation: Some(aura_swarm_store::IsolationLevel::MicroVM),
+                tier: None,
+                storage_encryption: None,
+            },
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: None,
+            error_message: None,
+        };
+        service.store.put_agent(&legacy).unwrap();
+
+        service
+            .delete_agent(&user_id, &legacy.agent_id)
+            .await
+            .unwrap();
+
+        assert!(kbs.provisioned().is_empty(), "legacy agents make no KBS calls");
+        assert!(kbs.revoked().is_empty(), "legacy agents make no KBS calls");
     }
 
     #[tokio::test]

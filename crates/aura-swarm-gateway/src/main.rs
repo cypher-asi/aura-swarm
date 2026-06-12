@@ -14,6 +14,13 @@
 //!
 //! Set `SCHEDULER_URL` environment variable to enable scheduler integration.
 //! If not set, the gateway operates without scheduler (local-only mode).
+//!
+//! # KBS Integration (state DEK lifecycle)
+//!
+//! Set `KBS_URL` and `KBS_ADMIN_KEY_PATH` (Ed25519 admin private key, PEM)
+//! to provision/revoke per-agent state DEKs in the Trustee KBS. `KBS_ENABLED`
+//! (default true) disables the integration; without an admin key path a
+//! no-op client is used (dev mode).
 
 use std::sync::Arc;
 
@@ -25,10 +32,30 @@ use aura_swarm_auth::MockJwtValidator;
 use aura_swarm_auth::{AuthConfig, ZosTokenValidator};
 use aura_swarm_control::{
     BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlane,
-    ControlPlaneService, HttpSchedulerClient,
+    ControlPlaneService, HttpKbsClient, HttpSchedulerClient, KbsClient, KbsConfig, NoopKbsClient,
 };
 use aura_swarm_gateway::{create_router, GatewayConfig, GatewayState};
 use aura_swarm_store::RocksStore;
+
+/// Build the KBS client for the per-agent state DEK lifecycle (provision at
+/// confidential-agent create, revoke at destroy). Without an admin key
+/// configured (dev mode) a no-op client is used.
+fn build_kbs_client() -> Result<Arc<dyn KbsClient>, Box<dyn std::error::Error>> {
+    let kbs_config = KbsConfig::from_env();
+    if kbs_config.is_configured() {
+        tracing::info!(
+            kbs_url = %kbs_config.url,
+            "KBS DEK lifecycle enabled"
+        );
+        Ok(Arc::new(HttpKbsClient::new(&kbs_config)?))
+    } else {
+        tracing::warn!(
+            "KBS not configured (no KBS_ADMIN_KEY_PATH or KBS_ENABLED=false) - \
+             using no-op KBS client; state DEKs will NOT be provisioned"
+        );
+        Ok(Arc::new(NoopKbsClient::new()))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -85,16 +112,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let control = Arc::new(ControlPlaneService::with_integrations(
+    let kbs_client = build_kbs_client()?;
+
+    let mut control = ControlPlaneService::with_integrations(
         store,
         ControlConfig::default(),
         scheduler_client,
         control_billing,
-    ));
+    );
+    control.set_kbs(kbs_client);
+    let control = Arc::new(control);
 
     tracing::info!(
         has_scheduler = control.has_scheduler(),
         has_billing = control.has_billing(),
+        has_kbs = control.has_kbs(),
         "Control plane initialized"
     );
 

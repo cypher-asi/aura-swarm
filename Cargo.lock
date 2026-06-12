@@ -233,6 +233,8 @@ dependencies = [
  "aura-swarm-store",
  "axum",
  "chrono",
+ "getrandom 0.3.4",
+ "jsonwebtoken",
  "reqwest",
  "serde",
  "serde_json",
@@ -243,6 +245,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]

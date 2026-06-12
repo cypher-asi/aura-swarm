@@ -73,6 +73,7 @@
 
 pub mod billing;
 pub mod error;
+pub mod kbs;
 pub mod lifecycle;
 pub mod scheduler_client;
 pub mod service;
@@ -81,6 +82,7 @@ pub mod types;
 
 pub use billing::{BillingCheckError, BillingChecker, BillingConfig};
 pub use error::{ControlError, Result};
+pub use kbs::{HttpKbsClient, KbsClient, KbsConfig, NoopKbsClient};
 pub use scheduler_client::{
     HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient,
 };

@@ -29,6 +29,11 @@ tokio = { workspace = true }
 # HTTP client for scheduler communication
 reqwest = { workspace = true }
 
+# KBS DEK lifecycle: admin-token signing + DEK generation/zeroization
+jsonwebtoken = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+
 # HTTP server (for binary)
 axum.workspace = true
 tower-http.workspace = true
@@ -39,6 +44,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
