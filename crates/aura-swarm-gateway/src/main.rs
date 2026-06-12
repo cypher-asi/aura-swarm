@@ -32,7 +32,8 @@ use aura_swarm_auth::MockJwtValidator;
 use aura_swarm_auth::{AuthConfig, ZosTokenValidator};
 use aura_swarm_control::{
     BillingChecker, BillingConfig as ControlBillingConfig, ControlConfig, ControlPlane,
-    ControlPlaneService, HttpKbsClient, HttpSchedulerClient, KbsClient, KbsConfig, NoopKbsClient,
+    ControlPlaneService, CronServiceConfig, HttpKbsClient, HttpPodTriggerClient,
+    HttpSchedulerClient, KbsClient, KbsConfig, NoopKbsClient, ProcessCronService,
 };
 use aura_swarm_gateway::{create_router, GatewayConfig, GatewayState};
 use aura_swarm_store::RocksStore;
@@ -115,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kbs_client = build_kbs_client()?;
 
     let mut control = ControlPlaneService::with_integrations(
-        store,
+        Arc::clone(&store),
         ControlConfig::default(),
         scheduler_client,
         control_billing,
@@ -161,6 +162,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if gateway_config.internal_token.is_none() {
         return Err("INTERNAL_TOKEN must be set to protect /internal gateway endpoints".into());
     }
+
+    // ProcessCronService: fire due process triggers (wake -> ready ->
+    // POST trigger to pod) and auto-hibernate long-idle agents. The pod
+    // trigger client authenticates with the platform INTERNAL_TOKEN —
+    // the same value the scheduler injects into confidential pods as
+    // AURA_SWARM_INTERNAL_TOKEN.
+    let cron_config = CronServiceConfig::from_env();
+    let pod_trigger_client = Arc::new(HttpPodTriggerClient::new(
+        gateway_config.internal_token.clone(),
+    ));
+    let cron_service = Arc::new(ProcessCronService::new(
+        Arc::clone(&store),
+        Arc::clone(&control),
+        pod_trigger_client,
+        cron_config,
+    ));
+    tokio::spawn(Arc::clone(&cron_service).run_cron_loop());
+    tokio::spawn(Arc::clone(&cron_service).run_auto_hibernate_loop());
+    tracing::info!("Started ProcessCronService cron and auto-hibernate loops");
 
     let state = GatewayState::new(control, jwt_validator, gateway_config);
 

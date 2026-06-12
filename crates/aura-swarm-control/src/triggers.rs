@@ -103,6 +103,12 @@ pub fn validate_process_id(process_id: &str) -> Result<()> {
 /// Returns [`ControlError::InvalidTrigger`] when the expression does
 /// not parse.
 pub fn validate_cron(expr: &str) -> Result<()> {
+    parse_cron(expr).map(|_| ())
+}
+
+/// Parse a cron expression after harness-compatible normalization
+/// (5-field expressions get a `0` seconds field prepended).
+fn parse_cron(expr: &str) -> Result<cron::Schedule> {
     if expr.trim().is_empty() {
         return Err(ControlError::InvalidTrigger(
             "cron expression must not be empty".into(),
@@ -114,8 +120,24 @@ pub fn validate_cron(expr: &str) -> Result<()> {
         expr.trim().to_string()
     };
     cron::Schedule::from_str(&normalized)
-        .map(|_| ())
         .map_err(|e| ControlError::InvalidTrigger(format!("invalid cron expression: {e}")))
+}
+
+/// Compute the next occurrence of `expr` strictly after `after` (UTC).
+///
+/// Returns `Ok(None)` when the schedule has no future occurrence (e.g.
+/// a year-bound expression entirely in the past).
+///
+/// # Errors
+///
+/// Returns [`ControlError::InvalidTrigger`] when the expression does
+/// not parse.
+pub fn next_occurrence_after(
+    expr: &str,
+    after: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    let schedule = parse_cron(expr)?;
+    Ok(schedule.after(&after).next())
 }
 
 #[cfg(test)]
@@ -145,6 +167,24 @@ mod tests {
         assert!(validate_process_id("a/b").is_err());
         assert!(validate_process_id("a b").is_err());
         assert!(validate_process_id(&"a".repeat(MAX_PROCESS_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn next_occurrence_is_strictly_after() {
+        use chrono::TimeZone;
+        let after = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let next = next_occurrence_after("*/5 * * * *", after).unwrap().unwrap();
+        assert!(next > after);
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap());
+    }
+
+    #[test]
+    fn next_occurrence_none_when_exhausted() {
+        use chrono::TimeZone;
+        // Year-bound schedule entirely in the past.
+        let after = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let next = next_occurrence_after("0 0 0 1 1 ? 2020", after).unwrap();
+        assert!(next.is_none());
     }
 
     #[test]

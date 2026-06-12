@@ -72,6 +72,7 @@
 #![warn(clippy::pedantic)]
 
 pub mod billing;
+pub mod cron_service;
 pub mod error;
 pub mod kbs;
 pub mod lifecycle;
@@ -82,6 +83,9 @@ pub mod triggers;
 pub mod types;
 
 pub use billing::{BillingCheckError, BillingChecker, BillingConfig};
+pub use cron_service::{
+    CronServiceConfig, HttpPodTriggerClient, PodTriggerClient, ProcessCronService,
+};
 pub use error::{ControlError, Result};
 pub use kbs::{HttpKbsClient, KbsClient, KbsConfig, NoopKbsClient};
 pub use scheduler_client::{

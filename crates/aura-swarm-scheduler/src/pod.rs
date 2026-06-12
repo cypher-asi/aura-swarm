@@ -315,8 +315,17 @@ fn build_env_vars(agent_id_hex: &str, user_id_hex: &str, config: &SchedulerConfi
 /// DEK identified by `AURA_STATE_KEY_ID` from the KBS at `AURA_KBS_URL`
 /// (released only after successful attestation), then open the sealed state
 /// overlay (`AURA_STATE_ENCRYPTION=sealed`).
+///
+/// Confidential pods additionally get `AURA_SWARM_INTERNAL_TOKEN` (the
+/// platform `INTERNAL_TOKEN` from the scheduler env) so the harness
+/// `TriggerRegistrar` can authenticate trigger-metadata registration to
+/// the gateway's `/internal` endpoints, and so the harness can verify the
+/// bearer the control-plane cron service presents when firing
+/// `POST /v1/processes/:id/trigger`. The control-plane URL and agent id
+/// the registrar also needs are already injected for every pod as
+/// `CONTROL_PLANE_URL` and `AGENT_ID` (legacy env list, unchanged).
 fn build_confidential_env_vars(state_key_id: &str, config: &SchedulerConfig) -> Vec<EnvVar> {
-    vec![
+    let mut env = vec![
         EnvVar {
             name: "AURA_KBS_URL".to_string(),
             value: Some(config.kbs_url.clone()),
@@ -332,7 +341,17 @@ fn build_confidential_env_vars(state_key_id: &str, config: &SchedulerConfig) -> 
             value: Some(state_key_id.to_string()),
             ..Default::default()
         },
-    ]
+    ];
+    // Dev mode without INTERNAL_TOKEN: omit the variable entirely so the
+    // harness falls back to its unauthenticated dev behavior.
+    if !config.gateway_token.is_empty() {
+        env.push(EnvVar {
+            name: "AURA_SWARM_INTERNAL_TOKEN".to_string(),
+            value: Some(config.gateway_token.clone()),
+            ..Default::default()
+        });
+    }
+    env
 }
 
 /// Build an environment variable that references a Kubernetes secret.
@@ -876,6 +895,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(key_id, format!("swarm/agents/{agent_id}/state-key"));
+    }
+
+    #[test]
+    fn confidential_pod_gets_internal_token_when_configured() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            ..test_spec()
+        };
+        let mut config = SchedulerConfig::default();
+        config.gateway_token = "super-secret".to_string();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let env = pod.spec.as_ref().unwrap().containers[0].env.as_ref().unwrap();
+
+        let token = env
+            .iter()
+            .find(|e| e.name == "AURA_SWARM_INTERNAL_TOKEN")
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(token, Some("super-secret"));
+        assert_eq!(
+            env.last().map(|e| e.name.as_str()),
+            Some("AURA_SWARM_INTERNAL_TOKEN"),
+            "internal token must be appended after the other confidential vars"
+        );
+
+        // The trigger registrar's other inputs are already present under
+        // their existing names.
+        assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
+        assert!(env.iter().any(|e| e.name == "AGENT_ID"));
+
+        // Legacy pods must NOT get the token even when configured.
+        let legacy_pod = build_pod(&agent_id, "user-hex", "legacy", &test_spec(), &config);
+        let legacy_env = legacy_pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .unwrap();
+        assert!(
+            !legacy_env
+                .iter()
+                .any(|e| e.name == "AURA_SWARM_INTERNAL_TOKEN"),
+            "legacy pod env must stay byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn confidential_pod_omits_internal_token_in_dev_mode() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            ..test_spec()
+        };
+        // Default config has no INTERNAL_TOKEN (dev mode).
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let env = pod.spec.as_ref().unwrap().containers[0].env.as_ref().unwrap();
+        assert!(!env.iter().any(|e| e.name == "AURA_SWARM_INTERNAL_TOKEN"));
     }
 
     #[test]
