@@ -79,12 +79,24 @@ pub trait Scheduler: Send + Sync {
 }
 
 /// Maximum time a pod is allowed to remain in a non-Ready Provisioning state
-/// before the scheduler escalates it to `AgentState::Error`. Pods that are
-/// `Pending`/`Unschedulable` or stuck in `ContainerCreating` past this
-/// threshold otherwise sit in `Provisioning` indefinitely with no signal to
-/// the gateway, which is what produced the "stuck on Cooking..." UX in
-/// aura-os when a brand-new pod could not be scheduled.
+/// before the scheduler escalates it to `AgentState::Error`. Applies to pods
+/// that are `Pending`/`Unschedulable` or sitting with no progress signal: more
+/// wall-clock time will not unstick a pod the scheduler cannot place, and
+/// surfacing it quickly is what fixed the "stuck on Cooking..." UX in aura-os
+/// when a brand-new pod could not be scheduled.
 const POD_STUCK_TIMEOUT: chrono::Duration = chrono::Duration::seconds(120);
+
+/// Grace period for pods that are still *progressing* through container
+/// creation / image pull (`ContainerCreating`, `PodInitializing`, ...). Unlike
+/// an unschedulable pod, one that is pulling an image is not stuck -- it just
+/// needs time, and a fresh multi-GB harness image being pulled onto every node
+/// during a redeploy routinely exceeds [`POD_STUCK_TIMEOUT`]. Escalating those
+/// to `Error` at 120s falsely terminalized healthy `Idle`/`Provisioning`
+/// agents mid-rollout (and tripped strict redeploy verification). Genuine pull
+/// failures (`ErrImagePull`/`ImagePullBackOff`/`CrashLoopBackOff`/...) are still
+/// caught immediately by [`K8sScheduler::extract_container_error`], so anything
+/// reaching this grace window is legitimately in flight.
+const POD_IMAGE_PULL_TIMEOUT: chrono::Duration = chrono::Duration::seconds(600);
 
 /// Kubernetes-based scheduler for agent pods.
 ///
@@ -383,6 +395,45 @@ impl K8sScheduler {
             return;
         }
 
+        // Recycle guard: a pod that is being intentionally torn down (its
+        // replacement carries the rolling upgrade) must not escalate to Error.
+        // This mirrors the guard already enforced in `handle_pod_update`.
+        if Self::is_pod_recycling(&pod) {
+            debug!(
+                agent_id = %agent_id,
+                pod_name,
+                reason,
+                "Ignoring Warning event for a recycling pod"
+            );
+            return;
+        }
+
+        // Transient-infra guard: FailedCreatePodSandBox / NetworkNotReady /
+        // FailedMount / FailedScheduling / FailedAttachVolume routinely fire as
+        // *transient* warnings while the cluster churns pods -- most visibly
+        // during a redeploy, when the desired-state reconciler rolling-replaces
+        // every stale-image pod and the cluster briefly contends on CNI IP
+        // allocation, sandbox setup, and subPath mounts on the shared state
+        // PVC. Escalating an otherwise-active agent to Error on the first such
+        // warning flips healthy idle/provisioning agents to Error for a few
+        // seconds (until the replacement pod is Ready) and trips the strict
+        // redeploy verification, even though nothing is actually broken.
+        //
+        // Only escalate once the pod has genuinely been wedged past
+        // POD_STUCK_TIMEOUT, matching the time-based escalation in
+        // `handle_pod_update`. Younger pods are left alone; the periodic 30s
+        // reconcile re-checks every pod and the stuck-pod path surfaces real
+        // failures once the grace window elapses.
+        if detect_stuck_pod(&pod, Utc::now(), POD_STUCK_TIMEOUT, POD_IMAGE_PULL_TIMEOUT).is_none() {
+            debug!(
+                agent_id = %agent_id,
+                pod_name,
+                reason,
+                "Deferring transient pod Warning; pod still within stuck-pod grace window"
+            );
+            return;
+        }
+
         let error_msg = format!("{reason}: {message}");
         if let Err(e) = self
             .notify_status_change(&agent_id, AgentState::Error, Some(error_msg))
@@ -636,13 +687,17 @@ impl K8sScheduler {
         };
 
         // Time-based escalation: if a pod has been sitting in Provisioning for
-        // longer than POD_STUCK_TIMEOUT (typically due to Unschedulable or a
-        // stalled ContainerCreating that never trips ImagePullBackOff), surface
-        // it as Error with whatever diagnostic the pod object can provide.
-        // Without this, brand-new agents can sit in Provisioning forever and
-        // the desktop UI never gets a definitive failure event.
+        // longer than its allowed budget (POD_STUCK_TIMEOUT for unschedulable /
+        // no-progress pods, POD_IMAGE_PULL_TIMEOUT for pods still pulling an
+        // image), surface it as Error with whatever diagnostic the pod object
+        // can provide. Without this, brand-new agents can sit in Provisioning
+        // forever and the desktop UI never gets a definitive failure event;
+        // with too tight a budget, healthy pods pulling a fresh harness image
+        // during a redeploy get falsely terminalized to Error.
         if matches!(new_state, AgentState::Provisioning) {
-            if let Some(stuck_msg) = detect_stuck_pod(pod, Utc::now(), POD_STUCK_TIMEOUT) {
+            if let Some(stuck_msg) =
+                detect_stuck_pod(pod, Utc::now(), POD_STUCK_TIMEOUT, POD_IMAGE_PULL_TIMEOUT)
+            {
                 warn!(
                     agent_id = %agent_id,
                     phase,
@@ -955,11 +1010,13 @@ impl K8sScheduler {
 fn detect_stuck_pod(
     pod: &Pod,
     now: DateTime<Utc>,
-    threshold: chrono::Duration,
+    stuck_threshold: chrono::Duration,
+    pull_threshold: chrono::Duration,
 ) -> Option<String> {
     let reference = K8sScheduler::pod_reference_time(pod)?;
     let age = now - reference;
-    if age < threshold {
+    // Nothing can be considered stuck before the (smaller) base budget.
+    if age < stuck_threshold {
         return None;
     }
 
@@ -967,7 +1024,9 @@ fn detect_stuck_pod(
 
     // Prefer the most specific signal we can find. Order matters: a
     // PodScheduled=False message (e.g. "0/3 nodes are available...") is far
-    // more useful than the generic phase fallback.
+    // more useful than the generic phase fallback. An unschedulable pod is
+    // genuinely stuck -- escalate at the base `stuck_threshold` because more
+    // time will not place it.
     if let Some(conditions) = status.and_then(|s| s.conditions.as_ref()) {
         for condition in conditions {
             if condition.type_ == "PodScheduled" && condition.status == "False" {
@@ -984,9 +1043,12 @@ fn detect_stuck_pod(
         }
     }
 
-    // Latest container waiting reason (e.g. ContainerCreating with a slow
-    // image pull). The hard-error reasons are already caught upstream by
-    // `extract_container_error`; here we surface the soft-stuck ones.
+    // Latest container waiting reason (e.g. ContainerCreating with a slow image
+    // pull). The hard-error reasons (ImagePullBackOff/ErrImagePull/
+    // CrashLoopBackOff/...) are already caught upstream by
+    // `extract_container_error`, so anything we see here is still *progressing*
+    // through creation. Give it the longer `pull_threshold` budget so a fresh
+    // harness image pull during a redeploy is not mistaken for a wedged pod.
     let container_statuses = status.and_then(|s| s.container_statuses.as_ref());
     let init_container_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
     for cs in container_statuses
@@ -996,6 +1058,11 @@ fn detect_stuck_pod(
     {
         if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
             if let Some(reason) = waiting.reason.as_deref() {
+                if age < pull_threshold {
+                    // Still inside the image-pull grace window; the pod is
+                    // creating, not stuck. Let it keep cooking.
+                    return None;
+                }
                 let detail = waiting.message.clone().unwrap_or_else(|| reason.to_string());
                 return Some(format!(
                     "pod stuck in {reason} for {}s: {detail}",
@@ -1557,11 +1624,14 @@ mod tests {
         }
     }
 
+    const STUCK_THRESHOLD: chrono::Duration = chrono::Duration::seconds(120);
+    const PULL_THRESHOLD: chrono::Duration = chrono::Duration::seconds(600);
+
     #[test]
     fn detect_stuck_pod_under_threshold_returns_none() {
         let pod = pod_with_age_secs(30);
         let now = Utc::now();
-        assert!(detect_stuck_pod(&pod, now, chrono::Duration::seconds(120)).is_none());
+        assert!(detect_stuck_pod(&pod, now, STUCK_THRESHOLD, PULL_THRESHOLD).is_none());
     }
 
     #[test]
@@ -1572,7 +1642,7 @@ mod tests {
         )]);
 
         let msg =
-            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).expect("stuck");
 
         assert!(
             msg.contains("Unschedulable"),
@@ -1585,15 +1655,33 @@ mod tests {
     }
 
     #[test]
-    fn detect_stuck_pod_container_creating_surfaces_waiting_reason() {
+    fn detect_stuck_pod_container_creating_within_pull_grace_returns_none() {
+        // A pod still pulling its image past the base stuck threshold but well
+        // inside the image-pull grace window is progressing, not stuck. This is
+        // the redeploy regression guard: a fresh harness image pull must not be
+        // escalated to Error and falsely terminalize a healthy agent.
         let mut pod = pod_with_age_secs(200);
         pod.status.as_mut().unwrap().container_statuses = Some(vec![waiting_container(
             "ContainerCreating",
             Some("pulling image foo:bar"),
         )]);
 
+        assert!(
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).is_none(),
+            "ContainerCreating within the pull grace window must not be flagged stuck"
+        );
+    }
+
+    #[test]
+    fn detect_stuck_pod_container_creating_past_pull_grace_surfaces_waiting_reason() {
+        let mut pod = pod_with_age_secs(700);
+        pod.status.as_mut().unwrap().container_statuses = Some(vec![waiting_container(
+            "ContainerCreating",
+            Some("pulling image foo:bar"),
+        )]);
+
         let msg =
-            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).expect("stuck");
 
         assert!(
             msg.contains("ContainerCreating"),
@@ -1609,7 +1697,7 @@ mod tests {
     fn detect_stuck_pod_falls_back_to_phase_when_no_signal() {
         let pod = pod_with_age_secs(180);
         let msg =
-            detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).expect("stuck");
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).expect("stuck");
 
         assert!(msg.contains("Pending"), "expected phase in message: {msg}");
         assert!(msg.contains("180s"), "expected age in message: {msg}");
@@ -1618,7 +1706,7 @@ mod tests {
     #[test]
     fn detect_stuck_pod_without_timestamps_returns_none() {
         let pod = Pod::default();
-        assert!(detect_stuck_pod(&pod, Utc::now(), chrono::Duration::seconds(120)).is_none());
+        assert!(detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).is_none());
     }
 
     // =========================================================================
