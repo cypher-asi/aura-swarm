@@ -106,10 +106,32 @@ pub trait KbsClient: Send + Sync {
     /// The DEK is generated inside the client and never returned to the
     /// caller, logged, or persisted by the control plane.
     ///
+    /// **Warning:** Trustee's resource registration is an unconditional
+    /// overwrite — it cannot report "already exists". Callers that must
+    /// not clobber an existing DEK (overwriting one bricks the agent's
+    /// sealed state) have to use [`KbsClient::dek_exists`] first for
+    /// put-if-absent semantics; see the R2 DEK backfill in `service.rs`.
+    ///
     /// # Errors
     ///
     /// Returns an error if key generation or the KBS request fails.
     async fn provision_dek(&self, key_id: &str) -> Result<()>;
+
+    /// Check whether a DEK is already registered under `key_id`.
+    ///
+    /// This exists because the KBS resource POST cannot report
+    /// "exists" (see [`KbsClient::provision_dek`]): provision-if-absent
+    /// is implemented as GET-first. Returns `Ok(true)` when the
+    /// resource is present, `Ok(false)` when the KBS definitively
+    /// reports it absent (404).
+    ///
+    /// # Errors
+    ///
+    /// Any response that does not prove presence or absence (auth
+    /// failures, 5xx, transport errors) is an error — callers must
+    /// treat "unknown" as "do not provision" so an existing DEK is
+    /// never overwritten.
+    async fn dek_exists(&self, key_id: &str) -> Result<bool>;
 
     /// Delete the DEK for the given key id from the KBS (crypto-erase).
     ///
@@ -246,6 +268,37 @@ impl KbsClient for HttpKbsClient {
         }
     }
 
+    async fn dek_exists(&self, key_id: &str) -> Result<bool> {
+        let url = self.resource_url(key_id)?;
+        let token = self.admin_token()?;
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| ControlError::Internal(format!("KBS request failed: {e}")))?;
+
+        let status = response.status();
+        if status.is_success() {
+            // The body may contain the DEK; drop it without reading.
+            Ok(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Ok(false)
+        } else {
+            // 401/403 here usually means the KBS resource-read policy
+            // does not admit the admin token. We cannot distinguish
+            // "absent" from "present but unreadable", so surface an
+            // error and let the caller skip rather than risk an
+            // overwrite.
+            let body = response.text().await.unwrap_or_default();
+            Err(ControlError::Internal(format!(
+                "KBS existence check for {key_id} returned {status}: {body}"
+            )))
+        }
+    }
+
     async fn revoke_dek(&self, key_id: &str) -> Result<()> {
         let url = self.resource_url(key_id)?;
         let token = self.admin_token()?;
@@ -328,6 +381,16 @@ impl KbsClient for NoopKbsClient {
             "NoopKbsClient: provision_dek called but no KBS configured"
         );
         Ok(())
+    }
+
+    async fn dek_exists(&self, key_id: &str) -> Result<bool> {
+        // Dev mode: report "present" so the R2 DEK backfill is a no-op
+        // instead of warn-spamming a provision per sealed agent.
+        tracing::debug!(
+            key_id = %key_id,
+            "NoopKbsClient: dek_exists called but no KBS configured; reporting present"
+        );
+        Ok(true)
     }
 
     async fn revoke_dek(&self, key_id: &str) -> Result<()> {
@@ -429,6 +492,8 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n\
         let client = NoopKbsClient::new();
         client.provision_dek("swarm/agents/x/state-key").await.unwrap();
         client.revoke_dek("swarm/agents/x/state-key").await.unwrap();
+        // Reports "present" so the R2 backfill is a dev-mode no-op.
+        assert!(client.dek_exists("swarm/agents/x/state-key").await.unwrap());
     }
 
     #[tokio::test]
@@ -471,6 +536,46 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n\
         let client = test_client(&server.uri());
         let err = client
             .provision_dek("swarm/agents/abc123/state-key")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn dek_exists_maps_200_404_and_errors() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/kbs/v0/resource/swarm/agents.present/state-key"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 32]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/kbs/v0/resource/swarm/agents.absent/state-key"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/kbs/v0/resource/swarm/agents.denied/state-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        assert!(client
+            .dek_exists("swarm/agents/present/state-key")
+            .await
+            .unwrap());
+        assert!(!client
+            .dek_exists("swarm/agents/absent/state-key")
+            .await
+            .unwrap());
+        // "Unknown" must be an error so callers never provision blind.
+        let err = client
+            .dek_exists("swarm/agents/denied/state-key")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("401"));

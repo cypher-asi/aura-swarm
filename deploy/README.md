@@ -17,6 +17,18 @@ Quick checks after install:
 
 KBS attestation policies/reference values and per-agent DEK provisioning are configured in the attestation/DEK lifecycle phase, not by these scripts.
 
+## R2 Migration Runbook (fleet move to tiers + sealed storage)
+
+R2 is the one-time release that moves every legacy agent onto the new architecture: agent records gain a tier + sealed storage (store schema v1 → v2), pods rolling-recreate from `kata-fc` onto `kata-qemu-snp`, and the harness encrypt-in-place migrates each agent's plaintext state on its first sealed boot. Run the steps in order:
+
+1. **Rollback point: EFS backup.** AWS Backup for the swarm EFS file system is already operational (EFS encryption and backups are enforced by the terraform storage module). Before deploying R2, take an explicit on-demand recovery point of the `swarm-agent-state` file system and note its ARN, and snapshot the gateway/control PVCs' contents if extra paranoia is warranted. This backup is the rollback path: the harness keeps a transient `*.plaintext-backup` directory only for the duration of each agent's encrypt-in-place swap, so the EFS recovery point is the durable pre-R2 state.
+2. **Deploy the R2 gateway.** A normal `./08-deploy-k8s.sh` redeploy. On startup the gateway runs the store migration automatically (`schema_version` v1 → v2 in the `meta` CF): every legacy agent record is rewritten to the nearest tier (cpu ≤ 500m → small, ≤ 1000m → standard, else pro), `confidential_vm` isolation, and sealed storage under `swarm/agents/{id}/state-key`. The pass is idempotent and crash-safe (the version bump lands last). The gateway then backfills missing state DEKs in the KBS for migrated agents — put-if-absent, never overwriting an existing DEK. Check the gateway logs for `Store schema migration complete` and `DEK backfill pass complete`; failures of the backfill retry on the next restart.
+3. **Enable the rolling pod migration.** Add `MIGRATION_RECREATE_LEGACY_PODS: "true"` to the `aura-swarm-config` ConfigMap (the scheduler deployment reads it via an optional `configMapKeyRef`) and restart the scheduler. The desired-state reconciler then treats any pod whose `runtimeClassName` mismatches its (now confidential) spec as stale and replaces **one pod per ~30s pass**, so the fleet drains off `kata-fc` gradually. On each recreated pod's first sealed boot the harness performs the atomic, resumable encrypt-in-place state migration (copy → fsync → swap → `.aura-sealed` marker → delete plaintext backup). Hibernating/stopped agents migrate on their next wake/start.
+4. **Verify convergence.** Run `./10-verify-redeploy.sh` (or `--skip-deploy` for checks only). Beyond the usual identity/digest proofs it now asserts the R2 end state: gateway reports `schema_version: 2` on `/internal/health`, every `swarm-agent` pod is on `kata-qemu-snp`, and no pod remains on `kata-fc`. While step 3 is still in flight, `REDEPLOY_VERIFY_SKIP_R2_CHECKS=true` skips these checks.
+5. **Rollback (if needed).** Restore the EFS recovery point from step 1, redeploy the previous gateway/scheduler images, and unset `MIGRATION_RECREATE_LEGACY_PODS`. A v1 database restored from backup will simply re-run the migration on the next R2 gateway start.
+
+After the fleet converges, R3 removes the legacy code paths (`MicroVM`, optional tier, plaintext state) and retires the `kata-fc` RuntimeClass and old node group.
+
 ## Normal Redeploy
 Run `./08-deploy-k8s.sh` for a normal redeploy. This path updates Kubernetes manifests in place and preserves stored swarm data.
 

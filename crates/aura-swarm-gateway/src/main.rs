@@ -89,6 +89,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(path = %data_dir, "Opening RocksDB store");
     let store = Arc::new(RocksStore::open(&data_dir)?);
 
+    // Swarm TEE upgrade R2: run pending schema migrations (v1 -> v2
+    // rewrites legacy agent records to tiered/sealed) before anything
+    // is served. A failure here aborts startup — serving against an
+    // unmigrated store would mix legacy and tiered behavior.
+    let migration = aura_swarm_store::migrations::run(&store)?;
+    if migration.agents_migrated > 0 {
+        tracing::info!(
+            from_version = migration.from_version,
+            to_version = migration.to_version,
+            agents_migrated = migration.agents_migrated,
+            "Store schema migration complete"
+        );
+    } else {
+        tracing::info!(
+            schema_version = migration.to_version,
+            "Store schema is current"
+        );
+    }
+
     let scheduler_client = match scheduler_url {
         Some(url) => {
             tracing::info!(scheduler_url = %url, "Scheduler integration enabled");
@@ -138,6 +157,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(0) => tracing::debug!("No stale Running agents to reconcile"),
         Ok(n) => tracing::info!(count = n, "Reconciled stale Running agents → Idle"),
         Err(e) => tracing::warn!(error = %e, "Failed to reconcile idle agents on startup"),
+    }
+
+    // R2 post-migration reconciliation: agents the v1 -> v2 migration
+    // marked as sealed have no DEK in the KBS yet — provision the
+    // missing ones (put-if-absent; an existing DEK is never touched).
+    // Failures are non-fatal: the pass reruns on every startup.
+    match control.backfill_missing_deks().await {
+        Ok(summary) if summary.provisioned > 0 || summary.failed > 0 => tracing::info!(
+            sealed_agents = summary.sealed_agents,
+            provisioned = summary.provisioned,
+            already_present = summary.already_present,
+            failed = summary.failed,
+            "DEK backfill pass complete"
+        ),
+        Ok(summary) => tracing::debug!(
+            sealed_agents = summary.sealed_agents,
+            "DEK backfill: nothing to do"
+        ),
+        Err(e) => tracing::warn!(error = %e, "DEK backfill pass failed; will retry next startup"),
     }
 
     #[cfg(feature = "dev-mode")]

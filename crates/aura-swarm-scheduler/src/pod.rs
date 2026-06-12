@@ -715,15 +715,19 @@ mod tests {
         assert_eq!(container_sec.allow_privilege_escalation, Some(false));
     }
 
-    /// CRITICAL dual-mode invariant (TEE upgrade R1): a legacy agent
-    /// (tier == None, MicroVM isolation) must produce a pod spec identical
-    /// to the pre-upgrade scheduler's output — no new env vars, node
-    /// selectors, tolerations, or reordered fields. Any diff here would
-    /// make the desired-state reconciler churn every legacy pod.
+    /// Dual-mode invariant (TEE upgrade R1; R2 has shipped): a legacy
+    /// agent record (tier == None, MicroVM isolation) must produce a pod
+    /// spec identical to the pre-upgrade scheduler's output — no new env
+    /// vars, node selectors, tolerations, or reordered fields.
     ///
-    /// The expected value below is a frozen snapshot of the pod spec shape
-    /// as of the pre-TEE-upgrade scheduler. Do not update it to "fix" this
-    /// test unless legacy pods are intentionally being changed (R2+).
+    /// Status after R2: the startup store migration rewrites every legacy
+    /// record to a tiered/sealed spec, so a healthy migrated deployment
+    /// never builds this pod shape anymore. The path (and this frozen
+    /// snapshot) is kept for **un-migrated DBs** — e.g. a v1 database
+    /// restored from the EFS/PVC backup taken before R2 — where the
+    /// scheduler may still serve legacy specs until the gateway migration
+    /// runs. The expected value below remains the frozen pre-TEE-upgrade
+    /// snapshot; both the path and this test are deleted in R3.
     #[test]
     fn legacy_pod_spec_is_byte_for_byte_unchanged() {
         let agent_id = AgentId::from_hex("00112233445566778899aabbccddeeff").unwrap();

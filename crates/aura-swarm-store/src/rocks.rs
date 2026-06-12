@@ -26,7 +26,9 @@ pub const LOG_SNAPSHOTS_PER_AGENT_CAP: usize = 5;
 
 /// RocksDB-backed storage implementation.
 pub struct RocksStore {
-    db: Arc<DBWithThreadMode<MultiThreaded>>,
+    /// Crate-visible so `crate::migrations` can iterate/rewrite raw
+    /// records and manage the `meta` CF without widening the public API.
+    pub(crate) db: Arc<DBWithThreadMode<MultiThreaded>>,
 }
 
 impl RocksStore {
@@ -52,10 +54,36 @@ impl RocksStore {
     }
 
     /// Get a column family handle.
-    fn cf(&self, name: &str) -> Result<Arc<BoundColumnFamily<'_>>> {
+    pub(crate) fn cf(&self, name: &str) -> Result<Arc<BoundColumnFamily<'_>>> {
         self.db
             .cf_handle(name)
             .ok_or_else(|| StoreError::Database(format!("column family not found: {name}")))
+    }
+
+    /// Read the on-disk schema version from the `meta` CF.
+    ///
+    /// A database without the key is schema v1 (pre-R2). See
+    /// [`crate::migrations`] for how the version is advanced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails or the stored
+    /// value is not a big-endian `u32`.
+    pub fn read_schema_version(&self) -> Result<u32> {
+        let cf = self.cf(cf::META)?;
+        match self
+            .db
+            .get_cf(&cf, crate::migrations::SCHEMA_VERSION_KEY)
+            .map_err(|e| StoreError::Database(e.to_string()))?
+        {
+            Some(bytes) => {
+                let arr: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
+                    StoreError::Database("invalid schema_version bytes in meta CF".to_string())
+                })?;
+                Ok(u32::from_be_bytes(arr))
+            }
+            None => Ok(crate::migrations::SCHEMA_VERSION_V1),
+        }
     }
 
     /// Serialize a value using CBOR.
@@ -273,6 +301,10 @@ impl Store for RocksStore {
         }
 
         Ok(agents)
+    }
+
+    fn schema_version(&self) -> Result<u32> {
+        self.read_schema_version()
     }
 
     // =========================================================================

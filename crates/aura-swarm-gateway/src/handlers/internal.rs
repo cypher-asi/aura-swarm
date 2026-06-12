@@ -128,7 +128,10 @@ where
 
 /// `GET /internal/health`
 ///
-/// Internal health check for service-to-service probes.
+/// Internal health check for service-to-service probes. Reports the
+/// store's `schema_version` (R2) so deploy verification can prove the
+/// v1 → v2 migration ran; `null` if the store read fails (the probe
+/// itself stays healthy).
 pub(crate) async fn internal_health<C, V>(
     State(state): State<Arc<GatewayState<C, V>>>,
     headers: HeaderMap,
@@ -138,7 +141,14 @@ where
     V: JwtValidator + 'static,
 {
     require_internal_auth(&state, &headers)?;
-    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
+    let schema_version = state.control.schema_version().await.ok();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "schema_version": schema_version,
+        })),
+    ))
 }
 
 /// Compact representation of an agent for internal reconciliation and deploy checks.

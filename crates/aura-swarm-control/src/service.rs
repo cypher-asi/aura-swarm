@@ -33,6 +33,21 @@ fn event_pricing(spec: &aura_swarm_store::AgentSpec) -> (Option<String>, Option<
     (spec.tier.clone(), price)
 }
 
+/// Outcome of the R2 startup DEK backfill
+/// ([`ControlPlaneService::backfill_missing_deks`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DekBackfillSummary {
+    /// Agents whose spec declares sealed storage.
+    pub sealed_agents: u32,
+    /// DEKs newly provisioned by this pass.
+    pub provisioned: u32,
+    /// DEKs that were already registered (untouched).
+    pub already_present: u32,
+    /// Agents skipped due to a failed provision or an indeterminate
+    /// existence check (retried on next startup).
+    pub failed: u32,
+}
+
 /// Run a blocking store operation off the async runtime.
 async fn blocking_store<S, F, T>(store: &Arc<S>, f: F) -> Result<T>
 where
@@ -326,6 +341,16 @@ pub trait ControlPlane: Send + Sync {
     /// identities, including hibernating, stopped, and error agents.
     async fn list_all_agents(&self) -> Result<Vec<Agent>>;
 
+    /// The store's on-disk schema version (Swarm TEE upgrade R2).
+    ///
+    /// Exposed through `/internal/health` so deploy verification can
+    /// prove the v1 → v2 migration ran (2 = tiered/sealed fleet).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store read fails.
+    async fn schema_version(&self) -> Result<u32>;
+
     // =========================================================================
     // Process Triggers (Swarm TEE upgrade phase 8)
     // =========================================================================
@@ -551,6 +576,82 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
                 }
             }
         }
+    }
+
+    /// R2 post-migration reconciliation: ensure every sealed agent has a
+    /// state DEK registered in the KBS, provisioning the missing ones.
+    ///
+    /// The v1 → v2 store migration marks legacy agents as sealed without
+    /// touching the KBS, so on the first post-migration startup those
+    /// agents have no DEK yet — their first sealed boot would fail
+    /// attestation-gated key release. This pass backfills them.
+    ///
+    /// Put-if-absent semantics: Trustee's resource POST is an
+    /// unconditional overwrite and cannot report "exists", so the client
+    /// GETs first ([`KbsClient::dek_exists`]) and only provisions on a
+    /// definitive 404. An existing DEK is **never** overwritten
+    /// (overwriting would brick the agent's sealed state), and an
+    /// indeterminate existence check (auth/transport error) skips the
+    /// agent with a loud log instead of provisioning blind.
+    ///
+    /// Per-agent failures are counted, logged, and do not abort the
+    /// pass; rerunning at next startup converges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the agent listing itself fails.
+    pub async fn backfill_missing_deks(&self) -> Result<DekBackfillSummary> {
+        let mut summary = DekBackfillSummary::default();
+
+        let Some(kbs) = &self.kbs else {
+            tracing::debug!("DEK backfill skipped: no KBS client configured");
+            return Ok(summary);
+        };
+
+        let agents = blocking_store(&self.store, move |s| Ok(s.list_all_agents()?)).await?;
+
+        for agent in agents {
+            let Some(encryption) = &agent.spec.storage_encryption else {
+                continue;
+            };
+            summary.sealed_agents += 1;
+            let key_id = encryption.key_id();
+
+            match kbs.dek_exists(key_id).await {
+                Ok(true) => summary.already_present += 1,
+                Ok(false) => match kbs.provision_dek(key_id).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            agent_id = %agent.agent_id,
+                            key_id = %key_id,
+                            "DEK backfill: provisioned missing state DEK"
+                        );
+                        summary.provisioned += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %agent.agent_id,
+                            key_id = %key_id,
+                            error = %e,
+                            "DEK backfill: provisioning failed; will retry next startup"
+                        );
+                        summary.failed += 1;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent.agent_id,
+                        key_id = %key_id,
+                        error = %e,
+                        "DEK backfill: existence check indeterminate; skipping \
+                         (never provisioning blind over a possibly-existing DEK)"
+                    );
+                    summary.failed += 1;
+                }
+            }
+        }
+
+        Ok(summary)
     }
 
     /// Check billing credits for agent creation at the given tier's rate.
@@ -1692,6 +1793,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         blocking_store(&self.store, move |s| Ok(s.list_all_agents()?)).await
     }
 
+    async fn schema_version(&self) -> Result<u32> {
+        blocking_store(&self.store, move |s| Ok(s.schema_version()?)).await
+    }
+
     // =========================================================================
     // Process Triggers (Swarm TEE upgrade phase 8)
     // =========================================================================
@@ -1783,18 +1888,36 @@ mod tests {
     use tempfile::TempDir;
 
     /// Mock KBS client recording provision/revoke calls, optionally failing
-    /// provisioning to exercise create rollback.
+    /// provisioning to exercise create rollback. `existing` simulates DEKs
+    /// already registered in the KBS (for the R2 backfill tests);
+    /// `fail_exists` makes the existence check indeterminate.
     #[derive(Default)]
     struct MockKbsClient {
         provisioned: Mutex<Vec<String>>,
         revoked: Mutex<Vec<String>>,
+        existing: Mutex<Vec<String>>,
         fail_provision: bool,
+        fail_exists: bool,
     }
 
     impl MockKbsClient {
         fn failing() -> Self {
             Self {
                 fail_provision: true,
+                ..Self::default()
+            }
+        }
+
+        fn with_existing(keys: Vec<String>) -> Self {
+            Self {
+                existing: Mutex::new(keys),
+                ..Self::default()
+            }
+        }
+
+        fn failing_exists() -> Self {
+            Self {
+                fail_exists: true,
                 ..Self::default()
             }
         }
@@ -1816,6 +1939,17 @@ mod tests {
             }
             self.provisioned.lock().unwrap().push(key_id.to_string());
             Ok(())
+        }
+
+        async fn dek_exists(&self, key_id: &str) -> Result<bool> {
+            if self.fail_exists {
+                return Err(ControlError::Internal(
+                    "KBS existence check failed".to_string(),
+                ));
+            }
+            let pre_existing = self.existing.lock().unwrap().iter().any(|k| k == key_id);
+            let provisioned = self.provisioned.lock().unwrap().iter().any(|k| k == key_id);
+            Ok(pre_existing || provisioned)
         }
 
         async fn revoke_dek(&self, key_id: &str) -> Result<()> {
@@ -2194,6 +2328,159 @@ mod tests {
 
         assert!(kbs.provisioned().is_empty(), "legacy agents make no KBS calls");
         assert!(kbs.revoked().is_empty(), "legacy agents make no KBS calls");
+    }
+
+    // =====================================================================
+    // R2 DEK backfill (post-migration reconciliation)
+    // =====================================================================
+
+    /// Insert a sealed agent record directly, simulating a record the
+    /// v1 → v2 store migration produced (sealed spec, no DEK in the KBS).
+    fn put_sealed_agent(
+        service: &ControlPlaneService<RocksStore, NoopSchedulerClient>,
+        user_id: UserId,
+        status: AgentState,
+    ) -> Agent {
+        let agent_id = AgentId::generate();
+        let now = Utc::now();
+        let agent = Agent {
+            agent_id,
+            user_id,
+            name: "migrated-agent".to_string(),
+            status,
+            spec: BoxTier::Standard.to_spec(&agent_id, "latest"),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: None,
+            error_message: None,
+        };
+        service.store.put_agent(&agent).unwrap();
+        agent
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_provisions_missing_and_skips_plaintext() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let migrated = put_sealed_agent(&service, user_id, AgentState::Hibernating);
+
+        // A plaintext record (no storage_encryption) must be ignored —
+        // possible on a v1 DB restored from backup before migration runs.
+        let now = Utc::now();
+        let plaintext = Agent {
+            agent_id: AgentId::generate(),
+            user_id,
+            name: "plaintext".to_string(),
+            status: AgentState::Stopped,
+            spec: aura_swarm_store::AgentSpec::default(),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: None,
+            error_message: None,
+        };
+        service.store.put_agent(&plaintext).unwrap();
+
+        let summary = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(summary.sealed_agents, 1);
+        assert_eq!(summary.provisioned, 1);
+        assert_eq!(summary.already_present, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            kbs.provisioned(),
+            vec![format!("swarm/agents/{}/state-key", migrated.agent_id)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_never_overwrites_existing_dek() {
+        let (mut service, _dir, user_id) = setup();
+        let agent = put_sealed_agent(&service, user_id, AgentState::Running);
+
+        let existing_key = format!("swarm/agents/{}/state-key", agent.agent_id);
+        let kbs = Arc::new(MockKbsClient::with_existing(vec![existing_key]));
+        service.set_kbs(Arc::clone(&kbs) as Arc<dyn KbsClient>);
+
+        let summary = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(summary.sealed_agents, 1);
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(summary.provisioned, 0);
+        assert!(
+            kbs.provisioned().is_empty(),
+            "an existing DEK must never be re-provisioned (overwrite would brick sealed state)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_skips_on_indeterminate_existence() {
+        let (mut service, _dir, user_id) = setup();
+        put_sealed_agent(&service, user_id, AgentState::Running);
+
+        let kbs = Arc::new(MockKbsClient::failing_exists());
+        service.set_kbs(Arc::clone(&kbs) as Arc<dyn KbsClient>);
+
+        let summary = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(summary.sealed_agents, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.provisioned, 0);
+        assert!(
+            kbs.provisioned().is_empty(),
+            "unknown existence must never provision blind"
+        );
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_is_idempotent_across_reruns() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+        put_sealed_agent(&service, user_id, AgentState::Hibernating);
+
+        let first = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(first.provisioned, 1);
+
+        // The mock reports provisioned keys as existing, mirroring the
+        // real KBS after the first pass.
+        let second = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(second.provisioned, 0);
+        assert_eq!(second.already_present, 1);
+        assert_eq!(kbs.provisioned().len(), 1, "exactly one provision ever");
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_provision_failure_counts_and_continues() {
+        let (mut service, _dir, user_id) = setup();
+        put_sealed_agent(&service, user_id, AgentState::Hibernating);
+
+        // dek_exists answers definitively (absent) but provisioning fails:
+        // the agent is counted failed and retried on the next startup.
+        let kbs = Arc::new(MockKbsClient::failing());
+        service.set_kbs(Arc::clone(&kbs) as Arc<dyn KbsClient>);
+
+        let summary = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(summary.sealed_agents, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.provisioned, 0);
+    }
+
+    #[tokio::test]
+    async fn dek_backfill_without_kbs_is_a_noop() {
+        let (service, _dir, user_id) = setup();
+        put_sealed_agent(&service, user_id, AgentState::Hibernating);
+
+        let summary = service.backfill_missing_deks().await.unwrap();
+        assert_eq!(summary, DekBackfillSummary::default());
+    }
+
+    #[tokio::test]
+    async fn schema_version_reported_through_control_plane() {
+        let (service, _dir, _user_id) = setup();
+        // Fresh test DBs are at v1 until the gateway runs migrations.
+        assert_eq!(service.schema_version().await.unwrap(), 1);
+        aura_swarm_store::migrations::run(service.store()).unwrap();
+        assert_eq!(
+            service.schema_version().await.unwrap(),
+            aura_swarm_store::CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[tokio::test]

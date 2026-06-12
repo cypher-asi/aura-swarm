@@ -37,11 +37,13 @@
 
 pub mod error;
 pub mod keys;
+pub mod migrations;
 pub mod rocks;
 pub mod schema;
 pub mod types;
 
 pub use error::{Result, StoreError};
+pub use migrations::{MigrationSummary, CURRENT_SCHEMA_VERSION};
 pub use rocks::RocksStore;
 pub use rocks::LOG_SNAPSHOTS_PER_AGENT_CAP;
 pub use types::{
@@ -140,6 +142,20 @@ pub trait Store: Send + Sync {
     ///
     /// Returns an error if the database operation fails.
     fn list_all_agents(&self) -> Result<Vec<Agent>>;
+
+    /// The on-disk schema version (Swarm TEE upgrade R2).
+    ///
+    /// `RocksDB` stores report the persisted `schema_version` from the
+    /// `meta` CF (missing key = v1). The default implementation reports
+    /// [`migrations::CURRENT_SCHEMA_VERSION`], which is correct for
+    /// in-memory / test stores that are born at the current schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn schema_version(&self) -> Result<u32> {
+        Ok(migrations::CURRENT_SCHEMA_VERSION)
+    }
 
     // =========================================================================
     // Session Operations

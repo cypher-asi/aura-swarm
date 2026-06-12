@@ -92,7 +92,7 @@ pub use kbs::{HttpKbsClient, KbsClient, KbsConfig, NoopKbsClient};
 pub use scheduler_client::{
     HttpSchedulerClient, NoopSchedulerClient, PodStatusResponse, SchedulerClient,
 };
-pub use service::{ControlPlane, ControlPlaneService};
+pub use service::{ControlPlane, ControlPlaneService, DekBackfillSummary};
 pub use triggers::TriggerRegistration;
 pub use types::{
     AgentLogEntry, AgentStatus, ControlConfig, CreateAgentRequest, LogOptions, LogSource,

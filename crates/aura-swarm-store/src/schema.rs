@@ -36,6 +36,11 @@ pub mod cf {
     /// agent (oldest snapshots pruned on insert) — see
     /// `LOG_SNAPSHOTS_PER_AGENT_CAP` in the rocks implementation.
     pub const AGENT_LOGS: &str = "agent_logs";
+
+    /// Database-level metadata (Swarm TEE upgrade R2). Holds the
+    /// `schema_version` key (big-endian `u32`); a database without the
+    /// key is schema v1 (pre-migration). See `crate::migrations`.
+    pub const META: &str = "meta";
 }
 
 /// Returns all column family names for database initialization.
@@ -55,6 +60,7 @@ pub fn all_column_families() -> Vec<&'static str> {
         cf::PROCESS_TRIGGERS,
         cf::USAGE_EVENTS,
         cf::AGENT_LOGS,
+        cf::META,
     ]
 }
 
@@ -77,6 +83,7 @@ mod tests {
                 cf::PROCESS_TRIGGERS,
                 cf::USAGE_EVENTS,
                 cf::AGENT_LOGS,
+                cf::META,
             ]
         );
     }

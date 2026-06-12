@@ -45,8 +45,9 @@ pub trait Scheduler: Send + Sync {
     /// Terminate an agent pod.
     ///
     /// `reason` records why the pod is going away (e.g. `terminated`,
-    /// `hibernate`, `stop`, `tier_change`, `stale_image`); it is attached
-    /// to the final-tail log snapshot shipped to the gateway.
+    /// `hibernate`, `stop`, `tier_change`, `stale_image`,
+    /// `stale_runtime_class`); it is attached to the final-tail log
+    /// snapshot shipped to the gateway.
     ///
     /// # Errors
     ///
@@ -539,6 +540,9 @@ impl K8sScheduler {
     /// - Creates pods for agents that are missing one
     /// - Deletes (one at a time) pods running a stale container image so the
     ///   next cycle recreates them with the current image
+    /// - When `MIGRATION_RECREATE_LEGACY_PODS` is set (R2), likewise deletes
+    ///   pods whose runtime class mismatches the desired spec, rolling
+    ///   legacy kata-fc pods onto SNP one at a time
     async fn run_desired_state_reconciler(&self) {
         // Give the pod watcher time to populate before the first periodic tick;
         // the initial sync is already handled via InitDone.
@@ -643,6 +647,40 @@ impl K8sScheduler {
                             }
                         }
                     }
+
+                    // R2 migration gate: a pod whose runtime class no longer
+                    // matches the desired spec (legacy kata-fc pod after the
+                    // store migration assigned a confidential spec) is stale
+                    // too. Shares the one-per-pass pacing with stale-image
+                    // replacement so the fleet rolls onto SNP gradually.
+                    if !stale_deleted
+                        && Self::pod_runtime_class_is_stale(&self.config, pod, &agent_info.spec)
+                    {
+                        let pod_name = pod.metadata.name.as_deref().unwrap_or("unknown");
+                        info!(
+                            agent_id = %agent_info.agent_id,
+                            pod_name,
+                            pod_runtime_class = ?pod.spec.as_ref()
+                                .and_then(|s| s.runtime_class_name.as_deref()),
+                            desired_runtime_class = ?Self::desired_runtime_class(
+                                &self.config,
+                                &agent_info.spec
+                            ),
+                            "Desired-state reconciler: deleting pod with stale runtime class \
+                             (R2 migration)"
+                        );
+                        if let Err(e) =
+                            self.terminate_agent(&agent_id, "stale_runtime_class").await
+                        {
+                            error!(
+                                agent_id = %agent_info.agent_id,
+                                error = %e,
+                                "Desired-state reconciler: failed to delete legacy-runtime pod"
+                            );
+                        } else {
+                            stale_deleted = true;
+                        }
+                    }
                 }
             }
         }
@@ -701,6 +739,39 @@ impl K8sScheduler {
         let container = pod.spec.as_ref()?.containers.first()?;
         let pod_image = container.image.as_deref()?;
         Some(pod_image != self.config.image)
+    }
+
+    /// The runtime class a pod built from `spec` would get under `config`
+    /// (`None` = default container runtime). Mirrors `pod::build_pod`.
+    fn desired_runtime_class(config: &SchedulerConfig, spec: &AgentSpec) -> Option<&'static str> {
+        spec.isolation
+            .unwrap_or(config.default_isolation)
+            .runtime_class()
+    }
+
+    /// R2 migration check: should the reconciler recreate `pod` because
+    /// its `runtimeClassName` no longer matches the desired spec?
+    ///
+    /// Gated on `config.migration_recreate_legacy_pods`
+    /// (`MIGRATION_RECREATE_LEGACY_PODS`): when the gate is off (R1
+    /// dual-mode), runtime-class mismatches are deliberately ignored so
+    /// legacy pods are never churned. When on (R2), a mismatch — e.g. a
+    /// kata-fc pod whose agent record now carries a confidential spec —
+    /// marks the pod stale so it rolling-recreates onto SNP nodes. A pod
+    /// without a spec is never recreated from here (the missing-pod path
+    /// handles genuinely broken pods).
+    fn pod_runtime_class_is_stale(
+        config: &SchedulerConfig,
+        pod: &Pod,
+        spec: &AgentSpec,
+    ) -> bool {
+        if !config.migration_recreate_legacy_pods {
+            return false;
+        }
+        let Some(pod_spec) = pod.spec.as_ref() else {
+            return false;
+        };
+        pod_spec.runtime_class_name.as_deref() != Self::desired_runtime_class(config, spec)
     }
 
     async fn handle_pod_update(&self, pod: &Pod) {
@@ -2066,6 +2137,123 @@ mod tests {
     fn is_pod_ready_false_when_no_status() {
         let pod = Pod::default();
         assert!(!K8sScheduler::is_pod_ready(&pod));
+    }
+
+    // =========================================================================
+    // R2 runtime-class staleness (reconciler migration gate)
+    //
+    // `pod_runtime_class_is_stale` drives the rolling recreation of legacy
+    // kata-fc pods onto SNP after the v1 -> v2 store migration. It must be
+    // inert unless MIGRATION_RECREATE_LEGACY_PODS is set, so R1 deployments
+    // never churn legacy pods.
+    // =========================================================================
+
+    fn pod_with_runtime_class(runtime_class: Option<&str>) -> Pod {
+        Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                runtime_class_name: runtime_class.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A spec as rewritten by the R2 store migration: confidential VM.
+    fn confidential_spec() -> AgentSpec {
+        let agent_id = test_agent_id();
+        BoxTier::Standard.to_spec(&agent_id, "latest")
+    }
+
+    /// A legacy spec (isolation defaults to the scheduler's MicroVM).
+    fn legacy_spec() -> AgentSpec {
+        AgentSpec::default()
+    }
+
+    fn migration_config(gate_on: bool) -> SchedulerConfig {
+        SchedulerConfig {
+            migration_recreate_legacy_pods: gate_on,
+            ..SchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn runtime_class_mismatch_ignored_when_gate_off() {
+        // R1 behavior: a kata-fc pod under a confidential desired spec is
+        // NOT stale while the migration gate is off.
+        let config = migration_config(false);
+        let pod = pod_with_runtime_class(Some("kata-fc"));
+        assert!(!K8sScheduler::pod_runtime_class_is_stale(
+            &config,
+            &pod,
+            &confidential_spec()
+        ));
+    }
+
+    #[test]
+    fn runtime_class_mismatch_is_stale_when_gate_on() {
+        // R2 behavior: the same kata-fc pod becomes stale once the gate is
+        // on, so the reconciler rolling-recreates it onto kata-qemu-snp.
+        let config = migration_config(true);
+        let pod = pod_with_runtime_class(Some("kata-fc"));
+        assert!(K8sScheduler::pod_runtime_class_is_stale(
+            &config,
+            &pod,
+            &confidential_spec()
+        ));
+    }
+
+    #[test]
+    fn matching_runtime_class_is_never_stale() {
+        let config = migration_config(true);
+
+        // Confidential pod already on SNP.
+        let snp_pod = pod_with_runtime_class(Some("kata-qemu-snp"));
+        assert!(!K8sScheduler::pod_runtime_class_is_stale(
+            &config,
+            &snp_pod,
+            &confidential_spec()
+        ));
+
+        // Legacy pod whose record is (still) legacy: default isolation is
+        // MicroVM -> kata-fc, which matches, so an un-migrated DB does not
+        // churn pods even with the gate on.
+        let fc_pod = pod_with_runtime_class(Some("kata-fc"));
+        assert!(!K8sScheduler::pod_runtime_class_is_stale(
+            &config,
+            &fc_pod,
+            &legacy_spec()
+        ));
+    }
+
+    #[test]
+    fn runtime_class_staleness_handles_missing_pod_spec() {
+        let config = migration_config(true);
+        let pod = Pod::default();
+        assert!(
+            !K8sScheduler::pod_runtime_class_is_stale(&config, &pod, &confidential_spec()),
+            "a pod without a spec must not be recreated from the runtime-class path"
+        );
+
+        // Container-isolation desired spec (None runtime class) vs a pod
+        // with an explicit runtime class IS a mismatch when gated.
+        let mut spec = legacy_spec();
+        spec.isolation = Some(aura_swarm_store::IsolationLevel::Container);
+        let pod = pod_with_runtime_class(Some("kata-fc"));
+        assert!(K8sScheduler::pod_runtime_class_is_stale(&config, &pod, &spec));
+    }
+
+    #[test]
+    fn desired_runtime_class_mirrors_pod_builder() {
+        let config = SchedulerConfig::default();
+        assert_eq!(
+            K8sScheduler::desired_runtime_class(&config, &confidential_spec()),
+            Some("kata-qemu-snp")
+        );
+        // Legacy spec falls back to the scheduler default (MicroVM).
+        assert_eq!(
+            K8sScheduler::desired_runtime_class(&config, &legacy_spec()),
+            Some("kata-fc")
+        );
     }
 
     // =========================================================================

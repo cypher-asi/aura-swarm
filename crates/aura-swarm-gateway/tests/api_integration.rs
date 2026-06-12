@@ -83,6 +83,13 @@ async fn internal_health_returns_200() {
     resp.assert_status_ok();
     let body: Value = resp.json();
     assert_eq!(body["status"], "ok");
+    // R2: the store schema version is exposed for deploy verification.
+    // The test app opens a fresh store without running migrations, so
+    // it reports v1; production runs migrations at startup and reports 2.
+    assert!(
+        body["schema_version"].is_u64(),
+        "internal health must report schema_version: {body}"
+    );
 }
 
 #[tokio::test]

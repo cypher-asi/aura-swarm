@@ -147,6 +147,18 @@ pub struct SchedulerConfig {
     /// not receive this variable.
     #[serde(default = "default_kbs_url")]
     pub kbs_url: String,
+    /// Swarm TEE upgrade R2 migration gate
+    /// (`MIGRATION_RECREATE_LEGACY_PODS`, default `false`).
+    ///
+    /// When `true`, the desired-state reconciler treats a running pod
+    /// whose `runtimeClassName` differs from the desired spec's runtime
+    /// class as stale and rolling-recreates it (one per pass, same
+    /// pacing as stale-image replacement) — this is how legacy kata-fc
+    /// pods move onto SNP nodes after the store migration assigns them
+    /// confidential specs. When `false` (R1 behavior), runtime-class
+    /// mismatches are ignored so legacy pods are never churned.
+    #[serde(default)]
+    pub migration_recreate_legacy_pods: bool,
 }
 
 fn default_kbs_url() -> String {
@@ -172,6 +184,7 @@ impl Default for SchedulerConfig {
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
             kbs_url: default_kbs_url(),
+            migration_recreate_legacy_pods: false,
         }
     }
 }
@@ -206,6 +219,9 @@ impl SchedulerConfig {
     /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
     /// - `KBS_URL`: Trustee KBS URL injected into confidential agent pods
     ///   as `AURA_KBS_URL`
+    /// - `MIGRATION_RECREATE_LEGACY_PODS`: R2 gate — when `1`/`true`, the
+    ///   reconciler recreates pods whose runtime class mismatches the
+    ///   desired spec (rolling legacy pods onto SNP)
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -273,6 +289,10 @@ impl SchedulerConfig {
         if let Ok(val) = std::env::var("KBS_URL") {
             config.kbs_url = val;
         }
+        if let Ok(val) = std::env::var("MIGRATION_RECREATE_LEGACY_PODS") {
+            let v = val.trim();
+            config.migration_recreate_legacy_pods = v == "1" || v.eq_ignore_ascii_case("true");
+        }
 
         config
     }
@@ -337,6 +357,10 @@ mod tests {
         assert_eq!(
             config.kbs_url,
             "http://kbs.swarm-system.svc.cluster.local:8080"
+        );
+        assert!(
+            !config.migration_recreate_legacy_pods,
+            "R2 legacy-pod recreation must be opt-in (R1 default off)"
         );
     }
 

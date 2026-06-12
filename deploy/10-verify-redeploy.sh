@@ -27,6 +27,11 @@ RUN_DEPLOY=true
 DEPLOY_ARGS=()
 POLL_SECS="${REDEPLOY_VERIFY_POLL_SECS:-15}"
 KEEP_EVIDENCE="${REDEPLOY_VERIFY_KEEP_EVIDENCE:-false}"
+# R2 (Swarm TEE migration) convergence checks: all agent pods on
+# kata-qemu-snp, none on kata-fc, gateway schema_version == 2. Set to
+# "true" only during the transition window before the R2 rollout
+# (MIGRATION_RECREATE_LEGACY_PODS) has completed.
+SKIP_R2_CHECKS="${REDEPLOY_VERIFY_SKIP_R2_CHECKS:-false}"
 
 usage() {
     echo "Usage: $0 [--skip-deploy] [--recreate-agents|--no-recreate-agents]"
@@ -352,6 +357,78 @@ compare_active_agents() {
     fi
 }
 
+# R2 (Swarm TEE migration) convergence proof:
+# - the gateway reports store schema_version 2 (v1 -> v2 migration ran),
+# - every swarm-agent pod runs on runtimeClassName kata-qemu-snp,
+# - no swarm-agent pod is left on the legacy kata-fc runtime class.
+verify_r2_convergence() {
+    echo ""
+    echo -e "${CYAN}R2 Migration Convergence Check${NC}"
+
+    if [[ "${SKIP_R2_CHECKS}" == "true" ]]; then
+        echo -e "${YELLOW}⚠${NC} Skipping R2 checks (REDEPLOY_VERIFY_SKIP_R2_CHECKS=true)."
+        echo "    Use this only while the MIGRATION_RECREATE_LEGACY_PODS rollout is still in flight."
+        return 0
+    fi
+
+    local failures=0
+
+    # 1) Store schema version via the gateway internal health endpoint.
+    start_port_forward
+    local schema_version
+    schema_version=$(redeploy_internal_get "/internal/health" | jq -r '.schema_version // "null"')
+    stop_port_forward
+    if [[ "${schema_version}" == "2" ]]; then
+        echo -e "${GREEN}✓${NC} Gateway reports store schema_version 2 (records migrated to tiered/sealed)"
+    else
+        echo -e "${RED}✗${NC} Gateway reports schema_version=${schema_version} (expected 2)."
+        echo "    The v1 -> v2 startup migration has not completed; check gateway logs."
+        failures=$((failures + 1))
+    fi
+
+    # 2) Runtime classes of every swarm-agent pod.
+    local runtime_classes_json="${TMP_DIR}/pod-runtime-classes.json"
+    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json \
+        | jq '
+            [
+                .items[] | {
+                    agent_id: (.metadata.labels["swarm.io/agent-id"] // ""),
+                    pod_name: (.metadata.name // ""),
+                    runtime_class: (.spec.runtimeClassName // "<none>")
+                }
+            ] | sort_by(.agent_id, .pod_name)
+        ' > "${runtime_classes_json}"
+
+    local pod_count snp_count legacy_pods other_pods
+    pod_count=$(jq 'length' "${runtime_classes_json}")
+    snp_count=$(jq '[.[] | select(.runtime_class == "kata-qemu-snp")] | length' "${runtime_classes_json}")
+    legacy_pods=$(jq -r '.[] | select(.runtime_class == "kata-fc") | "  \(.agent_id)  \(.pod_name)"' "${runtime_classes_json}")
+    other_pods=$(jq -r '.[] | select(.runtime_class != "kata-qemu-snp" and .runtime_class != "kata-fc") | "  \(.agent_id)  \(.pod_name)  \(.runtime_class)"' "${runtime_classes_json}")
+
+    if [[ -n "${legacy_pods}" ]]; then
+        echo -e "${RED}✗${NC} Pods still on the legacy kata-fc runtime class:"
+        printf '%s\n' "${legacy_pods}"
+        echo "    Ensure MIGRATION_RECREATE_LEGACY_PODS=true on the scheduler and wait for the rolling recreation."
+        failures=$((failures + 1))
+    fi
+    if [[ -n "${other_pods}" ]]; then
+        echo -e "${RED}✗${NC} Pods on an unexpected runtime class:"
+        printf '%s\n' "${other_pods}"
+        failures=$((failures + 1))
+    fi
+    if [[ "${pod_count}" == "0" ]]; then
+        echo -e "${GREEN}✓${NC} No swarm-agent pods running (nothing to check for runtime class)"
+    elif [[ "${snp_count}" == "${pod_count}" ]]; then
+        echo -e "${GREEN}✓${NC} All ${pod_count} swarm-agent pod(s) on runtimeClassName kata-qemu-snp"
+    fi
+
+    if [[ "${failures}" != "0" ]]; then
+        echo ""
+        echo "R2 migration convergence check failed (${failures} issue(s))."
+        return 1
+    fi
+}
+
 echo "=============================================="
 echo "  Aura Swarm - Redeploy Verification"
 echo "=============================================="
@@ -409,6 +486,8 @@ else
     redeploy_verify_agent_ids_still_present "${PRE_ALL_JSON}" "${POST_ALL_JSON}" "Active AgentId"
 fi
 compare_active_agents "${PRE_ACTIVE_JSON}" "${POST_ACTIVE_JSON}" "${PRE_PODS_JSON}" "${POST_PODS_JSON}"
+
+verify_r2_convergence
 
 EXPECTED_DIGEST=$(get_expected_harness_digest || true)
 FINAL_DIGESTS=$(jq -r '[.[] | select(.digest != "") | .digest] | unique | join(", ")' "${POST_PODS_JSON}")
