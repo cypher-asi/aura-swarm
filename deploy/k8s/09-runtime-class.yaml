@@ -25,3 +25,23 @@ overhead:
   podFixed:
     memory: "160Mi"
     cpu: "250m"
+---
+# Kata with QEMU + AMD SEV-SNP (Confidential Containers, production)
+# Handler is installed on confidential nodes by the CoCo operator
+# (see 10-coco-ccruntime.yaml). Confidential agent pods carry a matching
+# toleration for the swarm.io/confidential-node:NoSchedule taint.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-snp
+handler: kata-qemu-snp
+overhead:
+  podFixed:
+    # QEMU/SNP guests are heavier than Firecracker microVMs (full QEMU,
+    # guest firmware, attestation agents). Initial estimate - to be
+    # measured on real SNP nodes and tuned.
+    memory: "512Mi"
+    cpu: "350m"
+scheduling:
+  nodeSelector:
+    swarm.io/confidential-node: "true"

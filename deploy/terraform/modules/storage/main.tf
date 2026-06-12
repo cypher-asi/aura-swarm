@@ -52,7 +52,9 @@ resource "aws_security_group" "efs" {
 
 resource "aws_efs_file_system" "main" {
   creation_token = "${var.resource_prefix}-efs"
-  encrypted      = var.encrypted
+  # Encryption at rest is mandatory: agent state (including sealed/confidential
+  # agent overlays) lives on this filesystem. Not configurable by design.
+  encrypted = true
 
   performance_mode = var.performance_mode
   throughput_mode  = var.throughput_mode

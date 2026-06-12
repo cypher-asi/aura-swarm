@@ -23,12 +23,6 @@ variable "private_subnet_cidrs" {
   type        = list(string)
 }
 
-variable "encrypted" {
-  description = "Enable encryption for EFS"
-  type        = bool
-  default     = true
-}
-
 variable "throughput_mode" {
   description = "EFS throughput mode (bursting or provisioned)"
   type        = string

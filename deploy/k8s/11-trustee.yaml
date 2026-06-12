@@ -1,0 +1,228 @@
+# Trustee (KBS + Attestation Service) for confidential agents
+#
+# Deploys the Confidential Containers Trustee Key Broker Service with the
+# built-in (in-process) Attestation Service into swarm-system. Confidential
+# agent pods attest against it at boot and fetch their per-agent state DEK.
+#
+# The service DNS name/port MUST stay in sync with the scheduler default:
+#   AURA_KBS_URL = http://kbs.swarm-system.svc.cluster.local:8080
+#
+# Admin auth: the kbs-auth-public-key secret (Ed25519 public key, kbs.pem) is
+# generated/created by ./08-deploy-k8s.sh; the matching private key stays in
+# .secrets/kbs-admin.key and is used by kbs-client for policy/resource admin.
+#
+# Attestation policy and reference values are deliberately left at defaults
+# here; they are configured alongside the DEK lifecycle work (R1 attest-boot
+# phase) via kbs-client.
+---
+# KBS runtime configuration (built-in CoCo Attestation Service)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbs-config
+  namespace: swarm-system
+  labels:
+    app: kbs
+data:
+  kbs-config.toml: |
+    [http_server]
+    sockets = ["0.0.0.0:8080"]
+    # Plain HTTP inside the cluster; the service is not exposed externally
+    # and agent<->KBS payloads are protected by the attestation protocol.
+    insecure_http = true
+
+    [attestation_token]
+    insecure_key = true
+
+    [attestation_service]
+    type = "coco_as_builtin"
+
+    [attestation_service.attestation_token_broker]
+    duration_min = 5
+
+    [attestation_service.rvps_config]
+    type = "BuiltIn"
+
+    [admin]
+    type = "Simple"
+
+    [[admin.personas]]
+    id = "admin"
+    public_key_path = "/kbs/kbs.pem"
+
+    [[plugins]]
+    name = "resource"
+    storage_backend_type = "kvstorage"
+
+    [storage_backend]
+    storage_type = "LocalFs"
+
+    [storage_backend.backends.local_fs]
+    dir_path = "/opt/confidential-containers/kbs"
+---
+# Persistent KBS resource repository (per-agent DEKs and policies survive
+# pod restarts; backed by the encrypted EFS filesystem)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kbs-repository
+  namespace: swarm-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbs
+  namespace: swarm-system
+  labels:
+    app: kbs
+spec:
+  # Single replica: LocalFs storage backend has no coordination between writers
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kbs
+  template:
+    metadata:
+      labels:
+        app: kbs
+    spec:
+      containers:
+        - name: kbs
+          image: ghcr.io/confidential-containers/key-broker-service:built-in-as-v0.20.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/kbs
+            - --config-file
+            - /etc/kbs/kbs-config.toml
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # KBS has no dedicated health endpoint; probe the listener socket
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: kbs-auth-public-key
+              mountPath: /kbs/
+              readOnly: true
+            - name: kbs-config
+              mountPath: /etc/kbs/
+              readOnly: true
+            - name: kbs-repository
+              mountPath: /opt/confidential-containers/kbs
+            - name: as-work-dir
+              mountPath: /opt/confidential-containers/attestation-service
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: kbs-auth-public-key
+          secret:
+            secretName: kbs-auth-public-key
+        - name: kbs-config
+          configMap:
+            name: kbs-config
+        - name: kbs-repository
+          persistentVolumeClaim:
+            claimName: kbs-repository
+        # Built-in AS scratch space (reference values, token signing state)
+        - name: as-work-dir
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+# Service name + port must match the scheduler's AURA_KBS_URL default:
+# http://kbs.swarm-system.svc.cluster.local:8080
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbs
+  namespace: swarm-system
+  labels:
+    app: kbs
+spec:
+  selector:
+    app: kbs
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
+---
+# Allow agent pods to reach the KBS for attestation + DEK release.
+# (The default-deny + agent-egress policies in 08-network-policies.yaml do
+# not cover KBS; cluster-internal RFC1918 destinations are otherwise blocked.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-egress-kbs
+  namespace: swarm-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: swarm-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+          podSelector:
+            matchLabels:
+              app: kbs
+      ports:
+        - port: 8080
+---
+# Restrict KBS ingress to agent pods (attestation/DEK fetch) and the
+# swarm-system namespace (control plane DEK lifecycle, kbs-client admin).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kbs-ingress
+  namespace: swarm-system
+spec:
+  podSelector:
+    matchLabels:
+      app: kbs
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-agents
+          podSelector:
+            matchLabels:
+              app: swarm-agent
+        - namespaceSelector:
+            matchLabels:
+              name: swarm-system
+      ports:
+        - port: 8080

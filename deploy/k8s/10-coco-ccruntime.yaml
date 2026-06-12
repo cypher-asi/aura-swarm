@@ -1,0 +1,164 @@
+# Confidential Containers (CoCo) runtime install for SNP nodes
+#
+# Prerequisite: the CoCo operator must be installed first (done by
+# ./05-configure-eks.sh):
+#
+#   kubectl apply -k "github.com/confidential-containers/operator/config/default?ref=v0.17.0"
+#
+# The operator watches this CcRuntime CR and runs install daemonsets on the
+# selected nodes, deploying the kata-containers payload (including the
+# kata-qemu-snp shim/handler) onto every node labeled
+# swarm.io/confidential-node=true.
+#
+# Notes:
+# - Based on the operator's default sample CR (config/samples/ccruntime/base)
+#   at v0.17.0, with node selection/tolerations for the swarm SNP pool.
+# - runtimeClasses is intentionally empty: RuntimeClass objects (kata-fc,
+#   kata-qemu, kata-qemu-snp) are owned by 09-runtime-class.yaml so overhead
+#   and scheduling stay under our control.
+# - The CoCo operator is superseded upstream by the confidential-containers
+#   Helm chart (github.com/confidential-containers/charts); migrating to it
+#   is a follow-up, tracked for the R3 cleanup release.
+---
+apiVersion: confidentialcontainers.org/v1beta1
+kind: CcRuntime
+metadata:
+  name: ccruntime
+spec:
+  runtimeName: kata
+  # Install only on the confidential (SEV-SNP bare metal) node pool
+  ccNodeSelector:
+    matchLabels:
+      swarm.io/confidential-node: "true"
+  # Install daemonsets must tolerate the confidential pool taint
+  ccTolerations:
+    - key: swarm.io/confidential-node
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  config:
+    installType: bundle
+    # "stable" matches the operator v0.17.0 default sample. TODO: pin to the
+    # exact kata-containers release validated on the SNP pool before R2.
+    payloadImage: quay.io/kata-containers/kata-deploy:stable
+    installDoneLabel:
+      katacontainers.io/kata-runtime: "true"
+    uninstallDoneLabel:
+      katacontainers.io/kata-runtime: "cleanup"
+    installerVolumeMounts:
+      - mountPath: /etc/crio/
+        name: crio-conf
+      - mountPath: /etc/containerd/
+        name: containerd-conf
+      - mountPath: /usr/local/bin/
+        name: local-bin
+      - mountPath: /host/
+        name: host
+    installerVolumes:
+      - hostPath:
+          path: /etc/crio/
+          type: ""
+        name: crio-conf
+      - hostPath:
+          path: /etc/containerd/
+          type: ""
+        name: containerd-conf
+      - hostPath:
+          path: /usr/local/bin/
+          type: ""
+        name: local-bin
+      - hostPath:
+          path: /
+          type: ""
+        name: host
+    installCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "install"]
+    uninstallCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "cleanup"]
+    cleanupCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "reset"]
+    # RuntimeClass objects are managed in 09-runtime-class.yaml
+    runtimeClasses: []
+    preInstall:
+      image: quay.io/confidential-containers/reqs-payload
+      volumeMounts:
+        - mountPath: /opt/confidential-containers/
+          name: confidential-containers-artifacts
+        - mountPath: /etc/systemd/system/
+          name: etc-systemd-system
+        - mountPath: /etc/containerd/
+          name: containerd-conf
+        - mountPath: /usr/local/bin/
+          name: local-bin
+        - mountPath: /var/lib/containerd-nydus/
+          name: containerd-nydus
+      volumes:
+        - hostPath:
+            path: /opt/confidential-containers/
+            type: DirectoryOrCreate
+          name: confidential-containers-artifacts
+        - hostPath:
+            path: /etc/systemd/system/
+            type: ""
+          name: etc-systemd-system
+        - hostPath:
+            path: /etc/containerd/
+            type: ""
+          name: containerd-conf
+        - hostPath:
+            path: /usr/local/bin/
+            type: ""
+          name: local-bin
+        - hostPath:
+            path: /var/lib/containerd-nydus/
+            type: ""
+          name: containerd-nydus
+    postUninstall:
+      image: quay.io/confidential-containers/reqs-payload
+      volumeMounts:
+        - mountPath: /opt/confidential-containers/
+          name: confidential-containers-artifacts
+        - mountPath: /etc/systemd/system/
+          name: etc-systemd-system
+        - mountPath: /etc/containerd/
+          name: containerd-conf
+        - mountPath: /usr/local/bin/
+          name: local-bin
+        - mountPath: /var/lib/containerd-nydus/
+          name: containerd-nydus
+      volumes:
+        - hostPath:
+            path: /opt/confidential-containers/
+            type: DirectoryOrCreate
+          name: confidential-containers-artifacts
+        - hostPath:
+            path: /etc/systemd/system/
+            type: ""
+          name: etc-systemd-system
+        - hostPath:
+            path: /etc/containerd/
+            type: ""
+          name: containerd-conf
+        - hostPath:
+            path: /usr/local/bin/
+            type: ""
+          name: local-bin
+        - hostPath:
+            path: /var/lib/containerd-nydus/
+            type: ""
+          name: containerd-nydus
+    environmentVariables:
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            apiVersion: v1
+            fieldPath: spec.nodeName
+      - name: "CONFIGURE_CC"
+        value: "yes"
+      - name: "DEBUG"
+        value: "false"
+      - name: "INSTALL_COCO_CONTAINERD"
+        value: "false"
+      - name: "INSTALL_OFFICIAL_CONTAINERD"
+        value: "true"
+      - name: "INSTALL_VFIO_GPU_CONTAINERD"
+        value: "false"
+      - name: "INSTALL_NYDUS_SNAPSHOTTER"
+        value: "true"

@@ -254,6 +254,62 @@ resource "aws_eks_node_group" "main" {
 }
 
 #------------------------------------------------------------------------------
+# EKS Managed Node Group - Confidential (SEV-SNP bare metal)
+#
+# Bare-metal AMD nodes for Confidential Containers (kata-qemu-snp).
+# Labeled swarm.io/confidential-node=true (matched by the scheduler's node
+# selector and the kata-qemu-snp RuntimeClass) and tainted NO_SCHEDULE so
+# only confidential agent pods (which carry the matching toleration) and
+# the CoCo operator daemonsets land here.
+#------------------------------------------------------------------------------
+
+resource "aws_eks_node_group" "confidential" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.resource_prefix}-confidential-node-group"
+  node_role_arn   = aws_iam_role.node_group.arn
+  subnet_ids      = var.agent_subnet_ids
+
+  instance_types = [var.confidential_node_instance_type]
+  capacity_type  = "ON_DEMAND"
+
+  disk_size = var.confidential_node_disk_size
+
+  scaling_config {
+    desired_size = var.confidential_node_desired_count
+    min_size     = var.confidential_node_min_count
+    max_size     = var.confidential_node_max_count
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  labels = {
+    role = "agent"
+    # Matched by the scheduler node selector and kata-qemu-snp RuntimeClass
+    "swarm.io/confidential-node" = "true"
+  }
+
+  # Keep general workloads off the bare-metal pool; confidential agent pods
+  # and the CoCo operator daemonsets tolerate this taint.
+  taint {
+    key    = "swarm.io/confidential-node"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.resource_prefix}-confidential-node-group"
+  })
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_worker_policy,
+    aws_iam_role_policy_attachment.node_cni_policy,
+    aws_iam_role_policy_attachment.node_ecr_read,
+  ]
+}
+
+#------------------------------------------------------------------------------
 # EKS Addons
 #------------------------------------------------------------------------------
 

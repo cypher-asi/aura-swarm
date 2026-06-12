@@ -1,5 +1,22 @@
 # Deploy Workflows
 
+## Confidential (SEV-SNP) Infrastructure
+
+R1 runs dual-mode: legacy agents stay on the kata-fc pool while every new agent is a confidential SEV-SNP VM. The confidential infra installs in this order:
+
+1. **SNP node group (Terraform).** `./02-deploy-network.sh` regenerates `terraform.tfvars` including the confidential node group settings (`CONFIDENTIAL_NODE_*` in `config.env`, default `m6a.metal`, desired 1, min 0, max 3); `./04-deploy-eks.sh` applies it. Nodes come up labeled `swarm.io/confidential-node=true` and tainted `swarm.io/confidential-node=true:NoSchedule`, alongside the legacy pool. EFS encryption is mandatory and hardcoded in the storage module.
+2. **CoCo operator.** `./05-configure-eks.sh` installs the Confidential Containers operator (pinned via `COCO_OPERATOR_VERSION`) into `confidential-containers-system` and waits for the controller.
+3. **CcRuntime + RuntimeClass.** `./08-deploy-k8s.sh` applies `k8s/10-coco-ccruntime.yaml` (operator then installs the kata-qemu-snp runtime onto the SNP nodes) and `k8s/09-runtime-class.yaml` (RuntimeClasses `kata-fc`, `kata-qemu`, `kata-qemu-snp`; the SNP class carries pod overhead and the confidential-node selector). The CcRuntime apply is skipped with a warning if the operator CRD is missing.
+4. **Trustee (KBS + Attestation Service).** `./08-deploy-k8s.sh` applies `k8s/11-trustee.yaml`: the KBS deployment (built-in AS), the `kbs` service on port 8080 (matches the scheduler default `AURA_KBS_URL=http://kbs.swarm-system.svc.cluster.local:8080`), a persistent repository PVC, and network policies allowing agent pods to reach the KBS. The script also generates the KBS admin keypair: private key in `.secrets/kbs-admin.key` (keep it safe; used with `kbs-client`), public key in the `kbs-auth-public-key` secret.
+
+Quick checks after install:
+
+- `kubectl get nodes -l swarm.io/confidential-node=true` — SNP nodes joined.
+- `kubectl get ccruntime ccruntime -o jsonpath='{.status}'` — runtime install progress.
+- `kubectl get pods -n swarm-system -l app=kbs` — KBS running.
+
+KBS attestation policies/reference values and per-agent DEK provisioning are configured in the attestation/DEK lifecycle phase, not by these scripts.
+
 ## Normal Redeploy
 Run `./08-deploy-k8s.sh` for a normal redeploy. This path updates Kubernetes manifests in place and preserves stored swarm data.
 

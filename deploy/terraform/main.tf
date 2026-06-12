@@ -24,10 +24,10 @@ data "aws_availability_zones" "available" {
 
 locals {
   resource_prefix = "${var.project_name}-${var.environment}"
-  
+
   # Use provided AZs or auto-detect (limit to 2 for cost savings in dev)
   availability_zones = length(var.availability_zones) > 0 ? var.availability_zones : slice(data.aws_availability_zones.available.names, 0, 2)
-  
+
   common_tags = {
     Project     = var.project_name
     Environment = var.environment
@@ -65,7 +65,6 @@ module "storage" {
   subnet_ids           = module.network[0].storage_subnet_ids
   agent_subnet_cidrs   = module.network[0].agent_subnet_cidrs
   private_subnet_cidrs = module.network[0].private_subnet_cidrs
-  encrypted            = var.efs_encrypted
   throughput_mode      = var.efs_throughput_mode
   performance_mode     = var.efs_performance_mode
   tags                 = local.common_tags
@@ -79,17 +78,25 @@ module "eks" {
   source = "./modules/eks"
   count  = var.enable_eks && var.enable_network ? 1 : 0
 
-  resource_prefix      = local.resource_prefix
-  eks_version          = var.eks_version
-  vpc_id               = module.network[0].vpc_id
-  private_subnet_ids   = module.network[0].private_subnet_ids
-  agent_subnet_ids     = module.network[0].agent_subnet_ids
-  node_instance_type   = var.node_instance_type
-  node_desired_count   = var.node_desired_count
-  node_min_count       = var.node_min_count
-  node_max_count       = var.node_max_count
-  node_disk_size       = var.node_disk_size
-  tags                 = local.common_tags
+  resource_prefix    = local.resource_prefix
+  eks_version        = var.eks_version
+  vpc_id             = module.network[0].vpc_id
+  private_subnet_ids = module.network[0].private_subnet_ids
+  agent_subnet_ids   = module.network[0].agent_subnet_ids
+  node_instance_type = var.node_instance_type
+  node_desired_count = var.node_desired_count
+  node_min_count     = var.node_min_count
+  node_max_count     = var.node_max_count
+  node_disk_size     = var.node_disk_size
+
+  # Confidential (SEV-SNP bare metal) node group for CoCo / kata-qemu-snp
+  confidential_node_instance_type = var.confidential_node_instance_type
+  confidential_node_desired_count = var.confidential_node_desired_count
+  confidential_node_min_count     = var.confidential_node_min_count
+  confidential_node_max_count     = var.confidential_node_max_count
+  confidential_node_disk_size     = var.confidential_node_disk_size
+
+  tags = local.common_tags
 }
 
 #------------------------------------------------------------------------------
@@ -100,9 +107,9 @@ module "ecr" {
   source = "./modules/ecr"
   count  = var.enable_ecr ? 1 : 0
 
-  resource_prefix          = local.resource_prefix
-  repositories             = var.ecr_repositories
-  image_retention_count    = var.ecr_image_retention_count
-  force_delete             = var.ecr_force_delete
-  tags                     = local.common_tags
+  resource_prefix       = local.resource_prefix
+  repositories          = var.ecr_repositories
+  image_retention_count = var.ecr_image_retention_count
+  force_delete          = var.ecr_force_delete
+  tags                  = local.common_tags
 }

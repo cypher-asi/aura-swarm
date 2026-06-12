@@ -7,6 +7,8 @@
 # - Secrets (placeholders), RBAC
 # - Deployments (gateway, control, scheduler)
 # - Network policies
+# - RuntimeClasses + CcRuntime (kata-qemu-snp install on SNP nodes)
+# - Trustee KBS (built-in Attestation Service) + admin auth secret
 #
 # Usage:
 #   ./08-deploy-k8s.sh                    # Normal deploy (preserves swarm data/IDs)
@@ -338,6 +340,8 @@ MANIFESTS=(
     "07-scheduler.yaml"
     "08-network-policies.yaml"
     "09-runtime-class.yaml"
+    "10-coco-ccruntime.yaml"
+    "11-trustee.yaml"
 )
 
 for manifest in "${MANIFESTS[@]}"; do
@@ -346,6 +350,13 @@ for manifest in "${MANIFESTS[@]}"; do
     # Use temp file for secrets (contains injected values)
     if [[ "$manifest" == "03-secrets.yaml" ]]; then
         manifest_path="${SECRETS_YAML_TMP}"
+    fi
+    
+    # The CcRuntime CR needs the CoCo operator CRD (installed by 05-configure-eks.sh)
+    if [[ "$manifest" == "10-coco-ccruntime.yaml" ]] && \
+       ! kubectl get crd ccruntimes.confidentialcontainers.org &>/dev/null; then
+        echo -e "${YELLOW}⚠${NC} Skipping ${manifest} (CoCo operator not installed - run ./05-configure-eks.sh)"
+        continue
     fi
     
     if [[ -f "$manifest_path" ]]; then
@@ -360,6 +371,35 @@ done
 # Clean up temp directory (don't leave secrets on disk)
 rm -rf "${DEPLOY_TMP_DIR}"
 
+echo ""
+
+#------------------------------------------------------------------------------
+# Trustee KBS admin auth keypair
+#
+# The KBS deployment (11-trustee.yaml) mounts the kbs-auth-public-key secret.
+# The private half stays in .secrets/kbs-admin.key and is used with kbs-client
+# to administer KBS policies/resources. Generated once, then reused.
+#------------------------------------------------------------------------------
+
+KBS_ADMIN_KEY="${SECRETS_DIR}/kbs-admin.key"
+
+echo "Ensuring Trustee KBS admin auth keypair..."
+
+if [[ ! -f "${KBS_ADMIN_KEY}" ]]; then
+    echo "  Generating new Ed25519 admin keypair at .secrets/kbs-admin.key..."
+    mkdir -p "${SECRETS_DIR}"
+    openssl genpkey -algorithm ed25519 -out "${KBS_ADMIN_KEY}"
+fi
+
+KBS_PUB_TMP="${REDEPLOY_VERIFY_TMP_DIR}/kbs.pem"
+openssl pkey -in "${KBS_ADMIN_KEY}" -pubout -out "${KBS_PUB_TMP}"
+
+kubectl create secret generic kbs-auth-public-key \
+    --from-file=kbs.pem="${KBS_PUB_TMP}" \
+    -n "${K8S_NAMESPACE_SYSTEM}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+echo -e "${GREEN}✓${NC} kbs-auth-public-key secret in sync with .secrets/kbs-admin.key"
 echo ""
 
 #------------------------------------------------------------------------------

@@ -61,6 +61,12 @@ node_desired_count  = ${NODE_DESIRED_COUNT}
 node_min_count      = ${NODE_MIN_COUNT}
 node_max_count      = ${NODE_MAX_COUNT}
 
+# Confidential (SEV-SNP bare metal) node group
+confidential_node_instance_type = "${CONFIDENTIAL_NODE_INSTANCE_TYPE}"
+confidential_node_desired_count = ${CONFIDENTIAL_NODE_DESIRED_COUNT}
+confidential_node_min_count     = ${CONFIDENTIAL_NODE_MIN_COUNT}
+confidential_node_max_count     = ${CONFIDENTIAL_NODE_MAX_COUNT}
+
 # Feature flags — deploying network; other flags preserved from previous state
 enable_network = true
 enable_storage = ${EXISTING_STORAGE}

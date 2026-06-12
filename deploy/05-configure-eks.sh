@@ -5,7 +5,8 @@
 # - kubectl with cluster credentials
 # - AWS EFS CSI Driver
 # - Kata Containers runtime (or kata-qemu for dev)
-# - RuntimeClass for kata-fc
+# - RuntimeClasses (kata-fc, kata-qemu, kata-qemu-snp)
+# - Confidential Containers (CoCo) operator for the SEV-SNP node pool
 
 set -euo pipefail
 
@@ -178,7 +179,7 @@ echo ""
 
 kubectl apply -f "${SCRIPT_DIR}/k8s/09-runtime-class.yaml"
 
-echo -e "${GREEN}✓${NC} RuntimeClasses created (kata-fc, kata-qemu)"
+echo -e "${GREEN}✓${NC} RuntimeClasses created (kata-fc, kata-qemu, kata-qemu-snp)"
 echo ""
 
 echo -e "${YELLOW}Note: You need to install Kata Containers on worker nodes.${NC}"
@@ -186,6 +187,32 @@ echo "Options:"
 echo "  1. Use a custom EKS AMI with Kata pre-installed"
 echo "  2. Deploy Kata via DaemonSet (see kata-containers.io docs)"
 echo "  3. Use kata-qemu for testing without Firecracker"
+echo ""
+echo "The confidential (SEV-SNP) node pool is handled separately: the CoCo"
+echo "operator installed below deploys kata-qemu-snp onto nodes labeled"
+echo "swarm.io/confidential-node=true via the CcRuntime CR (10-coco-ccruntime.yaml)."
+echo ""
+
+#------------------------------------------------------------------------------
+# Install Confidential Containers (CoCo) Operator
+#------------------------------------------------------------------------------
+
+# Pinned operator release. NOTE: the operator is superseded upstream by the
+# confidential-containers Helm chart; migration is deferred to R3 cleanup.
+COCO_OPERATOR_VERSION="${COCO_OPERATOR_VERSION:-v0.17.0}"
+
+echo "Installing Confidential Containers operator (${COCO_OPERATOR_VERSION})..."
+
+kubectl apply -k "github.com/confidential-containers/operator/config/default?ref=${COCO_OPERATOR_VERSION}"
+
+echo "  Waiting for CoCo operator controller to become ready..."
+kubectl rollout status deployment/cc-operator-controller-manager \
+    -n confidential-containers-system --timeout=300s
+
+echo -e "${GREEN}✓${NC} CoCo operator installed"
+echo ""
+echo "The CcRuntime CR (kata-qemu-snp install on SNP nodes) is applied by"
+echo "./08-deploy-k8s.sh together with the rest of the manifests."
 echo ""
 
 #------------------------------------------------------------------------------
@@ -200,7 +227,8 @@ echo ""
 echo "Installed components:"
 echo "  - kubeconfig updated"
 echo "  - AWS EFS CSI Driver"
-echo "  - RuntimeClasses (kata-fc, kata-qemu)"
+echo "  - RuntimeClasses (kata-fc, kata-qemu, kata-qemu-snp)"
+echo "  - Confidential Containers operator (${COCO_OPERATOR_VERSION})"
 echo ""
 echo "Cluster nodes:"
 kubectl get nodes -o wide

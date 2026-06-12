@@ -106,6 +106,36 @@ variable "node_disk_size" {
   default     = 100
 }
 
+variable "confidential_node_instance_type" {
+  description = "EC2 instance type for confidential (SEV-SNP) worker nodes - must be AMD bare metal"
+  type        = string
+  default     = "m6a.metal"
+}
+
+variable "confidential_node_desired_count" {
+  description = "Desired number of confidential worker nodes"
+  type        = number
+  default     = 1
+}
+
+variable "confidential_node_min_count" {
+  description = "Minimum number of confidential worker nodes (0 allows scale-to-zero)"
+  type        = number
+  default     = 0
+}
+
+variable "confidential_node_max_count" {
+  description = "Maximum number of confidential worker nodes"
+  type        = number
+  default     = 3
+}
+
+variable "confidential_node_disk_size" {
+  description = "Disk size in GB for confidential worker nodes (guest images + kata artifacts)"
+  type        = number
+  default     = 200
+}
+
 #------------------------------------------------------------------------------
 # ECR Configuration
 #------------------------------------------------------------------------------
@@ -137,11 +167,9 @@ variable "ecr_force_delete" {
 # Storage Configuration
 #------------------------------------------------------------------------------
 
-variable "efs_encrypted" {
-  description = "Enable encryption for EFS"
-  type        = bool
-  default     = true
-}
+# NOTE: EFS encryption is mandatory (sealed agent state lives on EFS) and is
+# hardcoded in the storage module; there is intentionally no efs_encrypted
+# variable to disable it.
 
 variable "efs_throughput_mode" {
   description = "EFS throughput mode (bursting or provisioned)"
