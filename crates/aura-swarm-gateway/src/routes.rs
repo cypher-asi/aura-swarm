@@ -15,7 +15,9 @@ use tower_http::trace::TraceLayer;
 use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
-use crate::handlers::{agents, automaton, files, health, internal, run, sessions, terminal, ws};
+use crate::handlers::{
+    agents, automaton, files, health, internal, run, secrets, sessions, terminal, ws,
+};
 use crate::state::GatewayState;
 
 /// Create the gateway router with all routes and middleware.
@@ -45,6 +47,13 @@ use crate::state::GatewayState;
 /// ## Files (authenticated, proxied to agent pod)
 /// - `POST /v1/agents/:agent_id/files` - List directory contents
 /// - `POST /v1/agents/:agent_id/read-file` - Read file contents
+///
+/// ## Secrets (authenticated, proxied to the in-TEE vault on the pod;
+/// values are never persisted, cached, or logged by the gateway)
+/// - `GET /v1/agents/:agent_id/secrets` - List secret names + metadata
+/// - `GET /v1/agents/:agent_id/secrets/:name` - Get metadata (`?reveal=true` for the value)
+/// - `PUT /v1/agents/:agent_id/secrets/:name` - Create/update a secret
+/// - `DELETE /v1/agents/:agent_id/secrets/:name` - Delete a secret
 ///
 /// ## Sessions (authenticated, CRUD/observability only)
 /// - `POST /v1/agents/:agent_id/sessions` - Create session
@@ -138,6 +147,18 @@ where
         .route(
             "/v1/agents/:agent_id/read-file",
             post(files::read_file::<C, V>),
+        )
+        // Secrets vault pass-through (HTTP — forward to the pod's /secrets
+        // routes; pure proxy, no control-plane persistence or body logging)
+        .route(
+            "/v1/agents/:agent_id/secrets",
+            get(secrets::list_secrets::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/secrets/:name",
+            get(secrets::get_secret::<C, V>)
+                .put(secrets::put_secret::<C, V>)
+                .delete(secrets::delete_secret::<C, V>),
         )
         // Sessions (CRUD + observability; the chat/automaton stream is driven
         // by the run endpoints below)

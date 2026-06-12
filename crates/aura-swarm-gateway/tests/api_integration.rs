@@ -1138,3 +1138,141 @@ async fn forbidden_error_format() {
     let body: Value = resp.json();
     assert_eq!(body["error"]["code"], "forbidden");
 }
+
+// ---------------------------------------------------------------------------
+// Secrets pass-through (Swarm TEE phase 6)
+// ---------------------------------------------------------------------------
+
+/// Create an agent owned by `TEST_USER_UUID` and park it in a
+/// non-active state (`hibernating` via the internal status callback) so
+/// endpoint resolution deterministically yields "no pod" without any
+/// network calls.
+async fn create_hibernating_agent(server: &TestServer) -> String {
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let create_resp = server
+        .post("/v1/agents")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"name": "vault-agent"}))
+        .await;
+    create_resp.assert_status(axum::http::StatusCode::CREATED);
+    let agent_id = create_resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (internal_hdr, internal_val) = internal_auth_header();
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!({"status": "hibernating"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    agent_id
+}
+
+#[tokio::test]
+async fn secrets_routes_require_auth() {
+    let (server, _tmp) = build_test_app();
+    let fake_id = "dd".repeat(16);
+
+    server
+        .get(&format!("/v1/agents/{fake_id}/secrets"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .get(&format!("/v1/agents/{fake_id}/secrets/api-key"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .put(&format!("/v1/agents/{fake_id}/secrets/api-key"))
+        .json(&json!({"value": "v"}))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .delete(&format!("/v1/agents/{fake_id}/secrets/api-key"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn secrets_not_owner_forbidden() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_hibernating_agent(&server).await;
+
+    let (hdr2, val2) = auth_header(OTHER_USER_UUID);
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/secrets"))
+        .add_header(hdr2.clone(), val2.clone())
+        .await;
+    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+    let resp = server
+        .put(&format!("/v1/agents/{agent_id}/secrets/api-key"))
+        .add_header(hdr2.clone(), val2.clone())
+        .json(&json!({"value": "stolen"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+/// With no running pod the proxy must surface `503 agent_unavailable`
+/// (same wake/error semantics as the files proxy: no implicit wake).
+#[tokio::test]
+async fn secrets_agent_not_running_returns_503() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_hibernating_agent(&server).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/secrets"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = resp.json();
+    assert_eq!(body["error"]["code"], "agent_unavailable");
+
+    let resp = server
+        .put(&format!("/v1/agents/{agent_id}/secrets/api-key"))
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"value": "v", "description": "d"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+    let resp = server
+        .delete(&format!("/v1/agents/{agent_id}/secrets/api-key"))
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Secret names are validated before being interpolated into the
+/// proxied pod path (path-injection guard).
+#[tokio::test]
+async fn secrets_invalid_name_rejected() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_hibernating_agent(&server).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    // "a b" (URL-encoded space) and an encoded traversal both fail the
+    // name charset check with 400 before any endpoint resolution.
+    for bad in ["a%20b", "..%2F..%2Fetc"] {
+        let resp = server
+            .get(&format!("/v1/agents/{agent_id}/secrets/{bad}"))
+            .add_header(hdr.clone(), val.clone())
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["error"]["code"], "bad_request");
+    }
+}
+
+#[tokio::test]
+async fn secrets_invalid_agent_id_rejected() {
+    let (server, _tmp) = build_test_app();
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let resp = server
+        .get("/v1/agents/not-hex/secrets")
+        .add_header(hdr.clone(), val.clone())
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+}
