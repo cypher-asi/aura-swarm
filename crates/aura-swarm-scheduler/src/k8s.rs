@@ -18,7 +18,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, AgentState};
+use aura_swarm_store::{AgentSpec, AgentState, BoxTier};
 
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
@@ -1226,13 +1226,17 @@ impl Scheduler for K8sScheduler {
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
         pods.create(&PostParams::default(), &pod).await?;
 
-        // Register with billing reporter if configured
+        // Register with billing reporter if configured. Tiered (confidential)
+        // agents are billed under their SKU; legacy agents (tier == None)
+        // keep plain cpu/mem-hour reporting.
         if let Some(reporter) = &self.billing_reporter {
+            let tier = spec.tier.as_deref().and_then(BoxTier::from_name);
             reporter.register_pod(
                 &agent_id.to_hex(),
                 user_id_hex,
                 spec.cpu_millicores,
                 spec.memory_mb,
+                tier,
             );
             debug!(
                 agent_id = %agent_id,

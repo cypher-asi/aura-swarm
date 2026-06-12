@@ -4,11 +4,11 @@
 //! for Aura agent pods with all necessary configuration.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, IsolationLevel};
+use aura_swarm_store::{AgentSpec, IsolationLevel, StorageEncryption};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
-    ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
+    ResourceRequirements, SecretKeySelector, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -19,6 +19,10 @@ use crate::SchedulerConfig;
 
 /// The container port for the Aura runtime HTTP server.
 const AURA_PORT: i32 = 8080;
+
+/// Node label and taint key for the SEV-SNP bare-metal node group.
+/// Confidential pods select these nodes and tolerate the matching taint.
+const CONFIDENTIAL_NODE_KEY: &str = "swarm.io/confidential-node";
 
 /// Build a Kubernetes pod spec for an agent.
 ///
@@ -42,9 +46,23 @@ pub fn build_pod(
     let pod_name = build_pod_name(agent_name, &pod_id);
     let agent_id_hex = agent_id.to_hex();
 
+    // KBS key id for the sealed-state DEK. Prefer the id recorded in the
+    // agent's spec; fall back to the deterministic per-agent id. Only
+    // injected into confidential pods.
+    let state_key_id = spec.storage_encryption.as_ref().map_or_else(
+        || StorageEncryption::state_key_id(agent_id),
+        |enc| enc.key_id().to_string(),
+    );
+
     Pod {
         metadata: build_metadata(&pod_name, &agent_id_hex, agent_name, &pod_id, config),
-        spec: Some(build_pod_spec(&agent_id_hex, user_id_hex, spec, config)),
+        spec: Some(build_pod_spec(
+            &agent_id_hex,
+            user_id_hex,
+            spec,
+            &state_key_id,
+            config,
+        )),
         ..Default::default()
     }
 }
@@ -126,6 +144,7 @@ fn build_pod_spec(
     agent_id_hex: &str,
     user_id_hex: &str,
     spec: &AgentSpec,
+    state_key_id: &str,
     config: &SchedulerConfig,
 ) -> PodSpec {
     // Use agent's isolation level if specified, otherwise use scheduler default
@@ -133,16 +152,38 @@ fn build_pod_spec(
     // runtime_class() returns None for standard containers (uses default runtime)
     let runtime_class_name = isolation.runtime_class().map(String::from);
 
+    // SNP scheduling constraints apply ONLY to confidential agents. Legacy
+    // agents must keep today's pod spec byte-for-byte (None == field omitted),
+    // so the desired-state reconciler sees no diff for them during R1.
+    let confidential = isolation == IsolationLevel::ConfidentialVM;
+    let node_selector = confidential.then(|| {
+        let mut selector = BTreeMap::new();
+        selector.insert(CONFIDENTIAL_NODE_KEY.to_string(), "true".to_string());
+        selector
+    });
+    let tolerations = confidential.then(|| {
+        vec![Toleration {
+            key: Some(CONFIDENTIAL_NODE_KEY.to_string()),
+            operator: Some("Equal".to_string()),
+            value: Some("true".to_string()),
+            effect: Some("NoSchedule".to_string()),
+            ..Default::default()
+        }]
+    });
+
     PodSpec {
         runtime_class_name,
         containers: vec![build_container(
             agent_id_hex,
             user_id_hex,
             spec,
+            state_key_id,
             config,
             &config.image,
             isolation,
         )],
+        node_selector,
+        tolerations,
         volumes: Some(vec![build_state_volume(config)]),
         restart_policy: Some("Always".to_string()),
         termination_grace_period_seconds: Some(30),
@@ -155,10 +196,18 @@ fn build_container(
     agent_id_hex: &str,
     user_id_hex: &str,
     spec: &AgentSpec,
+    state_key_id: &str,
     config: &SchedulerConfig,
     image: &str,
     isolation: IsolationLevel,
 ) -> Container {
+    let mut env = build_env_vars(agent_id_hex, user_id_hex, config);
+    // Confidential agents get the attestation/sealed-storage variables
+    // APPENDED so the legacy env list (names, values, order) is untouched.
+    if isolation == IsolationLevel::ConfidentialVM {
+        env.extend(build_confidential_env_vars(state_key_id, config));
+    }
+
     Container {
         name: "aura".to_string(),
         image: Some(image.to_string()),
@@ -167,7 +216,7 @@ fn build_container(
             name: Some("http".to_string()),
             ..Default::default()
         }]),
-        env: Some(build_env_vars(agent_id_hex, user_id_hex, config)),
+        env: Some(env),
         resources: Some(build_resources(spec)),
         volume_mounts: Some(vec![build_state_mount(agent_id_hex)]),
         readiness_probe: Some(build_readiness_probe()),
@@ -255,6 +304,32 @@ fn build_env_vars(agent_id_hex: &str, user_id_hex: &str, config: &SchedulerConfi
         EnvVar {
             name: "AURA_PROJECT_BASE".to_string(),
             value: Some("/home/aura".to_string()),
+            ..Default::default()
+        },
+    ]
+}
+
+/// Build the extra environment variables for confidential (SEV-SNP) agents.
+///
+/// These drive the harness attestation boot flow: fetch the per-agent state
+/// DEK identified by `AURA_STATE_KEY_ID` from the KBS at `AURA_KBS_URL`
+/// (released only after successful attestation), then open the sealed state
+/// overlay (`AURA_STATE_ENCRYPTION=sealed`).
+fn build_confidential_env_vars(state_key_id: &str, config: &SchedulerConfig) -> Vec<EnvVar> {
+    vec![
+        EnvVar {
+            name: "AURA_KBS_URL".to_string(),
+            value: Some(config.kbs_url.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_STATE_ENCRYPTION".to_string(),
+            value: Some("sealed".to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "AURA_STATE_KEY_ID".to_string(),
+            value: Some(state_key_id.to_string()),
             ..Default::default()
         },
     ]
@@ -619,6 +694,208 @@ mod tests {
         let container_sec = pod_spec.containers[0].security_context.as_ref().unwrap();
         assert_eq!(container_sec.run_as_user, Some(1000));
         assert_eq!(container_sec.allow_privilege_escalation, Some(false));
+    }
+
+    /// CRITICAL dual-mode invariant (TEE upgrade R1): a legacy agent
+    /// (tier == None, MicroVM isolation) must produce a pod spec identical
+    /// to the pre-upgrade scheduler's output — no new env vars, node
+    /// selectors, tolerations, or reordered fields. Any diff here would
+    /// make the desired-state reconciler churn every legacy pod.
+    ///
+    /// The expected value below is a frozen snapshot of the pod spec shape
+    /// as of the pre-TEE-upgrade scheduler. Do not update it to "fix" this
+    /// test unless legacy pods are intentionally being changed (R2+).
+    #[test]
+    fn legacy_pod_spec_is_byte_for_byte_unchanged() {
+        let agent_id = AgentId::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        let agent_id_hex = agent_id.to_hex();
+        let spec = test_spec(); // legacy: isolation None, tier None, no storage encryption
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
+        let actual = serde_json::to_value(pod.spec.as_ref().unwrap()).unwrap();
+
+        let env_var = |name: &str, value: &str| {
+            serde_json::json!({ "name": name, "value": value })
+        };
+        let expected = serde_json::json!({
+            "containers": [{
+                "env": [
+                    env_var("AGENT_ID", &agent_id_hex),
+                    env_var("MACHINE_ID", &agent_id_hex),
+                    env_var("AURA_MACHINE_ID", &agent_id_hex),
+                    env_var("USER_ID", "user-hex"),
+                    env_var("STATE_DIR", "/state"),
+                    env_var("AURA_LISTEN_ADDR", "0.0.0.0:8080"),
+                    env_var("CONTROL_PLANE_URL", "http://aura-swarm-gateway.swarm-system.svc:8080"),
+                    env_var("AURA_DATA_DIR", "/state"),
+                    env_var("AURA_LLM_ROUTING", "proxy"),
+                    env_var("AURA_ROUTER_URL", "https://aura-router.onrender.com"),
+                    env_var("AURA_STORAGE_URL", "https://aura-storage.onrender.com"),
+                    env_var("AURA_NETWORK_URL", "https://aura-network.onrender.com"),
+                    env_var("ENABLE_FS_TOOLS", "true"),
+                    env_var("ENABLE_CMD_TOOLS", "true"),
+                    env_var("AURA_PROJECT_BASE", "/home/aura"),
+                ],
+                "image": "ghcr.io/cypher-asi/aura-harness:latest",
+                "livenessProbe": {
+                    "failureThreshold": 3,
+                    "httpGet": { "path": "/health", "port": 8080 },
+                    "initialDelaySeconds": 30,
+                    "periodSeconds": 30,
+                    "timeoutSeconds": 10
+                },
+                "name": "aura",
+                "ports": [{ "containerPort": 8080, "name": "http" }],
+                "readinessProbe": {
+                    "failureThreshold": 3,
+                    "httpGet": { "path": "/health", "port": 8080 },
+                    "initialDelaySeconds": 5,
+                    "periodSeconds": 10,
+                    "timeoutSeconds": 5
+                },
+                "resources": {
+                    "limits": { "cpu": "500m", "memory": "512Mi" },
+                    "requests": { "cpu": "500m", "memory": "512Mi" }
+                },
+                "securityContext": {
+                    "allowPrivilegeEscalation": true,
+                    "runAsNonRoot": false,
+                    "runAsUser": 0
+                },
+                "volumeMounts": [{
+                    "mountPath": "/state",
+                    "name": "state",
+                    "subPath": agent_id_hex
+                }]
+            }],
+            "restartPolicy": "Always",
+            "runtimeClassName": "kata-fc",
+            "securityContext": {
+                "fsGroup": 1000,
+                "runAsNonRoot": false,
+                "runAsUser": 0
+            },
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [{
+                "name": "state",
+                "persistentVolumeClaim": { "claimName": "swarm-agent-state" }
+            }]
+        });
+
+        assert_eq!(
+            actual, expected,
+            "legacy pod spec drifted from the pre-TEE-upgrade snapshot"
+        );
+    }
+
+    #[test]
+    fn confidential_pod_gets_snp_wiring() {
+        use aura_swarm_store::StorageEncryption;
+
+        let agent_id = test_agent_id();
+        let key_id = format!("swarm/agents/{agent_id}/state-key");
+        let spec = AgentSpec {
+            cpu_millicores: 1000,
+            memory_mb: 2048,
+            runtime_version: "latest".to_string(),
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            tier: Some("standard".to_string()),
+            storage_encryption: Some(StorageEncryption::Sealed {
+                key_id: key_id.clone(),
+            }),
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        // Runtime class
+        assert_eq!(
+            pod_spec.runtime_class_name.as_deref(),
+            Some("kata-qemu-snp")
+        );
+
+        // SNP node selector
+        let selector = pod_spec.node_selector.as_ref().unwrap();
+        assert_eq!(
+            selector.get("swarm.io/confidential-node"),
+            Some(&"true".to_string())
+        );
+
+        // Matching toleration
+        let tolerations = pod_spec.tolerations.as_ref().unwrap();
+        assert_eq!(tolerations.len(), 1);
+        let tol = &tolerations[0];
+        assert_eq!(tol.key.as_deref(), Some("swarm.io/confidential-node"));
+        assert_eq!(tol.operator.as_deref(), Some("Equal"));
+        assert_eq!(tol.value.as_deref(), Some("true"));
+        assert_eq!(tol.effect.as_deref(), Some("NoSchedule"));
+
+        // Confidential env vars, appended after the legacy set
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref())
+        };
+        assert_eq!(
+            get("AURA_KBS_URL"),
+            Some("http://kbs.swarm-system.svc.cluster.local:8080")
+        );
+        assert_eq!(get("AURA_STATE_ENCRYPTION"), Some("sealed"));
+        assert_eq!(get("AURA_STATE_KEY_ID"), Some(key_id.as_str()));
+        assert_eq!(
+            env.last().map(|e| e.name.as_str()),
+            Some("AURA_STATE_KEY_ID"),
+            "confidential vars must be appended, not interleaved"
+        );
+
+        // Legacy env vars are still all present
+        assert!(env.iter().any(|e| e.name == "AGENT_ID"));
+        assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
+    }
+
+    #[test]
+    fn confidential_pod_falls_back_to_deterministic_key_id() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            // No storage_encryption recorded: fall back to the
+            // deterministic per-agent key id.
+            ..test_spec()
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let env = pod.spec.as_ref().unwrap().containers[0].env.as_ref().unwrap();
+        let key_id = env
+            .iter()
+            .find(|e| e.name == "AURA_STATE_KEY_ID")
+            .and_then(|e| e.value.clone())
+            .unwrap();
+
+        assert_eq!(key_id, format!("swarm/agents/{agent_id}/state-key"));
+    }
+
+    #[test]
+    fn confidential_pod_uses_configured_kbs_url() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            ..test_spec()
+        };
+        let mut config = SchedulerConfig::default();
+        config.kbs_url = "http://kbs.example:9999".to_string();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let env = pod.spec.as_ref().unwrap().containers[0].env.as_ref().unwrap();
+        let kbs = env
+            .iter()
+            .find(|e| e.name == "AURA_KBS_URL")
+            .and_then(|e| e.value.clone());
+
+        assert_eq!(kbs.as_deref(), Some("http://kbs.example:9999"));
     }
 
     #[test]

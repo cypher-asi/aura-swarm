@@ -141,6 +141,16 @@ pub struct SchedulerConfig {
     pub aura_network_url: String,
     /// Internal bearer token for gateway service-to-service APIs.
     pub gateway_token: String,
+    /// URL of the Trustee KBS (key broker service), injected into
+    /// confidential agent pods as `AURA_KBS_URL` so the harness can fetch
+    /// its state DEK after attestation. Legacy (non-confidential) pods do
+    /// not receive this variable.
+    #[serde(default = "default_kbs_url")]
+    pub kbs_url: String,
+}
+
+fn default_kbs_url() -> String {
+    "http://kbs.swarm-system.svc.cluster.local:8080".to_string()
 }
 
 impl Default for SchedulerConfig {
@@ -161,6 +171,7 @@ impl Default for SchedulerConfig {
             aura_storage_url: "https://aura-storage.onrender.com".to_string(),
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
+            kbs_url: default_kbs_url(),
         }
     }
 }
@@ -193,6 +204,8 @@ impl SchedulerConfig {
     /// - `AURA_NETWORK_URL`: URL of the Aura network service
     /// - `INTERNAL_TOKEN`: bearer token for gateway internal APIs
     /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
+    /// - `KBS_URL`: Trustee KBS URL injected into confidential agent pods
+    ///   as `AURA_KBS_URL`
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -257,6 +270,9 @@ impl SchedulerConfig {
         } else if let Ok(val) = std::env::var("GATEWAY_TOKEN") {
             config.gateway_token = val;
         }
+        if let Ok(val) = std::env::var("KBS_URL") {
+            config.kbs_url = val;
+        }
 
         config
     }
@@ -318,6 +334,10 @@ mod tests {
         assert_eq!(config.default_isolation.runtime_class(), Some("kata-fc"));
         assert_eq!(config.default_cpu_millicores, 500);
         assert_eq!(config.default_memory_mb, 512);
+        assert_eq!(
+            config.kbs_url,
+            "http://kbs.swarm-system.svc.cluster.local:8080"
+        );
     }
 
     #[test]
