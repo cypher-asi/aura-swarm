@@ -93,11 +93,11 @@ pub use scheduler_client::{
 };
 pub use service::{ControlPlane, ControlPlaneService};
 pub use triggers::TriggerRegistration;
-pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions};
+pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions, TierChangeOutcome};
 
 // Re-export commonly used types from dependencies for convenience
 pub use aura_swarm_core::{AgentId, SessionId, UserId};
 pub use aura_swarm_store::{
     Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, ProcessTrigger, Session, SessionConfig,
-    SessionStatus, StorageEncryption,
+    SessionStatus, StorageEncryption, UsageEvent, UsageEventKind,
 };

@@ -3,7 +3,7 @@
 //! These types define the API contracts for agent and session management.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::AgentSpec;
+use aura_swarm_store::{Agent, AgentSpec};
 use serde::{Deserialize, Serialize};
 
 /// Request to create a new agent.
@@ -65,6 +65,24 @@ impl CreateAgentRequest {
         self.agent_id = Some(agent_id);
         self
     }
+}
+
+/// Outcome of a tier change request (`POST /v1/agents/:id/tier`).
+#[derive(Debug, Clone)]
+pub struct TierChangeOutcome {
+    /// The agent record after the operation.
+    pub agent: Agent,
+    /// Tier before the change. `None` means the agent was a legacy
+    /// (pre-migration) agent that has just been converted.
+    pub previous_tier: Option<String>,
+    /// The tier the agent is on now.
+    pub tier: String,
+    /// Whether anything changed (`false` for a same-tier no-op).
+    pub changed: bool,
+    /// Whether the running pod was recreated to apply the new size
+    /// (`false` for asleep agents: the change takes effect on next
+    /// wake/start).
+    pub pod_recreated: bool,
 }
 
 /// Options for retrieving agent logs.

@@ -44,7 +44,8 @@ pub use error::{Result, StoreError};
 pub use rocks::RocksStore;
 pub use types::{
     Agent, AgentSpec, AgentState, BoxTier, IsolationLevel, ProcessTrigger, Session, SessionConfig,
-    SessionStatus, StorageEncryption, UnknownBoxTier, User, WorkspaceConfig,
+    SessionStatus, StorageEncryption, UnknownBoxTier, UsageEvent, UsageEventKind, User,
+    WorkspaceConfig,
 };
 
 use aura_swarm_core::{AgentId, SessionId, UserId};
@@ -274,4 +275,26 @@ pub trait Store: Send + Sync {
         agent_id: &AgentId,
         triggers: Vec<ProcessTrigger>,
     ) -> Result<Vec<ProcessTrigger>>;
+
+    // =========================================================================
+    // Usage Event Operations (Swarm TEE upgrade phase 10+)
+    // =========================================================================
+
+    /// Append a usage event to the agent's time-ordered event log.
+    ///
+    /// Keys are `agent_id || timestamp_millis`; an existing key (two events
+    /// in the same millisecond) must not be overwritten — implementations
+    /// nudge the key forward instead so no event is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<()>;
+
+    /// List all usage events for an agent, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn list_usage_events_by_agent(&self, agent_id: &AgentId) -> Result<Vec<UsageEvent>>;
 }

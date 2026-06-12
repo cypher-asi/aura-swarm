@@ -102,6 +102,32 @@ pub(crate) struct LifecycleResponse {
     pub(crate) status: AgentState,
 }
 
+/// Request body for a tier change.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChangeTierBody {
+    /// Target box tier ("small" / "standard" / "pro").
+    pub(crate) tier: String,
+}
+
+/// Response for a tier change.
+#[derive(Debug, Serialize)]
+pub(crate) struct ChangeTierResponse {
+    /// Agent ID.
+    pub(crate) agent_id: String,
+    /// Tier before the change (`null` = the agent was a legacy agent that
+    /// has just been converted to the new architecture).
+    pub(crate) previous_tier: Option<String>,
+    /// Tier the agent is on now.
+    pub(crate) tier: String,
+    /// Whether anything changed (`false` for a same-tier no-op).
+    pub(crate) changed: bool,
+    /// Whether the running pod was recreated to apply the new size
+    /// (`false` for asleep agents: takes effect on next wake/start).
+    pub(crate) pod_recreated: bool,
+    /// Agent status after the operation.
+    pub(crate) status: AgentState,
+}
+
 /// Query parameters for log retrieval.
 #[derive(Debug, Deserialize)]
 pub(crate) struct LogQuery {
@@ -411,6 +437,44 @@ where
     Ok(Json(LifecycleResponse {
         agent_id: agent.agent_id.to_string(),
         status: agent.status,
+    }))
+}
+
+/// Change an agent's box tier (`POST /v1/agents/:id/tier`).
+///
+/// Same-tier requests are a no-op (200 with the current state). Asleep
+/// agents are record-only updates; awake agents get a credit-checked
+/// recreate-with-state. Calling this on a legacy agent converts it to the
+/// new architecture (per-agent early migration).
+///
+/// # Errors
+///
+/// Returns an error if the agent is not found, the user doesn't own it,
+/// the tier name is unknown (400), the agent is mid-transition (409), or
+/// the user can't afford the new tier's rate (402).
+pub(crate) async fn change_tier<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    user: AuthUser,
+    Path(agent_id): Path<String>,
+    Json(body): Json<ChangeTierBody>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agent_id = parse_agent_id(&agent_id)?;
+    let outcome = state
+        .control
+        .change_tier(&user.user_id, &agent_id, &body.tier)
+        .await?;
+
+    Ok(Json(ChangeTierResponse {
+        agent_id: outcome.agent.agent_id.to_string(),
+        previous_tier: outcome.previous_tier,
+        tier: outcome.tier,
+        changed: outcome.changed,
+        pod_recreated: outcome.pod_recreated,
+        status: outcome.agent.status,
     }))
 }
 

@@ -38,6 +38,7 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/restart` - Restart agent
 /// - `POST /v1/agents/:agent_id/hibernate` - Hibernate agent
 /// - `POST /v1/agents/:agent_id/wake` - Wake agent
+/// - `POST /v1/agents/:agent_id/tier` - Change box tier (upgrade/downgrade)
 /// - `GET /v1/agents/:agent_id/logs` - Get agent logs
 /// - `GET /v1/agents/:agent_id/status` - Get agent status
 /// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
@@ -129,6 +130,10 @@ where
         .route(
             "/v1/agents/:agent_id/wake",
             post(agents::wake_agent::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/tier",
+            post(agents::change_tier::<C, V>),
         )
         // Agent observability
         .route("/v1/agents/:agent_id/logs", get(agents::get_logs::<C, V>))

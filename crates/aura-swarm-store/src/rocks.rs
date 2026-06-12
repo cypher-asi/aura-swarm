@@ -14,7 +14,7 @@ use rocksdb::{
 use crate::error::{Result, StoreError};
 use crate::keys;
 use crate::schema::{all_column_families, cf};
-use crate::types::{Agent, AgentState, ProcessTrigger, Session, SessionStatus, User};
+use crate::types::{Agent, AgentState, ProcessTrigger, Session, SessionStatus, UsageEvent, User};
 use crate::Store;
 
 /// RocksDB-backed storage implementation.
@@ -530,6 +530,57 @@ impl Store for RocksStore {
 
         Ok(stored)
     }
+
+    // =========================================================================
+    // Usage Event Operations (Swarm TEE upgrade phase 10+)
+    // =========================================================================
+
+    fn append_usage_event(&self, event: &UsageEvent) -> Result<()> {
+        let cf = self.cf(cf::USAGE_EVENTS)?;
+        let value = Self::serialize(event)?;
+
+        // The key is `agent_id || timestamp_millis`. Two events for the same
+        // agent in the same millisecond would collide and silently drop one,
+        // so nudge the millis forward until a free slot is found (events are
+        // rare enough that this loop effectively never iterates).
+        let mut timestamp_millis = event.timestamp_millis();
+        loop {
+            let key = keys::usage_event_key(&event.agent_id, timestamp_millis);
+            let occupied = self
+                .db
+                .get_cf(&cf, &key)
+                .map_err(|e| StoreError::Database(e.to_string()))?
+                .is_some();
+            if !occupied {
+                return self
+                    .db
+                    .put_cf(&cf, key, value)
+                    .map_err(|e| StoreError::Database(e.to_string()));
+            }
+            timestamp_millis += 1;
+        }
+    }
+
+    fn list_usage_events_by_agent(&self, agent_id: &AgentId) -> Result<Vec<UsageEvent>> {
+        let cf = self.cf(cf::USAGE_EVENTS)?;
+        let prefix = keys::agent_prefix(agent_id);
+
+        let mut events = Vec::new();
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            events.push(Self::deserialize(&value)?);
+        }
+
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -966,6 +1017,70 @@ mod tests {
         let stored = store.replace_process_triggers(&agent_id, vec![]).unwrap();
         assert!(stored.is_empty());
         assert!(store.list_process_triggers_by_agent(&agent_id).unwrap().is_empty());
+    }
+
+    fn tier_changed_event(
+        agent_id: &AgentId,
+        timestamp_millis: i64,
+        to: &str,
+    ) -> crate::types::UsageEvent {
+        crate::types::UsageEvent {
+            event_id: uuid::Uuid::new_v4(),
+            agent_id: *agent_id,
+            timestamp: chrono::DateTime::from_timestamp_millis(timestamp_millis).unwrap(),
+            kind: crate::types::UsageEventKind::TierChanged {
+                from: Some("standard".to_string()),
+                to: to.to_string(),
+                from_hourly_price_cents: Some(8),
+                to_hourly_price_cents: 15,
+            },
+        }
+    }
+
+    #[test]
+    fn usage_events_append_and_list_time_ordered() {
+        let (store, _dir) = create_test_store();
+        let agent1 = AgentId::generate();
+        let agent2 = AgentId::generate();
+
+        // Append out of order; the prefix scan must return time order.
+        let late = tier_changed_event(&agent1, 2_000, "pro");
+        let early = tier_changed_event(&agent1, 1_000, "pro");
+        let other = tier_changed_event(&agent2, 1_500, "small");
+        store.append_usage_event(&late).unwrap();
+        store.append_usage_event(&early).unwrap();
+        store.append_usage_event(&other).unwrap();
+
+        let events = store.list_usage_events_by_agent(&agent1).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_id, early.event_id);
+        assert_eq!(events[1].event_id, late.event_id);
+
+        // Scoped to the agent prefix.
+        let events = store.list_usage_events_by_agent(&agent2).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, other.event_id);
+
+        assert!(store
+            .list_usage_events_by_agent(&AgentId::generate())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn usage_events_same_millisecond_are_not_overwritten() {
+        let (store, _dir) = create_test_store();
+        let agent_id = AgentId::generate();
+
+        let first = tier_changed_event(&agent_id, 1_000, "pro");
+        let second = tier_changed_event(&agent_id, 1_000, "small");
+        store.append_usage_event(&first).unwrap();
+        store.append_usage_event(&second).unwrap();
+
+        let events = store.list_usage_events_by_agent(&agent_id).unwrap();
+        assert_eq!(events.len(), 2, "colliding keys must both be kept");
+        assert_eq!(events[0].event_id, first.event_id);
+        assert_eq!(events[1].event_id, second.event_id);
     }
 
     #[test]

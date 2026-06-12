@@ -1552,3 +1552,174 @@ async fn trigger_cleanup_on_agent_destroy() {
     resp.assert_status_ok();
     assert_eq!(resp.json::<Value>()["triggers"], json!([]));
 }
+
+// ---------------------------------------------------------------------------
+// Tier changes (Swarm TEE phase 10)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn change_tier_requires_auth() {
+    let (server, _tmp) = build_test_app();
+    let fake_id = "aa".repeat(16);
+    server
+        .post(&format!("/v1/agents/{fake_id}/tier"))
+        .json(&json!({"tier": "pro"}))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn change_tier_not_owner_forbidden() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+
+    let (hdr2, val2) = auth_header(OTHER_USER_UUID);
+    server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr2, val2)
+        .json(&json!({"tier": "pro"}))
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn change_tier_invalid_inputs() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    // Unknown tier name → 400.
+    let resp = server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"tier": "mega"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.json::<Value>()["error"]["code"], "bad_request");
+
+    // Invalid agent id → 400.
+    server
+        .post("/v1/agents/not-hex/tier")
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"tier": "pro"}))
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // Unknown agent → 404.
+    let ghost = "ef".repeat(16);
+    server
+        .post(&format!("/v1/agents/{ghost}/tier"))
+        .add_header(hdr, val)
+        .json(&json!({"tier": "pro"}))
+        .await
+        .assert_status(axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn change_tier_same_tier_noop_returns_200() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // Default create is "standard": a standard→standard request is a no-op.
+    let resp = server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr, val)
+        .json(&json!({"tier": "standard"}))
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["changed"], false);
+    assert_eq!(body["pod_recreated"], false);
+    assert_eq!(body["previous_tier"], "standard");
+    assert_eq!(body["tier"], "standard");
+    assert_eq!(body["status"], "running");
+}
+
+#[tokio::test]
+async fn change_tier_hibernating_is_record_only() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_hibernating_agent(&server).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    let resp = server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"tier": "pro"}))
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["pod_recreated"], false);
+    assert_eq!(body["previous_tier"], "standard");
+    assert_eq!(body["tier"], "pro");
+    assert_eq!(body["status"], "hibernating");
+
+    // The record carries the new tier; it applies on next wake.
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}"))
+        .add_header(hdr, val)
+        .await;
+    let body: Value = resp.json();
+    assert_eq!(body["tier"], "pro");
+    assert_eq!(body["status"], "hibernating");
+    assert_eq!(body["spec"]["cpu_millicores"], 2000);
+}
+
+#[tokio::test]
+async fn change_tier_running_recreates_pod() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    let resp = server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr.clone(), val.clone())
+        .json(&json!({"tier": "pro"}))
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["pod_recreated"], true);
+    assert_eq!(body["tier"], "pro");
+    assert_eq!(body["status"], "provisioning");
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}"))
+        .add_header(hdr, val)
+        .await;
+    let body: Value = resp.json();
+    assert_eq!(body["tier"], "pro");
+    assert_eq!(body["status"], "provisioning");
+}
+
+#[tokio::test]
+async fn change_tier_mid_transition_returns_409() {
+    let (server, _tmp) = build_test_app();
+    // Fresh create leaves the agent in Provisioning.
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    server
+        .post(&format!("/v1/agents/{agent_id}/tier"))
+        .add_header(hdr, val)
+        .json(&json!({"tier": "pro"}))
+        .await
+        .assert_status(axum::http::StatusCode::CONFLICT);
+}

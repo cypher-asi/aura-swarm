@@ -96,6 +96,37 @@ pub trait ControlPlane: Send + Sync {
     /// Wake a hibernating agent.
     async fn wake_agent(&self, user_id: &UserId, agent_id: &AgentId) -> Result<Agent>;
 
+    /// Change an agent's box tier (upgrade / downgrade).
+    ///
+    /// Semantics (Swarm TEE upgrade phase 10):
+    ///
+    /// - Same-tier request: no-op, returns the current state.
+    /// - Hibernating / Stopped / Error: the record is updated only; the new
+    ///   size takes effect on the next wake/start (no pod churn).
+    /// - Running / Idle: pre-flight credit check at the new tier's rate,
+    ///   active sessions are closed, then recreate-with-state (terminate
+    ///   pod → update spec → schedule pod, same path as restart). Sealed
+    ///   state on EFS is untouched.
+    /// - Legacy agent (`tier == None`): assigning a tier converts it to the
+    ///   new architecture (confidential isolation + sealed storage) and
+    ///   provisions its state DEK in the KBS — per-agent early migration.
+    /// - A `TierChanged` usage event with both hourly prices is appended in
+    ///   every non-noop case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ControlError::InvalidTier` for an unknown tier name,
+    /// `ControlError::InvalidState` if the agent is mid-transition
+    /// (Provisioning / Stopping), `ControlError::InsufficientCredits` if an
+    /// awake agent can't afford the new rate, plus the usual
+    /// `AgentNotFound` / `NotOwner` ownership errors.
+    async fn change_tier(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        tier: &str,
+    ) -> Result<crate::types::TierChangeOutcome>;
+
     // =========================================================================
     // Session Operations
     // =========================================================================
@@ -519,6 +550,97 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
         }
         Ok(())
     }
+
+    /// Append a `TierChanged` usage event capturing both hourly prices so
+    /// cost intervals split exactly at the change. Legacy agents carry no
+    /// `from` tier/price (they were billed by cpu/mem-hours).
+    async fn append_tier_changed_event(
+        &self,
+        agent_id: &AgentId,
+        from: Option<String>,
+        to: BoxTier,
+    ) -> Result<()> {
+        let event = aura_swarm_store::UsageEvent::new(
+            *agent_id,
+            aura_swarm_store::UsageEventKind::TierChanged {
+                from_hourly_price_cents: from
+                    .as_deref()
+                    .and_then(BoxTier::from_name)
+                    .map(|t| t.hourly_price_cents()),
+                from,
+                to: to.as_str().to_string(),
+                to_hourly_price_cents: to.hourly_price_cents(),
+            },
+        );
+        blocking_store(&self.store, move |s| Ok(s.append_usage_event(&event)?)).await
+    }
+
+    /// Recreate-with-state for an in-place spec change on an awake agent:
+    /// close active sessions, terminate the pod, persist the new spec (plus
+    /// the `TierChanged` event), and schedule a replacement pod — the same
+    /// path as restart. Sealed state on EFS is untouched, and the scheduler
+    /// re-registers the new pod with the billing reporter under the new SKU.
+    async fn recreate_pod_with_spec(
+        &self,
+        agent: &mut Agent,
+        new_spec: aura_swarm_store::AgentSpec,
+        previous_tier: Option<String>,
+        new_tier: BoxTier,
+    ) -> Result<()> {
+        let agent_id = agent.agent_id;
+
+        // The recreate interrupts in-flight runs, same as restart/stop today.
+        blocking_store(&self.store, move |s| {
+            let sessions = s.list_sessions_by_agent(&agent_id)?;
+            for sess in sessions {
+                if sess.status == aura_swarm_store::SessionStatus::Active {
+                    s.update_session_status(
+                        &sess.session_id,
+                        aura_swarm_store::SessionStatus::Closed,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
+        self.transition_state(agent, AgentState::Stopping).await?;
+
+        if let Err(e) = self.terminate_agent_pod(&agent_id).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to terminate agent pod on tier change"
+            );
+        }
+
+        // Persist the new spec with the Stopped transition, then record the
+        // tier change before the new pod is scheduled so the event is never
+        // lost to a scheduling failure.
+        agent.spec = new_spec;
+        self.transition_state(agent, AgentState::Stopped).await?;
+        self.append_tier_changed_event(&agent_id, previous_tier, new_tier)
+            .await?;
+
+        self.transition_state(agent, AgentState::Provisioning)
+            .await?;
+
+        if let Err(e) = self.schedule_agent_pod(agent).await {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to schedule agent pod on tier change"
+            );
+            blocking_store(&self.store, move |s| {
+                s.update_agent_status(&agent_id, AgentState::Error).ok();
+                Ok(())
+            })
+            .await?;
+            return Err(e);
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -867,6 +989,106 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
         tracing::info!(agent_id = %agent_id, "Waking agent");
 
         Ok(agent)
+    }
+
+    async fn change_tier(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        tier: &str,
+    ) -> Result<crate::types::TierChangeOutcome> {
+        let new_tier =
+            BoxTier::from_name(tier).ok_or_else(|| ControlError::InvalidTier(tier.to_string()))?;
+
+        let mut agent = self.get_and_verify(user_id, agent_id).await?;
+        let previous_tier = agent.spec.tier.clone();
+
+        // Same-tier request: no-op, return the current state.
+        if previous_tier.as_deref() == Some(new_tier.as_str()) {
+            return Ok(crate::types::TierChangeOutcome {
+                previous_tier,
+                tier: new_tier.as_str().to_string(),
+                changed: false,
+                pod_recreated: false,
+                agent,
+            });
+        }
+
+        let recreate_pod = match agent.status {
+            // No pod: record-only, the new size applies on next wake/start.
+            AgentState::Hibernating | AgentState::Stopped | AgentState::Error => false,
+            // Awake: recreate-with-state, same path as restart.
+            AgentState::Running | AgentState::Idle => true,
+            // Mid-transition: the recreate would need a stop that the state
+            // machine forbids; the caller retries once the agent settles.
+            AgentState::Provisioning | AgentState::Stopping => {
+                return Err(ControlError::InvalidState {
+                    agent_id: *agent_id,
+                    from: agent.status,
+                    to: AgentState::Stopping,
+                });
+            }
+        };
+
+        if recreate_pod {
+            // Pre-flight: the user must afford the new tier's rate before
+            // any pod churn happens.
+            self.check_agent_credits(user_id, new_tier).await?;
+        }
+
+        // The tier dictates resources, isolation (ConfidentialVM) and sealed
+        // storage with the deterministic state-key id; only runtime_version
+        // carries over. For an already-tiered agent this is purely a resize.
+        let new_spec = new_tier.to_spec(agent_id, agent.spec.runtime_version.clone());
+
+        // Legacy agent (tier == None) early migration: it has no state DEK
+        // in the KBS yet, and the confidential pod it becomes cannot open
+        // its sealed state without one. Provision it before anything is
+        // persisted or recreated — on failure the record is untouched.
+        if previous_tier.is_none() {
+            let pending = Agent {
+                spec: new_spec.clone(),
+                ..agent.clone()
+            };
+            if let Err(e) = self.provision_state_dek(&pending).await {
+                tracing::error!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "Failed to provision state DEK in KBS for legacy tier migration"
+                );
+                return Err(ControlError::Internal(format!(
+                    "failed to provision agent state DEK in KBS: {e}"
+                )));
+            }
+        }
+
+        if recreate_pod {
+            self.recreate_pod_with_spec(&mut agent, new_spec, previous_tier.clone(), new_tier)
+                .await?;
+        } else {
+            agent.spec = new_spec;
+            agent.updated_at = Utc::now();
+            let snapshot = agent.clone();
+            blocking_store(&self.store, move |s| Ok(s.put_agent(&snapshot)?)).await?;
+            self.append_tier_changed_event(agent_id, previous_tier.clone(), new_tier)
+                .await?;
+        }
+
+        tracing::info!(
+            agent_id = %agent_id,
+            from = previous_tier.as_deref().unwrap_or("<legacy>"),
+            to = %new_tier,
+            pod_recreated = recreate_pod,
+            "Changed agent tier"
+        );
+
+        Ok(crate::types::TierChangeOutcome {
+            agent,
+            previous_tier,
+            tier: new_tier.as_str().to_string(),
+            changed: true,
+            pod_recreated: recreate_pod,
+        })
     }
 
     // =========================================================================
@@ -1283,6 +1505,59 @@ mod tests {
         }
     }
 
+    /// Mock scheduler client recording schedule/terminate calls (with the
+    /// spec each pod was scheduled with) to verify recreate flows.
+    #[derive(Default)]
+    struct MockSchedulerClient {
+        scheduled: Mutex<Vec<(AgentId, aura_swarm_store::AgentSpec)>>,
+        terminated: Mutex<Vec<AgentId>>,
+    }
+
+    impl MockSchedulerClient {
+        fn scheduled(&self) -> Vec<(AgentId, aura_swarm_store::AgentSpec)> {
+            self.scheduled.lock().unwrap().clone()
+        }
+
+        fn terminated(&self) -> Vec<AgentId> {
+            self.terminated.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SchedulerClient for MockSchedulerClient {
+        async fn schedule_agent(
+            &self,
+            agent_id: &AgentId,
+            _user_id_hex: &str,
+            _agent_name: &str,
+            spec: &aura_swarm_store::AgentSpec,
+        ) -> Result<()> {
+            self.scheduled.lock().unwrap().push((*agent_id, spec.clone()));
+            Ok(())
+        }
+
+        async fn terminate_agent(&self, agent_id: &AgentId) -> Result<()> {
+            self.terminated.lock().unwrap().push(*agent_id);
+            Ok(())
+        }
+
+        async fn get_pod_status(
+            &self,
+            _agent_id: &AgentId,
+        ) -> Result<crate::scheduler_client::PodStatusResponse> {
+            Ok(crate::scheduler_client::PodStatusResponse {
+                phase: "Running".to_string(),
+                ready: true,
+                restart_count: 0,
+                message: None,
+            })
+        }
+
+        async fn get_pod_endpoint(&self, _agent_id: &AgentId) -> Result<Option<String>> {
+            Ok(Some("localhost:8080".to_string()))
+        }
+    }
+
     fn setup() -> (
         ControlPlaneService<RocksStore, NoopSchedulerClient>,
         TempDir,
@@ -1309,6 +1584,76 @@ mod tests {
         let (mut service, dir, user_id) = setup();
         service.set_kbs(kbs);
         (service, dir, user_id)
+    }
+
+    fn setup_with_scheduler(
+        scheduler: Arc<MockSchedulerClient>,
+    ) -> (
+        ControlPlaneService<RocksStore, MockSchedulerClient>,
+        TempDir,
+        UserId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(RocksStore::open(dir.path()).unwrap());
+        let config = ControlConfig {
+            max_agents_per_user: 3,
+            ..Default::default()
+        };
+        let service = ControlPlaneService::with_scheduler(store, config, scheduler);
+        let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        (service, dir, user_id)
+    }
+
+    /// A legacy (pre-migration) agent record: no tier, microVM isolation,
+    /// plaintext state. Can no longer be produced by the create API.
+    fn legacy_agent(user_id: UserId, status: AgentState) -> Agent {
+        let now = Utc::now();
+        Agent {
+            agent_id: AgentId::generate(),
+            user_id,
+            name: "legacy-agent".to_string(),
+            status,
+            spec: aura_swarm_store::AgentSpec {
+                cpu_millicores: 500,
+                memory_mb: 512,
+                runtime_version: "v1".to_string(),
+                isolation: Some(aura_swarm_store::IsolationLevel::MicroVM),
+                tier: None,
+                storage_encryption: None,
+            },
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: None,
+            error_message: None,
+        }
+    }
+
+    /// Billing checker wired to a mock zbilling that always reports an
+    /// insufficient balance (fail-closed).
+    async fn insufficient_billing() -> (Arc<BillingChecker>, wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/usage/check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sufficient": false,
+                "balance_cents": 5,
+                "required_cents": 30,
+            })))
+            .mount(&server)
+            .await;
+
+        let checker = BillingChecker::new_shared(crate::billing::BillingConfig {
+            url: server.uri(),
+            api_key: "test-key".to_string(),
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        })
+        .unwrap();
+        (checker, server)
     }
 
     #[tokio::test]
@@ -2399,5 +2744,399 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(service.store.list_all_process_triggers().unwrap().is_empty());
+    }
+
+    // =========================================================================
+    // Tier changes (Swarm TEE upgrade phase 10)
+    // =========================================================================
+
+    use aura_swarm_store::UsageEventKind;
+
+    #[tokio::test]
+    async fn change_tier_invalid_tier_rejected() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+
+        let result = service.change_tier(&user_id, &agent.agent_id, "mega").await;
+        assert!(matches!(result, Err(ControlError::InvalidTier(t)) if t == "mega"));
+    }
+
+    #[tokio::test]
+    async fn change_tier_requires_ownership() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+
+        let other = UserId::from_uuid(uuid::Uuid::new_v4());
+        let result = service.change_tier(&other, &agent.agent_id, "pro").await;
+        assert!(matches!(result, Err(ControlError::NotOwner { .. })));
+    }
+
+    #[tokio::test]
+    async fn change_tier_same_tier_is_noop() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        // Default create is "standard"; agent is Running.
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let outcome = service
+            .change_tier(&user_id, &agent.agent_id, "standard")
+            .await
+            .unwrap();
+        assert!(!outcome.changed);
+        assert!(!outcome.pod_recreated);
+        assert_eq!(outcome.previous_tier.as_deref(), Some("standard"));
+        assert_eq!(outcome.tier, "standard");
+        assert_eq!(outcome.agent.status, AgentState::Running);
+
+        // No pod churn beyond the create, and no usage event recorded.
+        assert!(scheduler.terminated().is_empty());
+        assert_eq!(scheduler.scheduled().len(), 1);
+        assert!(service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_tier_asleep_updates_record_only() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Hibernating)
+            .unwrap();
+
+        let outcome = service
+            .change_tier(&user_id, &agent.agent_id, "pro")
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert!(!outcome.pod_recreated, "asleep agents must not churn pods");
+        assert_eq!(outcome.previous_tier.as_deref(), Some("standard"));
+        assert_eq!(outcome.tier, "pro");
+
+        // Record updated in place; state untouched until next wake.
+        let stored = service.store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(stored.status, AgentState::Hibernating);
+        assert_eq!(stored.spec.tier.as_deref(), Some("pro"));
+        assert_eq!(stored.spec.cpu_millicores, 2000);
+        assert_eq!(stored.spec.memory_mb, 4096);
+
+        // No pod calls beyond the original create.
+        assert!(scheduler.terminated().is_empty());
+        assert_eq!(scheduler.scheduled().len(), 1);
+
+        // TierChanged event with both hourly prices.
+        let events = service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            UsageEventKind::TierChanged {
+                from: Some("standard".to_string()),
+                to: "pro".to_string(),
+                from_hourly_price_cents: Some(BoxTier::Standard.hourly_price_cents()),
+                to_hourly_price_cents: BoxTier::Pro.hourly_price_cents(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn change_tier_awake_recreates_pod_and_closes_sessions() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+        let session = service
+            .create_session(&user_id, &agent.agent_id, SessionConfig::default())
+            .await
+            .unwrap();
+
+        let outcome = service
+            .change_tier(&user_id, &agent.agent_id, "small")
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert!(outcome.pod_recreated);
+        assert_eq!(outcome.tier, "small");
+        assert_eq!(outcome.agent.status, AgentState::Provisioning);
+
+        // Recreate-with-state: terminate then schedule with the new spec.
+        assert_eq!(scheduler.terminated(), vec![agent.agent_id]);
+        let schedule_calls = scheduler.scheduled();
+        assert_eq!(schedule_calls.len(), 2, "create + tier-change recreate");
+        let (sched_id, sched_spec) = &schedule_calls[1];
+        assert_eq!(*sched_id, agent.agent_id);
+        assert_eq!(sched_spec.tier.as_deref(), Some("small"));
+        assert_eq!(sched_spec.cpu_millicores, 500);
+        assert_eq!(sched_spec.memory_mb, 1024);
+
+        // The in-flight session was closed by the recreate.
+        let sess = service
+            .get_session(&user_id, &session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(sess.status, SessionStatus::Closed);
+
+        // Downgrade event captured with both prices.
+        let events = service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            UsageEventKind::TierChanged {
+                from: Some("standard".to_string()),
+                to: "small".to_string(),
+                from_hourly_price_cents: Some(BoxTier::Standard.hourly_price_cents()),
+                to_hourly_price_cents: BoxTier::Small.hourly_price_cents(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn change_tier_rejected_mid_transition() {
+        let (service, _dir, user_id) = setup();
+
+        // Fresh create leaves the agent in Provisioning.
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+
+        let result = service.change_tier(&user_id, &agent.agent_id, "pro").await;
+        assert!(matches!(result, Err(ControlError::InvalidState { .. })));
+
+        // Nothing changed and no event was recorded.
+        let stored = service.store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(stored.spec.tier.as_deref(), Some("standard"));
+        assert!(service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_tier_legacy_asleep_provisions_dek_and_converts() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let legacy = legacy_agent(user_id, AgentState::Hibernating);
+        service.store.put_agent(&legacy).unwrap();
+
+        let outcome = service
+            .change_tier(&user_id, &legacy.agent_id, "standard")
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert!(!outcome.pod_recreated);
+        assert_eq!(outcome.previous_tier, None, "legacy agents have no tier");
+
+        // The DEK was provisioned under the deterministic key id even though
+        // no pod recreate happens until the next wake.
+        let expected_key_id = format!("swarm/agents/{}/state-key", legacy.agent_id);
+        assert_eq!(kbs.provisioned(), vec![expected_key_id.clone()]);
+
+        // Converted to the new architecture: confidential + sealed.
+        let stored = service.store.get_agent(&legacy.agent_id).unwrap().unwrap();
+        assert_eq!(stored.spec.tier.as_deref(), Some("standard"));
+        assert_eq!(
+            stored.spec.isolation,
+            Some(aura_swarm_store::IsolationLevel::ConfidentialVM)
+        );
+        assert_eq!(
+            stored.spec.storage_encryption.as_ref().unwrap().key_id(),
+            expected_key_id
+        );
+        assert_eq!(stored.status, AgentState::Hibernating);
+
+        // Event records the legacy origin: no from-tier, no from-price.
+        let events = service
+            .store
+            .list_usage_events_by_agent(&legacy.agent_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            UsageEventKind::TierChanged {
+                from: None,
+                to: "standard".to_string(),
+                from_hourly_price_cents: None,
+                to_hourly_price_cents: BoxTier::Standard.hourly_price_cents(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn change_tier_legacy_awake_provisions_dek_before_recreate() {
+        let scheduler = Arc::new(MockSchedulerClient::default());
+        let (mut service, _dir, user_id) = setup_with_scheduler(Arc::clone(&scheduler));
+        let kbs = Arc::new(MockKbsClient::default());
+        let kbs_for_service: Arc<MockKbsClient> = Arc::clone(&kbs);
+        service.set_kbs(kbs_for_service);
+
+        let legacy = legacy_agent(user_id, AgentState::Idle);
+        service.store.put_agent(&legacy).unwrap();
+
+        let outcome = service
+            .change_tier(&user_id, &legacy.agent_id, "pro")
+            .await
+            .unwrap();
+        assert!(outcome.pod_recreated);
+
+        // DEK provisioned, pod recreated on the new (confidential) spec.
+        let expected_key_id = format!("swarm/agents/{}/state-key", legacy.agent_id);
+        assert_eq!(kbs.provisioned(), vec![expected_key_id]);
+        assert_eq!(scheduler.terminated(), vec![legacy.agent_id]);
+        let schedule_calls = scheduler.scheduled();
+        assert_eq!(schedule_calls.len(), 1);
+        assert_eq!(
+            schedule_calls[0].1.isolation,
+            Some(aura_swarm_store::IsolationLevel::ConfidentialVM)
+        );
+        assert_eq!(schedule_calls[0].1.tier.as_deref(), Some("pro"));
+    }
+
+    #[tokio::test]
+    async fn change_tier_does_not_reprovision_existing_dek() {
+        let kbs = Arc::new(MockKbsClient::default());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        // Create provisions the DEK once.
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tee-agent"))
+            .await
+            .unwrap();
+        assert_eq!(kbs.provisioned().len(), 1);
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        service
+            .change_tier(&user_id, &agent.agent_id, "pro")
+            .await
+            .unwrap();
+
+        // Re-provisioning would overwrite the DEK and brick the sealed
+        // state; a tiered agent's tier change must never touch the KBS.
+        assert_eq!(kbs.provisioned().len(), 1);
+        assert!(kbs.revoked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_tier_legacy_dek_provision_failure_aborts() {
+        let kbs = Arc::new(MockKbsClient::failing());
+        let (service, _dir, user_id) = setup_with_kbs(Arc::clone(&kbs));
+
+        let legacy = legacy_agent(user_id, AgentState::Hibernating);
+        service.store.put_agent(&legacy).unwrap();
+
+        let result = service.change_tier(&user_id, &legacy.agent_id, "pro").await;
+        assert!(matches!(result, Err(ControlError::Internal(_))));
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("DEK"), "error should mention the DEK: {msg}");
+
+        // The record is untouched: still legacy, still no event.
+        let stored = service.store.get_agent(&legacy.agent_id).unwrap().unwrap();
+        assert_eq!(stored.spec.tier, None);
+        assert_eq!(stored.spec.storage_encryption, None);
+        assert!(service
+            .store
+            .list_usage_events_by_agent(&legacy.agent_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_tier_insufficient_credits_rejects_awake_upgrade() {
+        let (mut service, _dir, user_id) = setup();
+
+        // Create before wiring in the failing billing checker.
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Running)
+            .unwrap();
+
+        let (billing, _server) = insufficient_billing().await;
+        service.set_billing(billing);
+
+        let result = service.change_tier(&user_id, &agent.agent_id, "pro").await;
+        assert!(matches!(
+            result,
+            Err(ControlError::InsufficientCredits { .. })
+        ));
+
+        // Pre-flight failed before any mutation: tier, state, and event log
+        // are all untouched.
+        let stored = service.store.get_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(stored.spec.tier.as_deref(), Some("standard"));
+        assert_eq!(stored.status, AgentState::Running);
+        assert!(service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_tier_asleep_skips_credit_check() {
+        let (mut service, _dir, user_id) = setup();
+
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("tier-agent"))
+            .await
+            .unwrap();
+        service
+            .store
+            .update_agent_status(&agent.agent_id, AgentState::Hibernating)
+            .unwrap();
+
+        let (billing, _server) = insufficient_billing().await;
+        service.set_billing(billing);
+
+        // Record-only changes have no pre-flight: the check happens when the
+        // agent next wakes onto the new rate.
+        let outcome = service
+            .change_tier(&user_id, &agent.agent_id, "pro")
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.tier, "pro");
     }
 }

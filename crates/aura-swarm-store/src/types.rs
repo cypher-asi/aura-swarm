@@ -456,6 +456,70 @@ pub struct ProcessTrigger {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A usage/cost event recorded for an agent (Swarm TEE upgrade phase 10+).
+///
+/// Events live in the `usage_events` CF keyed by
+/// `agent_id || timestamp_millis` (big-endian) so a per-agent prefix scan
+/// yields a time-ordered log. Phase 10 only writes [`UsageEventKind::TierChanged`];
+/// phase 11 adds the remaining kinds plus aggregation/APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageEvent {
+    /// Unique event id.
+    pub event_id: uuid::Uuid,
+    /// Agent the event belongs to.
+    pub agent_id: AgentId,
+    /// When the event occurred.
+    pub timestamp: DateTime<Utc>,
+    /// What happened.
+    pub kind: UsageEventKind,
+}
+
+impl UsageEvent {
+    /// Build a new event for `agent_id`, stamped now with a fresh id.
+    #[must_use]
+    pub fn new(agent_id: AgentId, kind: UsageEventKind) -> Self {
+        Self {
+            event_id: uuid::Uuid::new_v4(),
+            agent_id,
+            timestamp: Utc::now(),
+            kind,
+        }
+    }
+
+    /// The event timestamp as non-negative Unix millis (the storage-key
+    /// timestamp component).
+    #[must_use]
+    pub fn timestamp_millis(&self) -> u64 {
+        u64::try_from(self.timestamp.timestamp_millis()).unwrap_or(0)
+    }
+}
+
+/// What a [`UsageEvent`] records.
+///
+/// Internally tagged (`kind`) so phase 11 can extend the enum with
+/// `PodScheduled` / `PodTerminated` / `Hibernated` / `Woke` / `TriggerFired`
+/// without breaking CBOR decoding of already-persisted events: decoding
+/// dispatches on the stored tag string, never on variant order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageEventKind {
+    /// The agent's box tier changed (upgrade, downgrade, or legacy-agent
+    /// early migration). Both hourly prices are captured at event time so
+    /// cost intervals split exactly at the change.
+    TierChanged {
+        /// Tier before the change; `None` for a legacy agent that was
+        /// assigned its first tier (per-agent early migration).
+        from: Option<String>,
+        /// Tier after the change.
+        to: String,
+        /// Hourly price of the old tier in cents; `None` for legacy agents
+        /// (they were billed by cpu/mem-hours, not a tier rate).
+        from_hourly_price_cents: Option<u32>,
+        /// Hourly price of the new tier in cents.
+        to_hourly_price_cents: u32,
+    },
+}
+
 /// A user record stored in the database (synced from zOS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -651,6 +715,65 @@ mod tests {
         assert_eq!(
             StorageEncryption::sealed_for(&agent_id),
             StorageEncryption::sealed_for(&agent_id)
+        );
+    }
+
+    #[test]
+    fn usage_event_cbor_roundtrip() {
+        let event = UsageEvent::new(
+            AgentId::generate(),
+            UsageEventKind::TierChanged {
+                from: Some("standard".to_string()),
+                to: "pro".to_string(),
+                from_hourly_price_cents: Some(8),
+                to_hourly_price_cents: 15,
+            },
+        );
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&event, &mut buf).unwrap();
+        let parsed: UsageEvent = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    /// Forward-compatibility: phase 11 extends `UsageEventKind` with more
+    /// variants. Decoding must dispatch on the serde `kind` tag, so an
+    /// extended enum still reads today's persisted `TierChanged` records.
+    #[test]
+    fn usage_event_kind_decodes_under_extended_enum() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum FutureUsageEventKind {
+            PodScheduled {
+                tier: String,
+            },
+            TierChanged {
+                from: Option<String>,
+                to: String,
+                from_hourly_price_cents: Option<u32>,
+                to_hourly_price_cents: u32,
+            },
+            Hibernated,
+        }
+
+        let current = UsageEventKind::TierChanged {
+            from: None,
+            to: "standard".to_string(),
+            from_hourly_price_cents: None,
+            to_hourly_price_cents: 8,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&current, &mut buf).unwrap();
+
+        let parsed: FutureUsageEventKind = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(
+            parsed,
+            FutureUsageEventKind::TierChanged {
+                from: None,
+                to: "standard".to_string(),
+                from_hourly_price_cents: None,
+                to_hourly_price_cents: 8,
+            }
         );
     }
 
