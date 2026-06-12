@@ -212,7 +212,16 @@ resource "aws_security_group_rule" "cluster_to_nodes" {
 }
 
 #------------------------------------------------------------------------------
-# EKS Managed Node Group
+# EKS Managed Node Group - System
+#
+# Hosts the platform system components (gateway, scheduler, CoreDNS, EFS
+# CSI, CoCo operator controller, Trustee): it is the only untainted pool.
+#
+# R3 cleanup: this group used to double as the kata-fc microVM agent pool
+# (labeled katacontainers.io/kata-runtime=true). The kata-fc runtime was
+# retired with the legacy agents — all agent pods now run on the tainted
+# confidential (SEV-SNP) pool below — so the kata label is gone and the
+# group is sized for system workloads only.
 #------------------------------------------------------------------------------
 
 resource "aws_eks_node_group" "main" {
@@ -237,9 +246,7 @@ resource "aws_eks_node_group" "main" {
   }
 
   labels = {
-    role = "agent"
-    # Label for Kata runtime selection
-    "katacontainers.io/kata-runtime" = "true"
+    role = "system"
   }
 
   tags = merge(var.tags, {

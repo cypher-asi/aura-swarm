@@ -44,34 +44,23 @@ pub struct AgentSpec {
     #[serde(default)]
     pub isolation: Option<IsolationLevel>,
     /// Box tier this spec was derived from (e.g. "standard").
-    /// `None` means "legacy agent, pre-migration"; every agent created
-    /// after R1 of the TEE upgrade carries a tier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
+    ///
+    /// Required since R3 of the TEE upgrade: every live record carries a
+    /// tier (the R2 migration rewrote legacy records). The only decode
+    /// path for pre-tier record shapes lives in `migrations.rs`.
+    pub tier: String,
     /// Storage encryption mode for the agent's persistent state.
-    /// `None` means "legacy agent, pre-migration" (plaintext state).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_encryption: Option<StorageEncryption>,
-}
-
-impl Default for AgentSpec {
-    fn default() -> Self {
-        Self {
-            cpu_millicores: 500,
-            memory_mb: 512,
-            runtime_version: "latest".to_string(),
-            isolation: None,
-            tier: None,
-            storage_encryption: None,
-        }
-    }
+    ///
+    /// Required since R3 of the TEE upgrade: every agent's state is
+    /// sealed. The only decode path for pre-sealed record shapes lives
+    /// in `migrations.rs`.
+    pub storage_encryption: StorageEncryption,
 }
 
 /// Storage encryption mode for an agent's persistent state volume.
 ///
-/// Legacy agents (created before the TEE upgrade) carry no value here
-/// (`AgentSpec::storage_encryption == None`) and run with plaintext state;
-/// every agent created after R1 is `Sealed`.
+/// Every agent's state is `Sealed`; the enum exists so future modes
+/// (e.g. key rotation schemes) stay representable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageEncryption {
@@ -165,8 +154,8 @@ impl BoxTier {
     /// Map a raw resource request to the nearest tier:
     /// cpu <= 500m -> small, <= 1000m -> standard, else pro.
     ///
-    /// Used to keep accepting the legacy `spec` create input during the
-    /// dual-mode window (and by the R2 store migration).
+    /// Used only by the v1 -> v2 store migration (`migrations.rs`) when
+    /// rewriting pre-tier records from straggler DBs restored from backup.
     #[must_use]
     pub const fn nearest_for_cpu(cpu_millicores: u32) -> Self {
         if cpu_millicores <= 500 {
@@ -224,8 +213,8 @@ impl BoxTier {
             memory_mb: self.memory_mb(),
             runtime_version: runtime_version.into(),
             isolation: Some(self.isolation()),
-            tier: Some(self.as_str().to_string()),
-            storage_encryption: Some(StorageEncryption::sealed_for(agent_id)),
+            tier: self.as_str().to_string(),
+            storage_encryption: StorageEncryption::sealed_for(agent_id),
         }
     }
 }
@@ -258,8 +247,8 @@ impl std::error::Error for UnknownBoxTier {}
 
 /// Isolation level for agent execution.
 ///
-/// Determines whether the agent runs in a lightweight container,
-/// a microVM with its own kernel, or a confidential (TEE) VM.
+/// Determines whether the agent runs in a lightweight container
+/// or a confidential (TEE) VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
@@ -267,15 +256,9 @@ pub enum IsolationLevel {
     /// Faster startup, lower overhead, less isolation.
     /// Survives strictly for local dev-mode.
     Container,
-    /// Run in a Firecracker microVM (dedicated kernel).
-    ///
-    /// LEGACY ONLY: kept for agents created before the TEE upgrade during
-    /// the dual-mode window; no new agents are created at this level.
-    /// Removed entirely in R3 of the Swarm TEE Upgrade plan.
-    #[default]
-    MicroVM,
     /// Run in a confidential SEV-SNP VM (`CoCo`: Kata + QEMU) with
-    /// attestation-gated sealed storage. The level for all new agents.
+    /// attestation-gated sealed storage. The level for all agents.
+    #[default]
     #[serde(rename = "confidential_vm")]
     ConfidentialVM,
 }
@@ -283,14 +266,12 @@ pub enum IsolationLevel {
 impl IsolationLevel {
     /// Get the Kubernetes `RuntimeClass` name for this isolation level.
     ///
-    /// Returns `None` for container isolation (uses default runtime),
-    /// `Some("kata-fc")` for microVM isolation, or
+    /// Returns `None` for container isolation (uses default runtime) or
     /// `Some("kata-qemu-snp")` for confidential VM isolation.
     #[must_use]
     pub const fn runtime_class(&self) -> Option<&'static str> {
         match self {
             Self::Container => None, // Use default container runtime
-            Self::MicroVM => Some("kata-fc"),
             Self::ConfidentialVM => Some("kata-qemu-snp"),
         }
     }
@@ -654,7 +635,6 @@ mod tests {
     #[test]
     fn isolation_level_runtime_class() {
         assert_eq!(IsolationLevel::Container.runtime_class(), None);
-        assert_eq!(IsolationLevel::MicroVM.runtime_class(), Some("kata-fc"));
         assert_eq!(
             IsolationLevel::ConfidentialVM.runtime_class(),
             Some("kata-qemu-snp")
@@ -667,15 +647,6 @@ mod tests {
         assert_eq!(json, "\"confidential_vm\"");
         let parsed: IsolationLevel = serde_json::from_str("\"confidential_vm\"").unwrap();
         assert_eq!(parsed, IsolationLevel::ConfidentialVM);
-    }
-
-    #[test]
-    fn agent_spec_default() {
-        let spec = AgentSpec::default();
-        assert_eq!(spec.cpu_millicores, 500);
-        assert_eq!(spec.memory_mb, 512);
-        assert_eq!(spec.runtime_version, "latest");
-        assert!(spec.isolation.is_none());
     }
 
     #[test]
@@ -693,9 +664,9 @@ mod tests {
                 cpu_millicores: 1000,
                 memory_mb: 2048,
                 runtime_version: "v2".to_string(),
-                isolation: Some(IsolationLevel::MicroVM),
-                tier: None,
-                storage_encryption: None,
+                isolation: Some(IsolationLevel::ConfidentialVM),
+                tier: "standard".to_string(),
+                storage_encryption: StorageEncryption::sealed_for(&agent_id),
             },
             created_at: now,
             updated_at: now,
@@ -778,9 +749,9 @@ mod tests {
         assert_eq!(spec.cpu_millicores, 1000);
         assert_eq!(spec.memory_mb, 2048);
         assert_eq!(spec.isolation, Some(IsolationLevel::ConfidentialVM));
-        assert_eq!(spec.tier.as_deref(), Some("standard"));
+        assert_eq!(spec.tier, "standard");
 
-        let enc = spec.storage_encryption.unwrap();
+        let enc = spec.storage_encryption;
         assert_eq!(enc.key_id(), format!("swarm/agents/{agent_id}/state-key"));
         assert_eq!(enc, StorageEncryption::sealed_for(&agent_id));
     }
@@ -889,62 +860,8 @@ mod tests {
         );
     }
 
-    /// Regression test: a pre-upgrade agent record (CBOR serialized WITHOUT
-    /// the `tier` / `storage_encryption` fields) must still deserialize, with
-    /// the new fields defaulting to `None` ("legacy agent, pre-migration").
-    #[test]
-    fn legacy_cbor_agent_record_still_deserializes() {
-        use serde::Serialize;
-
-        // Exact shape of AgentSpec / Agent before the TEE upgrade.
-        #[derive(Serialize)]
-        struct LegacyAgentSpec {
-            cpu_millicores: u32,
-            memory_mb: u32,
-            runtime_version: String,
-            isolation: Option<IsolationLevel>,
-        }
-
-        #[derive(Serialize)]
-        struct LegacyAgent {
-            agent_id: AgentId,
-            user_id: UserId,
-            name: String,
-            status: AgentState,
-            spec: LegacyAgentSpec,
-            created_at: DateTime<Utc>,
-            updated_at: DateTime<Utc>,
-            last_heartbeat_at: Option<DateTime<Utc>>,
-        }
-
-        let now = chrono::Utc::now();
-        let legacy = LegacyAgent {
-            agent_id: AgentId::generate(),
-            user_id: UserId::from_uuid(uuid::Uuid::new_v4()),
-            name: "pre-upgrade-agent".to_string(),
-            status: AgentState::Hibernating,
-            spec: LegacyAgentSpec {
-                cpu_millicores: 1000,
-                memory_mb: 2048,
-                runtime_version: "v1".to_string(),
-                isolation: Some(IsolationLevel::MicroVM),
-            },
-            created_at: now,
-            updated_at: now,
-            last_heartbeat_at: None,
-        };
-
-        let mut buf = Vec::new();
-        ciborium::into_writer(&legacy, &mut buf).unwrap();
-
-        let parsed: Agent = ciborium::from_reader(buf.as_slice()).unwrap();
-        assert_eq!(parsed.agent_id, legacy.agent_id);
-        assert_eq!(parsed.name, "pre-upgrade-agent");
-        assert_eq!(parsed.status, AgentState::Hibernating);
-        assert_eq!(parsed.spec.cpu_millicores, 1000);
-        assert_eq!(parsed.spec.isolation, Some(IsolationLevel::MicroVM));
-        assert_eq!(parsed.spec.tier, None, "legacy record must read as tier=None");
-        assert_eq!(parsed.spec.storage_encryption, None);
-        assert_eq!(parsed.error_message, None);
-    }
+    // The legacy-CBOR deserialization regression tests live in
+    // `migrations.rs` since R3: the live structs require `tier` /
+    // `storage_encryption`, and the migration module owns the only
+    // frozen legacy decode path.
 }

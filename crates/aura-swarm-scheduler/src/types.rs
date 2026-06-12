@@ -143,22 +143,10 @@ pub struct SchedulerConfig {
     pub gateway_token: String,
     /// URL of the Trustee KBS (key broker service), injected into
     /// confidential agent pods as `AURA_KBS_URL` so the harness can fetch
-    /// its state DEK after attestation. Legacy (non-confidential) pods do
-    /// not receive this variable.
+    /// its state DEK after attestation. Container (dev-mode) pods do not
+    /// receive this variable.
     #[serde(default = "default_kbs_url")]
     pub kbs_url: String,
-    /// Swarm TEE upgrade R2 migration gate
-    /// (`MIGRATION_RECREATE_LEGACY_PODS`, default `false`).
-    ///
-    /// When `true`, the desired-state reconciler treats a running pod
-    /// whose `runtimeClassName` differs from the desired spec's runtime
-    /// class as stale and rolling-recreates it (one per pass, same
-    /// pacing as stale-image replacement) — this is how legacy kata-fc
-    /// pods move onto SNP nodes after the store migration assigns them
-    /// confidential specs. When `false` (R1 behavior), runtime-class
-    /// mismatches are ignored so legacy pods are never churned.
-    #[serde(default)]
-    pub migration_recreate_legacy_pods: bool,
 }
 
 fn default_kbs_url() -> String {
@@ -169,7 +157,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             namespace: "swarm-agents".to_string(),
-            default_isolation: IsolationLevel::MicroVM,
+            default_isolation: IsolationLevel::ConfidentialVM,
             image: "ghcr.io/cypher-asi/aura-harness:latest".to_string(),
             control_plane_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
             gateway_url: "http://aura-swarm-gateway.swarm-system.svc:8080".to_string(),
@@ -184,7 +172,6 @@ impl Default for SchedulerConfig {
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
             kbs_url: default_kbs_url(),
-            migration_recreate_legacy_pods: false,
         }
     }
 }
@@ -207,7 +194,8 @@ impl SchedulerConfig {
     /// - `CONTROL_PLANE_URL`: Internal URL of the control plane service (deprecated)
     /// - `GATEWAY_URL`: Internal URL of the gateway service for status callbacks
     /// - `STATE_PVC_NAME`: PVC name for agent state storage
-    /// - `DEFAULT_ISOLATION`: Default isolation level ("container" or "microvm")
+    /// - `DEFAULT_ISOLATION`: Default isolation level ("container" for
+    ///   dev-mode or "confidential_vm")
     /// - `DEFAULT_CPU_MILLICORES`: Default CPU allocation
     /// - `DEFAULT_MEMORY_MB`: Default memory allocation
     /// - `MAX_CPU_MILLICORES`: Maximum CPU allowed
@@ -219,9 +207,6 @@ impl SchedulerConfig {
     /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
     /// - `KBS_URL`: Trustee KBS URL injected into confidential agent pods
     ///   as `AURA_KBS_URL`
-    /// - `MIGRATION_RECREATE_LEGACY_PODS`: R2 gate — when `1`/`true`, the
-    ///   reconciler recreates pods whose runtime class mismatches the
-    ///   desired spec (rolling legacy pods onto SNP)
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -248,7 +233,9 @@ impl SchedulerConfig {
         if let Ok(val) = std::env::var("DEFAULT_ISOLATION") {
             config.default_isolation = match val.to_lowercase().as_str() {
                 "container" | "runc" => IsolationLevel::Container,
-                "microvm" | "kata" | "kata-fc" => IsolationLevel::MicroVM,
+                "confidential_vm" | "confidential" | "snp" | "kata-qemu-snp" => {
+                    IsolationLevel::ConfidentialVM
+                }
                 _ => config.default_isolation,
             };
         }
@@ -288,10 +275,6 @@ impl SchedulerConfig {
         }
         if let Ok(val) = std::env::var("KBS_URL") {
             config.kbs_url = val;
-        }
-        if let Ok(val) = std::env::var("MIGRATION_RECREATE_LEGACY_PODS") {
-            let v = val.trim();
-            config.migration_recreate_legacy_pods = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
         config
@@ -350,17 +333,16 @@ mod tests {
     fn scheduler_config_defaults() {
         let config = SchedulerConfig::default();
         assert_eq!(config.namespace, "swarm-agents");
-        assert_eq!(config.default_isolation, IsolationLevel::MicroVM);
-        assert_eq!(config.default_isolation.runtime_class(), Some("kata-fc"));
+        assert_eq!(config.default_isolation, IsolationLevel::ConfidentialVM);
+        assert_eq!(
+            config.default_isolation.runtime_class(),
+            Some("kata-qemu-snp")
+        );
         assert_eq!(config.default_cpu_millicores, 500);
         assert_eq!(config.default_memory_mb, 512);
         assert_eq!(
             config.kbs_url,
             "http://kbs.swarm-system.svc.cluster.local:8080"
-        );
-        assert!(
-            !config.migration_recreate_legacy_pods,
-            "R2 legacy-pod recreation must be opt-in (R1 default off)"
         );
     }
 

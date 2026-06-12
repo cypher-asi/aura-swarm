@@ -2,9 +2,9 @@
 # Environment: dev
 # Generated: 2026-03-25T14:06:31Z
 
-aws_region          = "us-east-2"
-project_name        = "aura-swarm"
-environment         = "dev"
+aws_region   = "us-east-2"
+project_name = "aura-swarm"
+environment  = "dev"
 
 # Network configuration
 vpc_cidr            = "10.0.0.0/16"
@@ -13,12 +13,12 @@ private_subnet_cidr = "10.0.2.0/24"
 agent_subnet_cidr   = "10.0.3.0/24"
 storage_subnet_cidr = "10.0.4.0/24"
 
-# EKS configuration
-eks_version         = "1.31"
-node_instance_type  = "m5.2xlarge"
-node_desired_count  = 2
-node_min_count      = 1
-node_max_count      = 5
+# EKS configuration (system node group; agents run on the confidential pool)
+eks_version        = "1.31"
+node_instance_type = "m5.2xlarge"
+node_desired_count = 2
+node_min_count     = 1
+node_max_count     = 3
 
 # Feature flags — deploying network; other flags preserved from previous state
 enable_network = true

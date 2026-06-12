@@ -53,16 +53,6 @@ spec:
                   name: aura-swarm-config
                   key: DEFAULT_ISOLATION
                   optional: true
-            # R2 migration gate: when "true", the desired-state reconciler
-            # rolling-recreates pods whose runtimeClassName mismatches their
-            # (migrated, confidential) spec, moving legacy kata-fc pods onto
-            # SNP. Leave unset/false outside the R2 migration window.
-            - name: MIGRATION_RECREATE_LEGACY_PODS
-              valueFrom:
-                configMapKeyRef:
-                  name: aura-swarm-config
-                  key: MIGRATION_RECREATE_LEGACY_PODS
-                  optional: true
             # Gateway URL for status callbacks
             - name: GATEWAY_URL
               valueFrom:

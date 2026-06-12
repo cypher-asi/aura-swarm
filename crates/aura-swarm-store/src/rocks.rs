@@ -703,7 +703,7 @@ impl Store for RocksStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AgentSpec, SessionConfig};
+    use crate::types::{BoxTier, SessionConfig};
     use tempfile::TempDir;
 
     fn create_test_store() -> (RocksStore, TempDir) {
@@ -713,12 +713,13 @@ mod tests {
     }
 
     fn create_test_agent(user_id: &UserId, name: &str) -> Agent {
+        let agent_id = AgentId::generate_deterministic(user_id, name, 42);
         Agent {
-            agent_id: AgentId::generate_deterministic(user_id, name, 42),
+            agent_id,
             user_id: *user_id,
             name: name.to_string(),
             status: AgentState::Running,
-            spec: AgentSpec::default(),
+            spec: BoxTier::Standard.to_spec(&agent_id, "latest"),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_heartbeat_at: None,

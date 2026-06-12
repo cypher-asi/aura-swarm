@@ -3,7 +3,7 @@
 //! This crate provides the [`Scheduler`] trait and [`K8sScheduler`] implementation
 //! for managing agent pods in a Kubernetes cluster. It handles:
 //!
-//! - Pod creation with Kata Containers runtime for microVM isolation
+//! - Pod creation with the `kata-qemu-snp` runtime for confidential VM isolation
 //! - Pod lifecycle management (start, stop, health checks)
 //! - Endpoint caching for fast routing
 //! - Status reconciliation with the control plane
@@ -38,7 +38,7 @@
 //!                              │
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    MicroVM Pods (Kata + Firecracker)             │
+//! │              Confidential VM Pods (Kata + QEMU SNP)              │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -47,7 +47,7 @@
 //! ```no_run
 //! use aura_swarm_scheduler::{K8sScheduler, Scheduler, SchedulerConfig};
 //! use aura_swarm_core::{AgentId, UserId};
-//! use aura_swarm_store::AgentSpec;
+//! use aura_swarm_store::BoxTier;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create scheduler with default config
@@ -57,7 +57,7 @@
 //! // Schedule an agent
 //! let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //! let agent_id = AgentId::generate();
-//! let spec = AgentSpec::default();
+//! let spec = BoxTier::Standard.to_spec(&agent_id, "latest");
 //!
 //! scheduler.schedule_agent(&agent_id, &user_id.to_string(), "my-agent", &spec).await?;
 //!
@@ -81,14 +81,14 @@
 //! ```text
 //! use aura_swarm_scheduler::{Scheduler, MockScheduler};
 //! use aura_swarm_core::{AgentId, UserId};
-//! use aura_swarm_store::AgentSpec;
+//! use aura_swarm_store::BoxTier;
 //!
 //! async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //!     let scheduler = MockScheduler::new();
 //!
 //!     let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
 //!     let agent_id = AgentId::generate();
-//!     let spec = AgentSpec::default();
+//!     let spec = BoxTier::Standard.to_spec(&agent_id, "latest");
 //!
 //!     scheduler.schedule_agent(&agent_id, &user_id.to_string(), "test-agent", &spec).await?;
 //!     assert_eq!(scheduler.pod_count(), 1);

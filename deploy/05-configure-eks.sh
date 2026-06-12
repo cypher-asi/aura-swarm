@@ -4,8 +4,7 @@
 # Configures:
 # - kubectl with cluster credentials
 # - AWS EFS CSI Driver
-# - Kata Containers runtime (or kata-qemu for dev)
-# - RuntimeClasses (kata-fc, kata-qemu, kata-qemu-snp)
+# - RuntimeClasses (kata-qemu, kata-qemu-snp)
 # - Confidential Containers (CoCo) operator for the SEV-SNP node pool
 
 set -euo pipefail
@@ -161,34 +160,21 @@ fi
 echo ""
 
 #------------------------------------------------------------------------------
-# Install Kata Containers Runtime
+# Install Kata RuntimeClasses
 #------------------------------------------------------------------------------
 
-echo "Installing Kata Containers runtime..."
-echo ""
-echo -e "${YELLOW}Note: For production, Kata with Firecracker requires bare metal"
-echo "or instances with nested virtualization. For dev/testing, using"
-echo "kata-qemu handler on standard instances.${NC}"
-echo ""
-
-# Apply Kata runtime class
-# In production, you would install Kata Containers on nodes via:
-# - Custom AMI with Kata pre-installed
-# - DaemonSet that installs Kata
-# For now, we create the RuntimeClass that will be used
+echo "Applying Kata RuntimeClasses..."
 
 kubectl apply -f "${SCRIPT_DIR}/k8s/09-runtime-class.yaml"
 
-echo -e "${GREEN}✓${NC} RuntimeClasses created (kata-fc, kata-qemu, kata-qemu-snp)"
+# R3 cleanup: the retired kata-fc RuntimeClass is removed from clusters
+# that still carry it (no agent pods reference it anymore).
+kubectl delete runtimeclass kata-fc --ignore-not-found
+
+echo -e "${GREEN}✓${NC} RuntimeClasses created (kata-qemu, kata-qemu-snp)"
 echo ""
 
-echo -e "${YELLOW}Note: You need to install Kata Containers on worker nodes.${NC}"
-echo "Options:"
-echo "  1. Use a custom EKS AMI with Kata pre-installed"
-echo "  2. Deploy Kata via DaemonSet (see kata-containers.io docs)"
-echo "  3. Use kata-qemu for testing without Firecracker"
-echo ""
-echo "The confidential (SEV-SNP) node pool is handled separately: the CoCo"
+echo "The confidential (SEV-SNP) node pool handler install: the CoCo"
 echo "operator installed below deploys kata-qemu-snp onto nodes labeled"
 echo "swarm.io/confidential-node=true via the CcRuntime CR (10-coco-ccruntime.yaml)."
 echo ""
@@ -227,7 +213,7 @@ echo ""
 echo "Installed components:"
 echo "  - kubeconfig updated"
 echo "  - AWS EFS CSI Driver"
-echo "  - RuntimeClasses (kata-fc, kata-qemu, kata-qemu-snp)"
+echo "  - RuntimeClasses (kata-qemu, kata-qemu-snp)"
 echo "  - Confidential Containers operator (${COCO_OPERATOR_VERSION})"
 echo ""
 echo "Cluster nodes:"

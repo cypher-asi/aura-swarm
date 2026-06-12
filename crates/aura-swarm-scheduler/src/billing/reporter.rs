@@ -34,11 +34,10 @@ struct PodTrackingInfo {
     last_report_at: Instant,
     cpu_millicores: u32,
     memory_mb: u32,
-    /// Box tier for tiered (confidential) agents. `None` for legacy agents,
-    /// which keep the plain cpu/mem-hour payload. Kept in the registration
-    /// data so re-registration (e.g. pod recreate on tier change) reports
-    /// under the right SKU.
-    tier: Option<BoxTier>,
+    /// Box tier the pod runs as. Kept in the registration data so
+    /// re-registration (e.g. pod recreate on tier change) reports under
+    /// the right SKU.
+    tier: BoxTier,
 }
 
 #[derive(Serialize)]
@@ -48,15 +47,10 @@ struct ComputeUsageRequest {
     agent_id: Option<String>,
     cpu_hours: f64,
     memory_gb_hours: f64,
-    /// Billing SKU for tiered agents (e.g. "swarm.standard").
-    /// Omitted entirely for legacy agents so their payload shape is
-    /// exactly the pre-TEE-upgrade one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sku: Option<String>,
-    /// Platform price per hour of pod runtime, in cents. Omitted for
-    /// legacy agents (see `sku`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hourly_price_cents: Option<u32>,
+    /// Billing SKU (e.g. "swarm.standard").
+    sku: String,
+    /// Platform price per hour of pod runtime, in cents.
+    hourly_price_cents: u32,
 }
 
 /// Compute usage reporter that tracks pod metrics and reports to billing.
@@ -109,16 +103,15 @@ impl ComputeUsageReporter {
 
     /// Register a pod for usage tracking.
     ///
-    /// `tier` is the box tier for tiered (confidential) agents and `None`
-    /// for legacy agents; it determines whether usage reports carry the
-    /// `sku` / `hourly_price_cents` fields.
+    /// `tier` is the box tier the pod runs as; usage reports carry its
+    /// `sku` / `hourly_price_cents`.
     pub fn register_pod(
         &self,
         agent_id: &str,
         user_id: &str,
         cpu_millicores: u32,
         memory_mb: u32,
-        tier: Option<BoxTier>,
+        tier: BoxTier,
     ) {
         let mut tracking = self.pod_tracking.write();
         tracking.insert(
@@ -199,8 +192,8 @@ impl ComputeUsageReporter {
             agent_id: Some(agent_id.to_string()),
             cpu_hours,
             memory_gb_hours,
-            sku: info.tier.map(|t| t.sku().to_string()),
-            hourly_price_cents: info.tier.map(|t| t.hourly_price_cents()),
+            sku: info.tier.sku().to_string(),
+            hourly_price_cents: info.tier.hourly_price_cents(),
         };
 
         let resp = self
@@ -288,47 +281,17 @@ mod tests {
         let config = SchedulerBillingConfig::default();
         let reporter = ComputeUsageReporter::new(config).unwrap();
 
-        reporter.register_pod("agent-1", "user-1", 500, 512, None);
+        reporter.register_pod("agent-1", "user-1", 500, 512, BoxTier::Small);
         assert_eq!(reporter.tracked_pod_count(), 1);
 
         reporter.unregister_pod("agent-1");
         assert_eq!(reporter.tracked_pod_count(), 0);
     }
 
-    /// Legacy agents (no tier) must report exactly the pre-TEE-upgrade
-    /// payload shape: no `sku` / `hourly_price_cents` keys at all.
+    /// Every usage payload carries `sku` and `hourly_price_cents`
+    /// alongside the cpu/mem-hour fields.
     #[test]
-    fn legacy_usage_payload_has_no_tier_fields() {
-        let body = ComputeUsageRequest {
-            event_id: "compute:agent-1:1".to_string(),
-            user_id: "user-1".to_string(),
-            agent_id: Some("agent-1".to_string()),
-            cpu_hours: 0.5,
-            memory_gb_hours: 0.25,
-            sku: None,
-            hourly_price_cents: None,
-        };
-
-        let json = serde_json::to_value(&body).unwrap();
-        // serde_json::Value keys are alphabetically ordered.
-        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(
-            keys,
-            vec![
-                "agent_id",
-                "cpu_hours",
-                "event_id",
-                "memory_gb_hours",
-                "user_id"
-            ],
-            "legacy payload shape must be unchanged"
-        );
-    }
-
-    /// Tiered agents report the legacy fields plus `sku` and
-    /// `hourly_price_cents`.
-    #[test]
-    fn tiered_usage_payload_carries_sku_and_price() {
+    fn usage_payload_carries_sku_and_price() {
         let tier = aura_swarm_store::BoxTier::Standard;
         let body = ComputeUsageRequest {
             event_id: "compute:agent-1:1".to_string(),
@@ -336,14 +299,13 @@ mod tests {
             agent_id: Some("agent-1".to_string()),
             cpu_hours: 0.5,
             memory_gb_hours: 0.25,
-            sku: Some(tier.sku().to_string()),
-            hourly_price_cents: Some(tier.hourly_price_cents()),
+            sku: tier.sku().to_string(),
+            hourly_price_cents: tier.hourly_price_cents(),
         };
 
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["sku"], "swarm.standard");
         assert_eq!(json["hourly_price_cents"], 8);
-        // Legacy fields are still present alongside the tier fields.
         assert_eq!(json["cpu_hours"], 0.5);
         assert_eq!(json["memory_gb_hours"], 0.25);
     }
@@ -355,17 +317,17 @@ mod tests {
         let config = SchedulerBillingConfig::default();
         let reporter = ComputeUsageReporter::new(config).unwrap();
 
-        reporter.register_pod("agent-1", "user-1", 1000, 2048, Some(BoxTier::Standard));
+        reporter.register_pod("agent-1", "user-1", 1000, 2048, BoxTier::Standard);
         {
             let tracking = reporter.pod_tracking.read();
-            assert_eq!(tracking["agent-1"].tier, Some(BoxTier::Standard));
+            assert_eq!(tracking["agent-1"].tier, BoxTier::Standard);
         }
 
         // Re-registration under a new tier (e.g. tier change pod recreate).
-        reporter.register_pod("agent-1", "user-1", 2000, 4096, Some(BoxTier::Pro));
+        reporter.register_pod("agent-1", "user-1", 2000, 4096, BoxTier::Pro);
         {
             let tracking = reporter.pod_tracking.read();
-            assert_eq!(tracking["agent-1"].tier, Some(BoxTier::Pro));
+            assert_eq!(tracking["agent-1"].tier, BoxTier::Pro);
         }
         assert_eq!(reporter.tracked_pod_count(), 1);
     }
@@ -394,8 +356,8 @@ mod tests {
         let config = SchedulerBillingConfig::default();
         let reporter = ComputeUsageReporter::new(config).unwrap();
 
-        reporter.register_pod("agent-1", "user-1", 500, 512, None);
-        reporter.register_pod("agent-1", "user-1", 1000, 1024, None);
+        reporter.register_pod("agent-1", "user-1", 500, 512, BoxTier::Small);
+        reporter.register_pod("agent-1", "user-1", 1000, 1024, BoxTier::Standard);
         assert_eq!(reporter.tracked_pod_count(), 1);
     }
 

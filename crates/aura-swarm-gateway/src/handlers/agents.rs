@@ -33,12 +33,9 @@ pub(crate) struct AgentResponse {
     /// Current status.
     pub(crate) status: AgentState,
     /// Resolved box tier ("small" / "standard" / "pro").
-    /// Absent for legacy agents created before tiers existed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tier: Option<String>,
+    pub(crate) tier: String,
     /// Resource specification.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) spec: Option<AgentSpec>,
+    pub(crate) spec: AgentSpec,
     /// Creation timestamp.
     pub(crate) created_at: DateTime<Utc>,
     /// Last update timestamp.
@@ -58,7 +55,7 @@ impl From<Agent> for AgentResponse {
             name: agent.name,
             status: agent.status,
             tier: agent.spec.tier.clone(),
-            spec: Some(agent.spec),
+            spec: agent.spec,
             created_at: agent.created_at,
             updated_at: agent.updated_at,
             last_heartbeat_at: agent.last_heartbeat_at,
@@ -75,18 +72,21 @@ pub(crate) struct ListAgentsResponse {
 }
 
 /// Request to create an agent.
+///
+/// R3 API-compat note: the pre-R3 raw `spec` body field is no longer a
+/// declared field. Since unknown JSON fields are ignored on deserialize,
+/// an old caller that still sends `{"name", "spec": {...}}` gets a
+/// default-tier ("standard") confidential agent — the raw resource
+/// numbers are NOT mapped to a tier anymore. Callers choose a size by
+/// sending `tier`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateAgentBody {
     /// Human-readable name for the agent.
     pub(crate) name: String,
     /// Optional box tier ("small" / "standard" / "pro"). Defaults to
-    /// "standard". The legacy `spec` field is still accepted; its resources
-    /// are mapped to the nearest tier when no tier is given.
+    /// "standard".
     #[serde(default)]
     pub(crate) tier: Option<String>,
-    /// Legacy raw resource specification (mapped to the nearest tier).
-    #[serde(default)]
-    pub(crate) spec: Option<AgentSpec>,
     /// Optional caller-supplied agent ID (e.g. from aura-network).
     /// If omitted, one is generated automatically.
     #[serde(default)]
@@ -114,9 +114,8 @@ pub(crate) struct ChangeTierBody {
 pub(crate) struct ChangeTierResponse {
     /// Agent ID.
     pub(crate) agent_id: String,
-    /// Tier before the change (`null` = the agent was a legacy agent that
-    /// has just been converted to the new architecture).
-    pub(crate) previous_tier: Option<String>,
+    /// Tier before the change.
+    pub(crate) previous_tier: String,
     /// Tier the agent is on now.
     pub(crate) tier: String,
     /// Whether anything changed (`false` for a same-tier no-op).
@@ -165,9 +164,8 @@ pub(crate) struct StatusResponse {
     /// Last heartbeat timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
-    /// Current box tier; absent for legacy agents.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tier: Option<String>,
+    /// Current box tier.
+    pub(crate) tier: String,
     /// Seconds the agent had a pod in the last 24 hours.
     pub(crate) awake_seconds_24h: u64,
     /// Estimated cost in cents for the last 24 hours (priced at the rates
@@ -256,11 +254,7 @@ where
         ));
     }
 
-    let mut request = if let Some(spec) = body.spec {
-        CreateAgentRequest::with_spec(body.name, spec)
-    } else {
-        CreateAgentRequest::new(body.name)
-    };
+    let mut request = CreateAgentRequest::new(body.name);
 
     if let Some(tier) = body.tier {
         request = request.with_tier(tier);
@@ -637,7 +631,7 @@ pub(crate) struct AgentStateResponse {
     /// runs an older image without baked-in build metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) harness_git_sha: Option<String>,
-    /// Isolation level ("container" or "micro_vm").
+    /// Isolation level ("container" or "confidentialvm").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) isolation: Option<String>,
     /// Pod network endpoint (IP:port) if running.

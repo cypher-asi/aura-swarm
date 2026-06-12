@@ -15,7 +15,7 @@ use crate::error::SwarmClientError;
 use crate::types::{
     ApiErrorResponse, CreateRemoteAgentRequest, CreateSessionRequest, CreateSessionResponse,
     ListRemoteAgentsResponse, ListSessionsResponse, RemoteAgent, RemoteAgentLogEntry,
-    RemoteAgentLogsResponse, RemoteAgentSpec, RemoteAgentStateResponse, SessionResponse,
+    RemoteAgentLogsResponse, RemoteAgentStateResponse, SessionResponse,
 };
 
 /// Typed HTTP client for the aura-swarm gateway.
@@ -77,8 +77,11 @@ impl SwarmClient {
 
     /// Create a remote agent.
     ///
-    /// If `remote_agent_id` is supplied the gateway will use it as the agent ID,
-    /// enabling ID parity between the local aura-os agent and the remote VM.
+    /// `tier` selects the box size ("small" / "standard" / "pro");
+    /// `None` lets the gateway default to "standard". If
+    /// `remote_agent_id` is supplied the gateway will use it as the agent
+    /// ID, enabling ID parity between the local aura-os agent and the
+    /// remote VM.
     ///
     /// # Errors
     ///
@@ -86,14 +89,14 @@ impl SwarmClient {
     pub async fn create_remote_agent(
         &self,
         name: &str,
-        spec: Option<RemoteAgentSpec>,
+        tier: Option<&str>,
         remote_agent_id: Option<&str>,
     ) -> Result<RemoteAgent, SwarmClientError> {
         let url = format!("{}/v1/agents", self.base_url);
 
         let body = CreateRemoteAgentRequest {
             name: name.to_string(),
-            spec,
+            tier: tier.map(String::from),
             agent_id: remote_agent_id.map(String::from),
         };
 

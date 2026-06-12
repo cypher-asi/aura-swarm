@@ -231,19 +231,20 @@ pub(crate) fn count_active_sessions<S: Store>(store: &S, agent_id: &AgentId) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_swarm_store::{AgentSpec, RocksStore, SessionConfig};
+    use aura_swarm_store::{BoxTier, RocksStore, SessionConfig};
     use tempfile::TempDir;
 
     fn setup() -> (RocksStore, TempDir, UserId, Agent) {
         let dir = TempDir::new().unwrap();
         let store = RocksStore::open(dir.path()).unwrap();
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
+        let agent_id = AgentId::generate_deterministic(&user_id, "test-agent", 42);
         let agent = Agent {
-            agent_id: AgentId::generate_deterministic(&user_id, "test-agent", 42),
+            agent_id,
             user_id,
             name: "test-agent".to_string(),
             status: AgentState::Running,
-            spec: AgentSpec::default(),
+            spec: BoxTier::Standard.to_spec(&agent_id, "latest"),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_heartbeat_at: None,

@@ -367,7 +367,7 @@ verify_r2_convergence() {
 
     if [[ "${SKIP_R2_CHECKS}" == "true" ]]; then
         echo -e "${YELLOW}⚠${NC} Skipping R2 checks (REDEPLOY_VERIFY_SKIP_R2_CHECKS=true)."
-        echo "    Use this only while the MIGRATION_RECREATE_LEGACY_PODS rollout is still in flight."
+        echo "    (R3: the reconciler always replaces runtime-class-stale pods; skip only mid-rollout.)"
         return 0
     fi
 
@@ -408,7 +408,7 @@ verify_r2_convergence() {
     if [[ -n "${legacy_pods}" ]]; then
         echo -e "${RED}✗${NC} Pods still on the legacy kata-fc runtime class:"
         printf '%s\n' "${legacy_pods}"
-        echo "    Ensure MIGRATION_RECREATE_LEGACY_PODS=true on the scheduler and wait for the rolling recreation."
+        echo "    The reconciler replaces runtime-class-stale pods one per ~30s pass; wait for the rolling recreation."
         failures=$((failures + 1))
     fi
     if [[ -n "${other_pods}" ]]; then

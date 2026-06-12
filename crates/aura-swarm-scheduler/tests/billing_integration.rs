@@ -82,10 +82,10 @@ fn reporter_tracks_pods() {
 
     assert_eq!(reporter.tracked_pod_count(), 0);
 
-    reporter.register_pod("agent-1", "user-1", 500, 512, None);
+    reporter.register_pod("agent-1", "user-1", 500, 512, BoxTier::Small);
     assert_eq!(reporter.tracked_pod_count(), 1);
 
-    reporter.register_pod("agent-2", "user-1", 1000, 1024, Some(BoxTier::Standard));
+    reporter.register_pod("agent-2", "user-1", 1000, 1024, BoxTier::Standard);
     assert_eq!(reporter.tracked_pod_count(), 2);
 
     reporter.unregister_pod("agent-1");
@@ -109,7 +109,7 @@ async fn reporter_disabled_reports_zero() {
     let config = SchedulerBillingConfig::default(); // No API key
     let reporter = ComputeUsageReporter::new(config).unwrap();
 
-    reporter.register_pod("agent-1", "user-1", 500, 512, None);
+    reporter.register_pod("agent-1", "user-1", 500, 512, BoxTier::Small);
 
     // Should return 0 when disabled
     let count = reporter.report_all_usage().await;
@@ -186,7 +186,7 @@ mod live {
             .expect("Failed to create test account");
 
         let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
-        reporter.register_pod(&agent_uuid, &user_uuid, 500, 512, None);
+        reporter.register_pod(&agent_uuid, &user_uuid, 500, 512, BoxTier::Small);
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let count = reporter.report_all_usage().await;
@@ -212,8 +212,8 @@ mod live {
             .expect("Failed to create test account 2");
 
         let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
-        reporter.register_pod(&agent_uuid_1, &user_uuid_1, 500, 512, None);
-        reporter.register_pod(&agent_uuid_2, &user_uuid_2, 1000, 1024, Some(BoxTier::Standard));
+        reporter.register_pod(&agent_uuid_1, &user_uuid_1, 500, 512, BoxTier::Small);
+        reporter.register_pod(&agent_uuid_2, &user_uuid_2, 1000, 1024, BoxTier::Standard);
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let count = reporter.report_all_usage().await;
@@ -235,8 +235,8 @@ mod live {
 
         let reporter = ComputeUsageReporter::new(test_billing_config()).unwrap();
 
-        reporter.register_pod(&agent_uuid_1, &user_uuid, 500, 512, None);
-        reporter.register_pod(&agent_uuid_2, &user_uuid, 1000, 1024, Some(BoxTier::Standard));
+        reporter.register_pod(&agent_uuid_1, &user_uuid, 500, 512, BoxTier::Small);
+        reporter.register_pod(&agent_uuid_2, &user_uuid, 1000, 1024, BoxTier::Standard);
         assert_eq!(reporter.tracked_pod_count(), 2);
 
         tokio::time::sleep(Duration::from_millis(10)).await;

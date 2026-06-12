@@ -51,7 +51,8 @@ impl RemoteAgentState {
     }
 }
 
-/// Resource specification for a remote agent's VM/pod.
+/// Resource specification for a remote agent's VM/pod, as reported by the
+/// gateway. Read-only for clients: sizes are chosen via the box tier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAgentSpec {
     /// CPU allocation in millicores.
@@ -63,6 +64,9 @@ pub struct RemoteAgentSpec {
     /// Aura runtime version.
     #[serde(default = "default_runtime_version")]
     pub runtime_version: String,
+    /// Box tier the spec was derived from ("small" / "standard" / "pro").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     /// Isolation level for the agent runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<RemoteIsolationLevel>,
@@ -84,6 +88,7 @@ impl Default for RemoteAgentSpec {
             cpu_millicores: default_cpu(),
             memory_mb: default_memory(),
             runtime_version: default_runtime_version(),
+            tier: None,
             isolation: None,
         }
     }
@@ -93,11 +98,13 @@ impl Default for RemoteAgentSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteIsolationLevel {
-    /// Standard container (shared kernel). Faster startup, lower overhead.
+    /// Standard container (shared kernel). Local dev-mode only.
     Container,
-    /// Firecracker microVM (dedicated kernel). Stronger isolation.
+    /// Confidential SEV-SNP VM (Kata + QEMU) with attestation-gated
+    /// sealed storage. The level for all swarm agents.
     #[default]
-    MicroVm,
+    #[serde(rename = "confidential_vm")]
+    ConfidentialVm,
 }
 
 /// A remote agent record as returned by the gateway.
@@ -109,6 +116,9 @@ pub struct RemoteAgent {
     pub name: String,
     /// Current lifecycle state.
     pub status: RemoteAgentState,
+    /// Box tier ("small" / "standard" / "pro").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     /// Resource specification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<RemoteAgentSpec>,
@@ -132,13 +142,17 @@ pub struct ListRemoteAgentsResponse {
 }
 
 /// Request to create a remote agent.
+///
+/// Since R3 of the TEE upgrade the gateway no longer accepts a raw
+/// resource `spec`; the size is chosen via the box tier (defaults to
+/// "standard" when omitted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRemoteAgentRequest {
     /// Human-readable name for the agent.
     pub name: String,
-    /// Optional resource specification.
+    /// Optional box tier ("small" / "standard" / "pro").
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spec: Option<RemoteAgentSpec>,
+    pub tier: Option<String>,
     /// Caller-supplied agent ID for identity parity with the local agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -369,34 +383,36 @@ mod tests {
             cpu_millicores: 1000,
             memory_mb: 2048,
             runtime_version: "v2.0".to_string(),
-            isolation: Some(RemoteIsolationLevel::MicroVm),
+            tier: Some("standard".to_string()),
+            isolation: Some(RemoteIsolationLevel::ConfidentialVm),
         };
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: RemoteAgentSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.cpu_millicores, 1000);
         assert_eq!(parsed.memory_mb, 2048);
         assert_eq!(parsed.runtime_version, "v2.0");
-        assert_eq!(parsed.isolation, Some(RemoteIsolationLevel::MicroVm));
+        assert_eq!(parsed.tier.as_deref(), Some("standard"));
+        assert_eq!(parsed.isolation, Some(RemoteIsolationLevel::ConfidentialVm));
     }
 
     #[test]
     fn remote_isolation_level_serde() {
         let json = serde_json::to_string(&RemoteIsolationLevel::Container).unwrap();
         assert_eq!(json, "\"container\"");
-        let json = serde_json::to_string(&RemoteIsolationLevel::MicroVm).unwrap();
-        assert_eq!(json, "\"micro_vm\"");
+        let json = serde_json::to_string(&RemoteIsolationLevel::ConfidentialVm).unwrap();
+        assert_eq!(json, "\"confidential_vm\"");
 
         let parsed: RemoteIsolationLevel = serde_json::from_str("\"container\"").unwrap();
         assert_eq!(parsed, RemoteIsolationLevel::Container);
-        let parsed: RemoteIsolationLevel = serde_json::from_str("\"micro_vm\"").unwrap();
-        assert_eq!(parsed, RemoteIsolationLevel::MicroVm);
+        let parsed: RemoteIsolationLevel = serde_json::from_str("\"confidential_vm\"").unwrap();
+        assert_eq!(parsed, RemoteIsolationLevel::ConfidentialVm);
     }
 
     #[test]
     fn remote_isolation_level_default() {
         assert_eq!(
             RemoteIsolationLevel::default(),
-            RemoteIsolationLevel::MicroVm
+            RemoteIsolationLevel::ConfidentialVm
         );
     }
 
@@ -406,6 +422,7 @@ mod tests {
             agent_id: "abc123".to_string(),
             name: "test-agent".to_string(),
             status: RemoteAgentState::Running,
+            tier: Some("standard".to_string()),
             spec: Some(RemoteAgentSpec::default()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -462,7 +479,7 @@ mod tests {
     fn create_remote_agent_request_serde() {
         let req = CreateRemoteAgentRequest {
             name: "my-agent".to_string(),
-            spec: None,
+            tier: Some("pro".to_string()),
             agent_id: Some("caller-id-123".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -478,7 +495,7 @@ mod tests {
         let json = r#"{"name": "minimal"}"#;
         let req: CreateRemoteAgentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "minimal");
-        assert!(req.spec.is_none());
+        assert!(req.tier.is_none());
         assert!(req.agent_id.is_none());
     }
 

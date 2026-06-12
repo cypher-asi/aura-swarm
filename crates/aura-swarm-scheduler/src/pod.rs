@@ -4,7 +4,7 @@
 //! for Aura agent pods with all necessary configuration.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, IsolationLevel, StorageEncryption};
+use aura_swarm_store::{AgentSpec, IsolationLevel};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
@@ -27,7 +27,7 @@ const CONFIDENTIAL_NODE_KEY: &str = "swarm.io/confidential-node";
 /// Build a Kubernetes pod spec for an agent.
 ///
 /// This creates a complete pod specification including:
-/// - Kata Containers runtime class for microVM isolation
+/// - `kata-qemu-snp` runtime class for confidential VM isolation
 /// - Resource requests and limits
 /// - Environment variables for agent configuration
 /// - Volume mounts for persistent state
@@ -46,13 +46,9 @@ pub fn build_pod(
     let pod_name = build_pod_name(agent_name, &pod_id);
     let agent_id_hex = agent_id.to_hex();
 
-    // KBS key id for the sealed-state DEK. Prefer the id recorded in the
-    // agent's spec; fall back to the deterministic per-agent id. Only
-    // injected into confidential pods.
-    let state_key_id = spec.storage_encryption.as_ref().map_or_else(
-        || StorageEncryption::state_key_id(agent_id),
-        |enc| enc.key_id().to_string(),
-    );
+    // KBS key id for the sealed-state DEK, as recorded in the agent's
+    // spec. Only injected into confidential pods.
+    let state_key_id = spec.storage_encryption.key_id().to_string();
 
     Pod {
         metadata: build_metadata(&pod_name, &agent_id_hex, agent_name, &pod_id, config),
@@ -152,9 +148,8 @@ fn build_pod_spec(
     // runtime_class() returns None for standard containers (uses default runtime)
     let runtime_class_name = isolation.runtime_class().map(String::from);
 
-    // SNP scheduling constraints apply ONLY to confidential agents. Legacy
-    // agents must keep today's pod spec byte-for-byte (None == field omitted),
-    // so the desired-state reconciler sees no diff for them during R1.
+    // SNP scheduling constraints apply only to confidential agents;
+    // container (dev-mode) pods get no selector/toleration.
     let confidential = isolation == IsolationLevel::ConfidentialVM;
     let node_selector = confidential.then(|| {
         let mut selector = BTreeMap::new();
@@ -203,7 +198,7 @@ fn build_container(
 ) -> Container {
     let mut env = build_env_vars(agent_id_hex, user_id_hex, config);
     // Confidential agents get the attestation/sealed-storage variables
-    // APPENDED so the legacy env list (names, values, order) is untouched.
+    // appended after the base env list.
     if isolation == IsolationLevel::ConfidentialVM {
         env.extend(build_confidential_env_vars(state_key_id, config));
     }
@@ -443,21 +438,18 @@ fn build_liveness_probe() -> Probe {
 ///
 /// The security posture is gated on the isolation level:
 ///
-/// - `MicroVM` (Kata/Firecracker): the guest kernel is the multi-tenant
-///   boundary, so it is safe to give the user a root-capable dev
-///   environment inside the VM — they can `apt install`, manage
-///   services, and modify the OS. Runs as root (uid 0); `fs_group`
+/// - `ConfidentialVM` (Kata/QEMU SNP): the confidential guest kernel is
+///   the multi-tenant boundary, so it is safe to give the user a
+///   root-capable dev environment inside the VM — they can `apt install`,
+///   manage services, and modify the OS. Runs as root (uid 0); `fs_group`
 ///   stays 1000 so the `/state` PVC (EFS access point owned by 1000)
 ///   remains group-accessible.
-/// - `Container` (shared-kernel runc): root would be a host-compromise
-///   risk in a multi-tenant cluster, so the locked-down non-root
-///   posture is preserved.
+/// - `Container` (shared-kernel runc, dev-mode): root would be a
+///   host-compromise risk in a multi-tenant cluster, so the locked-down
+///   non-root posture is preserved.
 fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
     match isolation {
-        // ConfidentialVM shares the MicroVM posture: the (confidential)
-        // guest kernel is the multi-tenant boundary. SNP-specific pod
-        // wiring (node selector, KBS env) lands in a later phase.
-        IsolationLevel::MicroVM | IsolationLevel::ConfidentialVM => PodSecurityContext {
+        IsolationLevel::ConfidentialVM => PodSecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
             fs_group: Some(1000),
@@ -474,13 +466,13 @@ fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
 
 /// Build the container-level security context for an agent.
 ///
-/// Mirrors [`build_security_context`]: microVM agents run as root with
-/// privilege escalation allowed (so `sudo` works for OS modification),
-/// while runc-isolated agents stay non-root with privilege escalation
-/// denied.
+/// Mirrors [`build_security_context`]: confidential agents run as root
+/// with privilege escalation allowed (so `sudo` works for OS
+/// modification), while runc-isolated agents stay non-root with
+/// privilege escalation denied.
 fn build_container_security_context(isolation: IsolationLevel) -> SecurityContext {
     match isolation {
-        IsolationLevel::MicroVM | IsolationLevel::ConfidentialVM => SecurityContext {
+        IsolationLevel::ConfidentialVM => SecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
             allow_privilege_escalation: Some(true),
@@ -498,20 +490,23 @@ fn build_container_security_context(isolation: IsolationLevel) -> SecurityContex
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_swarm_store::IsolationLevel;
+    use aura_swarm_store::{IsolationLevel, StorageEncryption};
 
     fn test_agent_id() -> AgentId {
         AgentId::generate()
     }
 
-    fn test_spec() -> AgentSpec {
+    /// A small confidential spec with the deterministic per-agent key id.
+    /// `isolation: None` exercises the scheduler-default path
+    /// (`ConfidentialVM` unless configured otherwise).
+    fn test_spec(agent_id: &AgentId) -> AgentSpec {
         AgentSpec {
             cpu_millicores: 500,
             memory_mb: 512,
             runtime_version: "latest".to_string(),
             isolation: None,
-            tier: None,
-            storage_encryption: None,
+            tier: "small".to_string(),
+            storage_encryption: StorageEncryption::sealed_for(agent_id),
         }
     }
 
@@ -561,7 +556,7 @@ mod tests {
     #[test]
     fn build_pod_has_required_fields() {
         let agent_id = test_agent_id();
-        let spec = test_spec();
+        let spec = test_spec(&agent_id);
         let config = SchedulerConfig::default();
 
         let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
@@ -585,7 +580,10 @@ mod tests {
 
         // Spec
         let pod_spec = pod.spec.as_ref().unwrap();
-        assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-fc"));
+        assert_eq!(
+            pod_spec.runtime_class_name.as_deref(),
+            Some("kata-qemu-snp")
+        );
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Always"));
         assert_eq!(pod_spec.termination_grace_period_seconds, Some(30));
 
@@ -622,7 +620,7 @@ mod tests {
             memory_mb: 2048,
             runtime_version: "v1.0".to_string(),
             isolation: None,
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
@@ -647,14 +645,17 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: None,
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
         let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
-        assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-fc"));
+        assert_eq!(
+            pod_spec.runtime_class_name.as_deref(),
+            Some("kata-qemu-snp")
+        );
     }
 
     #[test]
@@ -662,7 +663,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::Container),
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
@@ -673,11 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn microvm_pod_runs_as_root_for_dev_env() {
+    fn confidential_pod_runs_as_root_for_dev_env() {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
-            isolation: Some(IsolationLevel::MicroVM),
-            ..test_spec()
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
@@ -699,7 +700,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::Container),
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
@@ -715,107 +716,13 @@ mod tests {
         assert_eq!(container_sec.allow_privilege_escalation, Some(false));
     }
 
-    /// Dual-mode invariant (TEE upgrade R1; R2 has shipped): a legacy
-    /// agent record (tier == None, MicroVM isolation) must produce a pod
-    /// spec identical to the pre-upgrade scheduler's output — no new env
-    /// vars, node selectors, tolerations, or reordered fields.
-    ///
-    /// Status after R2: the startup store migration rewrites every legacy
-    /// record to a tiered/sealed spec, so a healthy migrated deployment
-    /// never builds this pod shape anymore. The path (and this frozen
-    /// snapshot) is kept for **un-migrated DBs** — e.g. a v1 database
-    /// restored from the EFS/PVC backup taken before R2 — where the
-    /// scheduler may still serve legacy specs until the gateway migration
-    /// runs. The expected value below remains the frozen pre-TEE-upgrade
-    /// snapshot; both the path and this test are deleted in R3.
-    #[test]
-    fn legacy_pod_spec_is_byte_for_byte_unchanged() {
-        let agent_id = AgentId::from_hex("00112233445566778899aabbccddeeff").unwrap();
-        let agent_id_hex = agent_id.to_hex();
-        let spec = test_spec(); // legacy: isolation None, tier None, no storage encryption
-        let config = SchedulerConfig::default();
-
-        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
-        let actual = serde_json::to_value(pod.spec.as_ref().unwrap()).unwrap();
-
-        let env_var = |name: &str, value: &str| {
-            serde_json::json!({ "name": name, "value": value })
-        };
-        let expected = serde_json::json!({
-            "containers": [{
-                "env": [
-                    env_var("AGENT_ID", &agent_id_hex),
-                    env_var("MACHINE_ID", &agent_id_hex),
-                    env_var("AURA_MACHINE_ID", &agent_id_hex),
-                    env_var("USER_ID", "user-hex"),
-                    env_var("STATE_DIR", "/state"),
-                    env_var("AURA_LISTEN_ADDR", "0.0.0.0:8080"),
-                    env_var("CONTROL_PLANE_URL", "http://aura-swarm-gateway.swarm-system.svc:8080"),
-                    env_var("AURA_DATA_DIR", "/state"),
-                    env_var("AURA_LLM_ROUTING", "proxy"),
-                    env_var("AURA_ROUTER_URL", "https://aura-router.onrender.com"),
-                    env_var("AURA_STORAGE_URL", "https://aura-storage.onrender.com"),
-                    env_var("AURA_NETWORK_URL", "https://aura-network.onrender.com"),
-                    env_var("ENABLE_FS_TOOLS", "true"),
-                    env_var("ENABLE_CMD_TOOLS", "true"),
-                    env_var("AURA_PROJECT_BASE", "/home/aura"),
-                ],
-                "image": "ghcr.io/cypher-asi/aura-harness:latest",
-                "livenessProbe": {
-                    "failureThreshold": 3,
-                    "httpGet": { "path": "/health", "port": 8080 },
-                    "initialDelaySeconds": 30,
-                    "periodSeconds": 30,
-                    "timeoutSeconds": 10
-                },
-                "name": "aura",
-                "ports": [{ "containerPort": 8080, "name": "http" }],
-                "readinessProbe": {
-                    "failureThreshold": 3,
-                    "httpGet": { "path": "/health", "port": 8080 },
-                    "initialDelaySeconds": 5,
-                    "periodSeconds": 10,
-                    "timeoutSeconds": 5
-                },
-                "resources": {
-                    "limits": { "cpu": "500m", "memory": "512Mi" },
-                    "requests": { "cpu": "500m", "memory": "512Mi" }
-                },
-                "securityContext": {
-                    "allowPrivilegeEscalation": true,
-                    "runAsNonRoot": false,
-                    "runAsUser": 0
-                },
-                "volumeMounts": [{
-                    "mountPath": "/state",
-                    "name": "state",
-                    "subPath": agent_id_hex
-                }]
-            }],
-            "restartPolicy": "Always",
-            "runtimeClassName": "kata-fc",
-            "securityContext": {
-                "fsGroup": 1000,
-                "runAsNonRoot": false,
-                "runAsUser": 0
-            },
-            "terminationGracePeriodSeconds": 30,
-            "volumes": [{
-                "name": "state",
-                "persistentVolumeClaim": { "claimName": "swarm-agent-state" }
-            }]
-        });
-
-        assert_eq!(
-            actual, expected,
-            "legacy pod spec drifted from the pre-TEE-upgrade snapshot"
-        );
-    }
+    // The pre-TEE-upgrade byte-for-byte legacy pod snapshot test was
+    // deleted in R3: the kata-fc/legacy pod shape can no longer be built
+    // (its purpose — proving zero churn for legacy pods during the
+    // dual-mode window — is fulfilled).
 
     #[test]
     fn confidential_pod_gets_snp_wiring() {
-        use aura_swarm_store::StorageEncryption;
-
         let agent_id = test_agent_id();
         let key_id = format!("swarm/agents/{agent_id}/state-key");
         let spec = AgentSpec {
@@ -823,10 +730,10 @@ mod tests {
             memory_mb: 2048,
             runtime_version: "latest".to_string(),
             isolation: Some(IsolationLevel::ConfidentialVM),
-            tier: Some("standard".to_string()),
-            storage_encryption: Some(StorageEncryption::Sealed {
+            tier: "standard".to_string(),
+            storage_encryption: StorageEncryption::Sealed {
                 key_id: key_id.clone(),
-            }),
+            },
         };
         let config = SchedulerConfig::default();
 
@@ -855,7 +762,7 @@ mod tests {
         assert_eq!(tol.value.as_deref(), Some("true"));
         assert_eq!(tol.effect.as_deref(), Some("NoSchedule"));
 
-        // Confidential env vars, appended after the legacy set
+        // Confidential env vars, appended after the base set
         let env = pod_spec.containers[0].env.as_ref().unwrap();
         let get = |name: &str| {
             env.iter()
@@ -874,19 +781,17 @@ mod tests {
             "confidential vars must be appended, not interleaved"
         );
 
-        // Legacy env vars are still all present
+        // Base env vars are still all present
         assert!(env.iter().any(|e| e.name == "AGENT_ID"));
         assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
     }
 
     #[test]
-    fn confidential_pod_falls_back_to_deterministic_key_id() {
+    fn pod_uses_spec_recorded_key_id() {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::ConfidentialVM),
-            // No storage_encryption recorded: fall back to the
-            // deterministic per-agent key id.
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let config = SchedulerConfig::default();
 
@@ -906,7 +811,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::ConfidentialVM),
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let mut config = SchedulerConfig::default();
         config.gateway_token = "super-secret".to_string();
@@ -930,17 +835,22 @@ mod tests {
         assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
         assert!(env.iter().any(|e| e.name == "AGENT_ID"));
 
-        // Legacy pods must NOT get the token even when configured.
-        let legacy_pod = build_pod(&agent_id, "user-hex", "legacy", &test_spec(), &config);
-        let legacy_env = legacy_pod.spec.as_ref().unwrap().containers[0]
+        // Container (dev-mode) pods must NOT get the token even when
+        // configured: they have no attestation boot flow.
+        let dev_spec = AgentSpec {
+            isolation: Some(IsolationLevel::Container),
+            ..test_spec(&agent_id)
+        };
+        let dev_pod = build_pod(&agent_id, "user-hex", "dev", &dev_spec, &config);
+        let dev_env = dev_pod.spec.as_ref().unwrap().containers[0]
             .env
             .as_ref()
             .unwrap();
         assert!(
-            !legacy_env
+            !dev_env
                 .iter()
                 .any(|e| e.name == "AURA_SWARM_INTERNAL_TOKEN"),
-            "legacy pod env must stay byte-for-byte unchanged"
+            "container pod env must not carry the confidential vars"
         );
     }
 
@@ -949,7 +859,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::ConfidentialVM),
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         // Default config has no INTERNAL_TOKEN (dev mode).
         let config = SchedulerConfig::default();
@@ -964,7 +874,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: Some(IsolationLevel::ConfidentialVM),
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let mut config = SchedulerConfig::default();
         config.kbs_url = "http://kbs.example:9999".to_string();
@@ -984,7 +894,7 @@ mod tests {
         let agent_id = test_agent_id();
         let spec = AgentSpec {
             isolation: None,
-            ..test_spec()
+            ..test_spec(&agent_id)
         };
         let mut config = SchedulerConfig::default();
         config.default_isolation = IsolationLevel::Container;

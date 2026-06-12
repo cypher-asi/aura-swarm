@@ -60,9 +60,8 @@ pub(crate) struct UserAgentUsage {
     pub(crate) name: String,
     /// Current lifecycle state.
     pub(crate) status: AgentState,
-    /// Current box tier; absent for legacy agents.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tier: Option<String>,
+    /// Current box tier.
+    pub(crate) tier: String,
     /// Seconds the agent had a pod within the range.
     pub(crate) awake_seconds: u64,
     /// Estimated cost in cents within the range.

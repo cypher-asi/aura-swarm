@@ -1,19 +1,9 @@
 # RuntimeClass for Kata Containers
 # Based on spec 05-scheduler.md section 3.2
----
-# Kata with Firecracker (production)
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-fc
-handler: kata-fc
-overhead:
-  podFixed:
-    memory: "160Mi"
-    cpu: "250m"
-scheduling:
-  nodeSelector:
-    katacontainers.io/kata-runtime: "true"
+#
+# R3 cleanup: the kata-fc (Firecracker) RuntimeClass was retired — all
+# agents run as confidential SEV-SNP VMs on kata-qemu-snp. To remove it
+# from a live cluster: kubectl delete runtimeclass kata-fc
 ---
 # Kata with QEMU (for testing on standard instances)
 apiVersion: node.k8s.io/v1

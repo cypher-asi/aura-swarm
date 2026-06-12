@@ -29,20 +29,91 @@
 //!
 //! # Legacy decode boundary
 //!
-//! This module is the **only** place allowed to decode the legacy (v1)
-//! CBOR record shape. Today the legacy shape deserializes through the
-//! current [`Agent`] struct because the new fields are `#[serde(default)]`
-//! `Option`s; in R3 those fields become required on the live structs and
-//! the frozen legacy-shaped structs move **here** (the migration module
-//! retains the only legacy decode path, for straggler DBs restored from
-//! backup).
+//! This module is the **only** place allowed to decode the legacy
+//! (pre-R3) CBOR record shapes. The live [`Agent`] / `AgentSpec` structs
+//! require `tier` and `storage_encryption` since R3; the frozen
+//! [`legacy`] structs below reproduce the old shapes (optional fields,
+//! the retired `MicroVM` isolation level) purely for decoding records
+//! from straggler DBs restored from a pre-R2 backup, and this module
+//! maps them forward to the live shape.
 
 use rocksdb::WriteBatch;
 
 use crate::error::{Result, StoreError};
 use crate::rocks::RocksStore;
 use crate::schema::cf;
-use crate::types::{Agent, BoxTier, IsolationLevel, StorageEncryption};
+use crate::types::{Agent, AgentSpec, BoxTier, IsolationLevel, StorageEncryption};
+
+/// Frozen pre-R3 record shapes, kept solely so the v1 -> v2 migration can
+/// decode straggler DBs restored from backup. Never use these outside
+/// this module, and never change their serde names: they must match the
+/// bytes old releases wrote.
+pub(crate) mod legacy {
+    use aura_swarm_core::{AgentId, UserId};
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Serialize};
+
+    use crate::types::AgentState;
+
+    /// Pre-R3 `IsolationLevel`. Wire names are frozen to the exact
+    /// strings the live enum (with `rename_all = "snake_case"`) produced
+    /// at the time: `MicroVM` snake_cased to `micro_v_m`, and
+    /// `ConfidentialVM` carried an explicit `confidential_vm` rename.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) enum LegacyIsolationLevel {
+        /// Standard container (dev-mode).
+        #[serde(rename = "container")]
+        Container,
+        /// Firecracker microVM (`kata-fc`) — retired in R3.
+        #[serde(rename = "micro_v_m")]
+        MicroVM,
+        /// Confidential SEV-SNP VM (`kata-qemu-snp`).
+        #[serde(rename = "confidential_vm")]
+        ConfidentialVM,
+    }
+
+    /// Pre-R3 `StorageEncryption` (same wire shape as the live enum).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum LegacyStorageEncryption {
+        /// Sealed with a per-agent DEK released by the KBS.
+        Sealed {
+            /// KBS key identifier for the per-agent state DEK.
+            key_id: String,
+        },
+    }
+
+    /// Pre-R3 `AgentSpec`: `tier` / `storage_encryption` optional
+    /// (`None` = legacy agent, pre-migration), `isolation` may be the
+    /// retired `MicroVM` level.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct LegacyAgentSpec {
+        pub(crate) cpu_millicores: u32,
+        pub(crate) memory_mb: u32,
+        pub(crate) runtime_version: String,
+        #[serde(default)]
+        pub(crate) isolation: Option<LegacyIsolationLevel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) storage_encryption: Option<LegacyStorageEncryption>,
+    }
+
+    /// Pre-R3 `Agent` record envelope.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct LegacyAgent {
+        pub(crate) agent_id: AgentId,
+        pub(crate) user_id: UserId,
+        pub(crate) name: String,
+        pub(crate) status: AgentState,
+        pub(crate) spec: LegacyAgentSpec,
+        pub(crate) created_at: DateTime<Utc>,
+        pub(crate) updated_at: DateTime<Utc>,
+        pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) error_message: Option<String>,
+    }
+}
 
 /// Key in the `meta` CF holding the schema version (big-endian `u32`).
 pub const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
@@ -124,27 +195,38 @@ fn migrate_v1_to_v2(store: &RocksStore) -> Result<u32> {
     for item in iter {
         let (key, value) = item.map_err(|e| StoreError::Database(e.to_string()))?;
 
-        // Legacy (v1) records decode through the current `Agent` struct
-        // because `tier` / `storage_encryption` are `#[serde(default)]`.
-        // R3 note: when those fields become required, the frozen legacy
-        // struct definitions move into this module and this is the only
-        // place that may decode them.
-        let mut agent: Agent = ciborium::from_reader(value.as_ref())
+        // The ONLY legacy decode path: records are read through the frozen
+        // pre-R3 shapes (optional tier/storage_encryption, retired MicroVM
+        // level) and mapped forward to the required live shape.
+        let old: legacy::LegacyAgent = ciborium::from_reader(value.as_ref())
             .map_err(|e| StoreError::Serialization(format!("decoding v1 agent record: {e}")))?;
 
-        if agent.spec.tier.is_some() {
-            // Already on the new architecture (post-R1 create or early
-            // migration via the tier endpoint) — idempotent skip.
+        if old.spec.tier.is_some() && old.spec.storage_encryption.is_some() {
+            // Already on the new architecture (post-R1 create, early
+            // migration via the tier endpoint, or a previous pass) —
+            // idempotent skip; the bytes already decode as a live record.
             continue;
         }
 
-        let tier = BoxTier::nearest_for_cpu(agent.spec.cpu_millicores);
-        agent.spec.cpu_millicores = tier.cpu_millis();
-        agent.spec.memory_mb = tier.memory_mb();
-        agent.spec.isolation = Some(IsolationLevel::ConfidentialVM);
-        agent.spec.tier = Some(tier.as_str().to_string());
-        agent.spec.storage_encryption = Some(StorageEncryption::sealed_for(&agent.agent_id));
-        agent.updated_at = chrono::Utc::now();
+        let tier = BoxTier::nearest_for_cpu(old.spec.cpu_millicores);
+        let agent = Agent {
+            agent_id: old.agent_id,
+            user_id: old.user_id,
+            name: old.name,
+            status: old.status,
+            spec: AgentSpec {
+                cpu_millicores: tier.cpu_millis(),
+                memory_mb: tier.memory_mb(),
+                runtime_version: old.spec.runtime_version,
+                isolation: Some(IsolationLevel::ConfidentialVM),
+                tier: tier.as_str().to_string(),
+                storage_encryption: StorageEncryption::sealed_for(&old.agent_id),
+            },
+            created_at: old.created_at,
+            updated_at: chrono::Utc::now(),
+            last_heartbeat_at: old.last_heartbeat_at,
+            error_message: old.error_message,
+        };
 
         let mut buf = Vec::new();
         ciborium::into_writer(&agent, &mut buf)
@@ -197,12 +279,12 @@ fn migrate_v1_to_v2(store: &RocksStore) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::legacy::{LegacyAgent, LegacyAgentSpec, LegacyIsolationLevel};
     use super::*;
     use crate::types::AgentState;
     use crate::Store;
     use aura_swarm_core::{AgentId, UserId};
-    use chrono::{DateTime, Utc};
-    use serde::Serialize;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     fn create_test_store() -> (RocksStore, TempDir) {
@@ -211,32 +293,11 @@ mod tests {
         (store, dir)
     }
 
-    /// Exact pre-upgrade (v1) record shape, serialized without the
-    /// `tier` / `storage_encryption` / `error_message` fields — the same
-    /// frozen shape the phase-1 regression test uses.
-    #[derive(Serialize)]
-    struct LegacyAgentSpec {
-        cpu_millicores: u32,
-        memory_mb: u32,
-        runtime_version: String,
-        isolation: Option<IsolationLevel>,
-    }
-
-    #[derive(Serialize)]
-    struct LegacyAgent {
-        agent_id: AgentId,
-        user_id: UserId,
-        name: String,
-        status: AgentState,
-        spec: LegacyAgentSpec,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
-        last_heartbeat_at: Option<DateTime<Utc>>,
-    }
-
     /// Write a raw legacy-CBOR agent record straight into the agents CF
     /// (bypassing `put_agent`, which would serialize the modern shape),
-    /// plus its index entries like the v1 code did.
+    /// plus its index entries like the v1 code did. Serializes through the
+    /// frozen [`legacy`] shapes — the exact pre-upgrade wire format
+    /// (no `tier` / `storage_encryption` / `error_message` keys).
     fn put_legacy_agent(store: &RocksStore, cpu_millicores: u32, status: AgentState) -> AgentId {
         let agent_id = AgentId::generate();
         let user_id = UserId::from_uuid(uuid::Uuid::new_v4());
@@ -250,11 +311,14 @@ mod tests {
                 cpu_millicores,
                 memory_mb: 512,
                 runtime_version: "v1".to_string(),
-                isolation: Some(IsolationLevel::MicroVM),
+                isolation: Some(LegacyIsolationLevel::MicroVM),
+                tier: None,
+                storage_encryption: None,
             },
             created_at: now,
             updated_at: now,
             last_heartbeat_at: None,
+            error_message: None,
         };
 
         let mut buf = Vec::new();
@@ -330,13 +394,13 @@ mod tests {
             (pro, BoxTier::Pro),
         ] {
             let agent = store.get_agent(&agent_id).unwrap().unwrap();
-            assert_eq!(agent.spec.tier.as_deref(), Some(expected_tier.as_str()));
+            assert_eq!(agent.spec.tier, expected_tier.as_str());
             assert_eq!(agent.spec.cpu_millicores, expected_tier.cpu_millis());
             assert_eq!(agent.spec.memory_mb, expected_tier.memory_mb());
             assert_eq!(agent.spec.isolation, Some(IsolationLevel::ConfidentialVM));
             assert_eq!(
                 agent.spec.storage_encryption,
-                Some(StorageEncryption::sealed_for(&agent_id)),
+                StorageEncryption::sealed_for(&agent_id),
                 "sealed key id must be the deterministic per-agent id"
             );
         }
@@ -371,7 +435,7 @@ mod tests {
         assert_eq!(summary.agents_migrated, 1, "only the legacy record migrates");
 
         let after = store.get_agent(&modern_id).unwrap().unwrap();
-        assert_eq!(after.spec.tier.as_deref(), Some("pro"));
+        assert_eq!(after.spec.tier, "pro");
         assert_eq!(after.updated_at, before.updated_at, "modern record untouched");
     }
 
@@ -417,7 +481,7 @@ mod tests {
         assert_eq!(store.read_schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
         let agent = store.get_agent(&migrated_early).unwrap().unwrap();
-        assert_eq!(agent.spec.tier.as_deref(), Some("small"));
+        assert_eq!(agent.spec.tier, "small");
     }
 
     #[test]
@@ -443,5 +507,65 @@ mod tests {
         let store = RocksStore::open(dir.path()).unwrap();
         assert_eq!(store.read_schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// The frozen legacy wire names must never drift: these are the exact
+    /// strings pre-R3 releases wrote (the live `IsolationLevel` used
+    /// `rename_all = "snake_case"`, which turned `MicroVM` into
+    /// `micro_v_m`; `ConfidentialVM` carried an explicit rename).
+    #[test]
+    fn frozen_legacy_wire_names_are_exact() {
+        assert_eq!(
+            serde_json::to_string(&LegacyIsolationLevel::Container).unwrap(),
+            "\"container\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LegacyIsolationLevel::MicroVM).unwrap(),
+            "\"micro_v_m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LegacyIsolationLevel::ConfidentialVM).unwrap(),
+            "\"confidential_vm\""
+        );
+    }
+
+    /// Regression test (moved from `types.rs` in R3): a pre-upgrade agent
+    /// record — CBOR serialized WITHOUT the `tier` / `storage_encryption`
+    /// fields, with `MicroVM` isolation — still decodes through the frozen
+    /// legacy shapes and maps forward to a valid live record.
+    #[test]
+    fn legacy_cbor_agent_record_decodes_and_maps_forward() {
+        let (store, _dir) = create_test_store();
+        let agent_id = put_legacy_agent(&store, 1000, AgentState::Hibernating);
+
+        // The raw legacy bytes do NOT decode as a live Agent (required
+        // fields missing) — only this module may read them.
+        let cf_agents = store.cf(cf::AGENTS).unwrap();
+        let raw = store
+            .db
+            .get_cf(&cf_agents, crate::keys::agent_key(&agent_id))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ciborium::from_reader::<Agent, _>(raw.as_slice()).is_err(),
+            "live struct must not accept the legacy shape"
+        );
+        let legacy: LegacyAgent = ciborium::from_reader(raw.as_slice()).unwrap();
+        assert_eq!(legacy.spec.isolation, Some(LegacyIsolationLevel::MicroVM));
+        assert_eq!(legacy.spec.tier, None);
+        assert_eq!(legacy.spec.storage_encryption, None);
+
+        // The migration maps it forward to the required live shape.
+        run(&store).unwrap();
+        let agent = store.get_agent(&agent_id).unwrap().unwrap();
+        assert_eq!(agent.name, "legacy-1000m");
+        assert_eq!(agent.status, AgentState::Hibernating);
+        assert_eq!(agent.spec.tier, "standard");
+        assert_eq!(agent.spec.isolation, Some(IsolationLevel::ConfidentialVM));
+        assert_eq!(
+            agent.spec.storage_encryption,
+            StorageEncryption::sealed_for(&agent_id)
+        );
+        assert_eq!(agent.error_message, None);
     }
 }

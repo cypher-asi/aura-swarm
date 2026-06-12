@@ -3,7 +3,7 @@
 //! These types define the API contracts for agent and session management.
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{Agent, AgentSpec};
+use aura_swarm_store::Agent;
 use serde::{Deserialize, Serialize};
 
 /// Request to create a new agent.
@@ -13,16 +13,12 @@ pub struct CreateAgentRequest {
     pub name: String,
     /// Box tier name ("small" / "standard" / "pro").
     ///
-    /// If omitted, the tier is derived from the legacy `spec` field (mapped
-    /// to the nearest tier) or defaults to `standard`. Every created agent
-    /// is confidential + sealed regardless of how the tier is resolved.
+    /// If omitted, defaults to `standard`. Every created agent is
+    /// confidential + sealed. (The pre-R3 raw `spec` input is gone; the
+    /// gateway ignores a legacy `spec` body field and applies the tier
+    /// default instead.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
-    /// Legacy raw resource specification, still accepted for old callers
-    /// (aura-network/aura-os). Its resources are mapped to the nearest tier;
-    /// only the `runtime_version` is carried over verbatim.
-    #[serde(default)]
-    pub spec: Option<AgentSpec>,
     /// Optional caller-supplied agent ID (e.g. from aura-network).
     /// If omitted, one is generated automatically via HKDF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,18 +32,6 @@ impl CreateAgentRequest {
         Self {
             name: name.into(),
             tier: None,
-            spec: None,
-            agent_id: None,
-        }
-    }
-
-    /// Create a new request with a legacy raw spec (mapped to a tier on create).
-    #[must_use]
-    pub fn with_spec(name: impl Into<String>, spec: AgentSpec) -> Self {
-        Self {
-            name: name.into(),
-            tier: None,
-            spec: Some(spec),
             agent_id: None,
         }
     }
@@ -72,9 +56,8 @@ impl CreateAgentRequest {
 pub struct TierChangeOutcome {
     /// The agent record after the operation.
     pub agent: Agent,
-    /// Tier before the change. `None` means the agent was a legacy
-    /// (pre-migration) agent that has just been converted.
-    pub previous_tier: Option<String>,
+    /// Tier before the change.
+    pub previous_tier: String,
     /// The tier the agent is on now.
     pub tier: String,
     /// Whether anything changed (`false` for a same-tier no-op).
@@ -215,23 +198,6 @@ mod tests {
         let req = CreateAgentRequest::new("my-agent");
         assert_eq!(req.name, "my-agent");
         assert!(req.tier.is_none());
-        assert!(req.spec.is_none());
-        assert!(req.agent_id.is_none());
-    }
-
-    #[test]
-    fn create_agent_request_with_spec() {
-        let spec = AgentSpec {
-            cpu_millicores: 1000,
-            memory_mb: 1024,
-            runtime_version: "v1.0.0".to_string(),
-            isolation: None,
-            tier: None,
-            storage_encryption: None,
-        };
-        let req = CreateAgentRequest::with_spec("my-agent", spec.clone());
-        assert_eq!(req.name, "my-agent");
-        assert_eq!(req.spec.unwrap().cpu_millicores, 1000);
         assert!(req.agent_id.is_none());
     }
 

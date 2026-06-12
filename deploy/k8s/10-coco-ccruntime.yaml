@@ -13,9 +13,9 @@
 # Notes:
 # - Based on the operator's default sample CR (config/samples/ccruntime/base)
 #   at v0.17.0, with node selection/tolerations for the swarm SNP pool.
-# - runtimeClasses is intentionally empty: RuntimeClass objects (kata-fc,
-#   kata-qemu, kata-qemu-snp) are owned by 09-runtime-class.yaml so overhead
-#   and scheduling stay under our control.
+# - runtimeClasses is intentionally empty: RuntimeClass objects
+#   (kata-qemu, kata-qemu-snp) are owned by 09-runtime-class.yaml so
+#   overhead and scheduling stay under our control.
 # - The CoCo operator is superseded upstream by the confidential-containers
 #   Helm chart (github.com/confidential-containers/charts); migrating to it
 #   is a follow-up, tracked for the R3 cleanup release.
