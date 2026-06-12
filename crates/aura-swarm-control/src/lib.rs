@@ -81,6 +81,7 @@ pub mod service;
 pub mod session;
 pub mod triggers;
 pub mod types;
+pub mod usage;
 
 pub use billing::{BillingCheckError, BillingChecker, BillingConfig};
 pub use cron_service::{
@@ -94,6 +95,7 @@ pub use scheduler_client::{
 pub use service::{ControlPlane, ControlPlaneService};
 pub use triggers::TriggerRegistration;
 pub use types::{AgentStatus, ControlConfig, CreateAgentRequest, LogOptions, TierChangeOutcome};
+pub use usage::{AgentUsage, BillableInterval, UsageAggregation};
 
 // Re-export commonly used types from dependencies for convenience
 pub use aura_swarm_core::{AgentId, SessionId, UserId};

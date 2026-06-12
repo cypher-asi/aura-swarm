@@ -161,18 +161,35 @@ pub(crate) struct LogEntry {
     pub(crate) message: String,
 }
 
-/// Response for agent status.
+/// Response for agent status, with real metrics derived from the agent's
+/// usage-event log plus current state (Swarm TEE upgrade phase 11).
 #[derive(Debug, Serialize)]
 pub(crate) struct StatusResponse {
     /// Current agent status.
     pub(crate) status: AgentState,
-    /// Uptime in seconds.
+    /// Seconds since the current pod was scheduled (0 when no pod).
     pub(crate) uptime_seconds: u64,
     /// Number of active sessions.
     pub(crate) active_sessions: u32,
     /// Last heartbeat timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Current box tier; absent for legacy agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tier: Option<String>,
+    /// Seconds the agent had a pod in the last 24 hours.
+    pub(crate) awake_seconds_24h: u64,
+    /// Estimated cost in cents for the last 24 hours (priced at the rates
+    /// recorded on the usage events; zbilling stays the billing source of
+    /// truth).
+    pub(crate) estimated_cost_cents_24h: u64,
+    /// When the agent was last woken from hibernation/stop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_wake_at: Option<DateTime<Utc>>,
+    /// Wakes in the last 24 hours.
+    pub(crate) wakes_24h: u32,
+    /// Process triggers fired into the agent in the last 24 hours.
+    pub(crate) triggers_fired_24h: u32,
     /// Resource usage.
     pub(crate) resource_usage: ResourceUsage,
 }
@@ -180,9 +197,10 @@ pub(crate) struct StatusResponse {
 /// Resource usage metrics.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResourceUsage {
-    /// CPU usage percentage (0-100).
+    /// CPU usage percentage (0-100). Always 0 today: there is no live
+    /// metrics source for in-VM CPU yet.
     pub(crate) cpu_percent: f64,
-    /// Memory usage in megabytes.
+    /// Allocated memory in megabytes while a pod is active (0 otherwise).
     pub(crate) memory_mb: u64,
 }
 
@@ -511,10 +529,8 @@ where
     Ok(Json(LogsResponse { logs: vec![] }))
 }
 
-/// Get agent status.
-///
-/// Note: This is a placeholder implementation. Real status would come from
-/// the control plane with metrics from the scheduler.
+/// Get agent status with real metrics derived from the agent's
+/// usage-event log (last 24 hours) plus its current state.
 ///
 /// # Errors
 ///
@@ -532,8 +548,29 @@ where
     let agent_id = parse_agent_id(&agent_id)?;
     let agent = state.control.get_agent(&user.user_id, &agent_id).await?;
 
-    // Safe: max(0) ensures non-negative
-    let uptime_seconds = (Utc::now() - agent.created_at).num_seconds().max(0) as u64;
+    let now = Utc::now();
+    let usage = state
+        .control
+        .get_agent_usage(&user.user_id, &agent_id, now - chrono::Duration::hours(24), now)
+        .await?;
+    let agg = usage.aggregation;
+
+    let pod_active = matches!(
+        agent.status,
+        AgentState::Provisioning | AgentState::Running | AgentState::Idle
+    );
+
+    // Uptime is the age of the currently open billable interval. Agents
+    // created before lifecycle events existed can be awake without an
+    // open interval; fall back to the pre-phase-11 created_at heuristic.
+    // Safe: max(0) ensures non-negative.
+    let uptime_seconds = if pod_active {
+        let started = agg.open_interval_started_at.unwrap_or(agent.created_at);
+        (now - started).num_seconds().max(0) as u64
+    } else {
+        0
+    };
+
     let active_sessions = state
         .control
         .count_active_sessions(&agent_id)
@@ -545,9 +582,19 @@ where
         uptime_seconds,
         active_sessions,
         last_heartbeat_at: agent.last_heartbeat_at,
+        tier: agent.spec.tier.clone(),
+        awake_seconds_24h: agg.awake_seconds,
+        estimated_cost_cents_24h: agg.cost_cents,
+        last_wake_at: agg.last_wake_at,
+        wakes_24h: agg.wakes,
+        triggers_fired_24h: agg.triggers_fired,
         resource_usage: ResourceUsage {
             cpu_percent: 0.0,
-            memory_mb: 0,
+            memory_mb: if pod_active {
+                u64::from(agent.spec.memory_mb)
+            } else {
+                0
+            },
         },
     }))
 }

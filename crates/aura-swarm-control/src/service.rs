@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_swarm_core::{AgentId, SessionId, UserId};
-use aura_swarm_store::{Agent, AgentState, BoxTier, Session, SessionConfig, SessionStatus, Store};
-use chrono::Utc;
+use aura_swarm_store::{
+    Agent, AgentState, BoxTier, Session, SessionConfig, SessionStatus, Store, UsageEvent,
+    UsageEventKind,
+};
+use chrono::{DateTime, Utc};
 
 use crate::billing::BillingChecker;
 use crate::error::{ControlError, Result};
@@ -17,6 +20,18 @@ use crate::lifecycle;
 use crate::scheduler_client::SchedulerClient;
 use crate::session;
 use crate::types::{ControlConfig, CreateAgentRequest};
+
+/// Tier name + hourly price to record on a usage event, captured from the
+/// agent's spec **at event time** so later re-pricing never rewrites usage
+/// history. Legacy agents (no tier) record `(None, None)`.
+fn event_pricing(spec: &aura_swarm_store::AgentSpec) -> (Option<String>, Option<u32>) {
+    let price = spec
+        .tier
+        .as_deref()
+        .and_then(BoxTier::from_name)
+        .map(|t| t.hourly_price_cents());
+    (spec.tier.clone(), price)
+}
 
 /// Run a blocking store operation off the async runtime.
 async fn blocking_store<S, F, T>(store: &Arc<S>, f: F) -> Result<T>
@@ -126,6 +141,42 @@ pub trait ControlPlane: Send + Sync {
         agent_id: &AgentId,
         tier: &str,
     ) -> Result<crate::types::TierChangeOutcome>;
+
+    // =========================================================================
+    // Usage / Cost Stats (Swarm TEE upgrade phase 11)
+    // =========================================================================
+
+    /// Aggregate one agent's usage over `[from, to)`: billable intervals
+    /// (priced at event time), totals, counters, and the most recent raw
+    /// events within the range (capped at
+    /// [`crate::usage::RECENT_EVENTS_CAP`]).
+    ///
+    /// zbilling remains the billing source of truth — this is the
+    /// user-facing stats layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the usual `AgentNotFound` / `NotOwner` ownership errors.
+    async fn get_agent_usage(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<crate::usage::AgentUsage>;
+
+    /// Aggregate usage over `[from, to)` for every agent the user
+    /// currently owns (destroyed agents are not included).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store operation fails.
+    async fn get_user_usage(
+        &self,
+        user_id: &UserId,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<(Agent, crate::usage::UsageAggregation)>>;
 
     // =========================================================================
     // Session Operations
@@ -551,6 +602,51 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
         Ok(())
     }
 
+    /// Append a usage event, best-effort: stats bookkeeping must never
+    /// fail the surrounding user-facing operation, so failures are only
+    /// logged (the aggregation undercounts instead of the API erroring).
+    async fn append_usage_event_best_effort(&self, agent_id: &AgentId, kind: UsageEventKind) {
+        let event = UsageEvent::new(*agent_id, kind);
+        let result =
+            blocking_store(&self.store, move |s| Ok(s.append_usage_event(&event)?)).await;
+        if let Err(e) = result {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to append usage event; usage stats may undercount"
+            );
+        }
+    }
+
+    /// Record that a pod was scheduled for the agent (opens a billable
+    /// interval priced at the spec's current tier rate).
+    async fn record_pod_scheduled(&self, agent: &Agent) {
+        let (tier, hourly_price_cents) = event_pricing(&agent.spec);
+        self.append_usage_event_best_effort(
+            &agent.agent_id,
+            UsageEventKind::PodScheduled {
+                tier,
+                hourly_price_cents,
+            },
+        )
+        .await;
+    }
+
+    /// Record that the agent's pod was terminated (closes the billable
+    /// interval), with the reason known by the call site.
+    async fn record_pod_terminated(&self, agent: &Agent, reason: &str) {
+        let (tier, hourly_price_cents) = event_pricing(&agent.spec);
+        self.append_usage_event_best_effort(
+            &agent.agent_id,
+            UsageEventKind::PodTerminated {
+                tier,
+                hourly_price_cents,
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+    }
+
     /// Append a `TierChanged` usage event capturing both hourly prices so
     /// cost intervals split exactly at the change. Legacy agents carry no
     /// `from` tier/price (they were billed by cpu/mem-hours).
@@ -614,6 +710,9 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
             );
         }
 
+        // The old pod's interval closes at the OLD tier's price.
+        self.record_pod_terminated(agent, "tier_change").await;
+
         // Persist the new spec with the Stopped transition, then record the
         // tier change before the new pod is scheduled so the event is never
         // lost to a scheduling failure.
@@ -638,6 +737,9 @@ impl<S: Store + 'static, SC: SchedulerClient> ControlPlaneService<S, SC> {
             .await?;
             return Err(e);
         }
+
+        // The replacement pod opens a new interval at the NEW tier's price.
+        self.record_pod_scheduled(agent).await;
 
         Ok(())
     }
@@ -771,6 +873,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             return Err(e);
         }
 
+        self.record_pod_scheduled(&agent).await;
+
         tracing::info!(
             agent_id = %agent.agent_id,
             user_id = %user_id,
@@ -856,6 +960,8 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             return Err(e);
         }
 
+        self.record_pod_scheduled(&agent).await;
+
         tracing::info!(agent_id = %agent_id, "Starting agent");
 
         Ok(agent)
@@ -889,6 +995,11 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
                 "Failed to terminate agent pod on stop"
             );
         }
+
+        // Recorded even if the terminate API call failed: the agent has
+        // logically left the billable state and the reconciler reaps the
+        // pod (a restart's terminate half also lands here as "stop").
+        self.record_pod_terminated(&agent, "stop").await;
 
         tracing::info!(agent_id = %agent_id, "Stopping agent");
 
@@ -952,6 +1063,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             );
         }
 
+        self.record_pod_terminated(&agent, "hibernate").await;
+        self.append_usage_event_best_effort(agent_id, UsageEventKind::Hibernated)
+            .await;
+
         tracing::info!(agent_id = %agent_id, "Hibernating agent");
 
         Ok(agent)
@@ -985,6 +1100,10 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             .await?;
             return Err(e);
         }
+
+        self.append_usage_event_best_effort(agent_id, UsageEventKind::Woke)
+            .await;
+        self.record_pod_scheduled(&agent).await;
 
         tracing::info!(agent_id = %agent_id, "Waking agent");
 
@@ -1089,6 +1208,58 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
             changed: true,
             pod_recreated: recreate_pod,
         })
+    }
+
+    // =========================================================================
+    // Usage / Cost Stats (Swarm TEE upgrade phase 11)
+    // =========================================================================
+
+    async fn get_agent_usage(
+        &self,
+        user_id: &UserId,
+        agent_id: &AgentId,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<crate::usage::AgentUsage> {
+        self.get_and_verify(user_id, agent_id).await?;
+
+        let aid = *agent_id;
+        let events =
+            blocking_store(&self.store, move |s| Ok(s.list_usage_events_by_agent(&aid)?)).await?;
+
+        let aggregation = crate::usage::aggregate(&events, from, to);
+
+        // Most recent in-range raw events, oldest first, capped.
+        let in_range: Vec<_> = events
+            .into_iter()
+            .filter(|e| e.timestamp >= from && e.timestamp < to)
+            .collect();
+        let skip = in_range.len().saturating_sub(crate::usage::RECENT_EVENTS_CAP);
+        let recent_events = in_range.into_iter().skip(skip).collect();
+
+        Ok(crate::usage::AgentUsage {
+            aggregation,
+            recent_events,
+        })
+    }
+
+    async fn get_user_usage(
+        &self,
+        user_id: &UserId,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<(Agent, crate::usage::UsageAggregation)>> {
+        let agents = self.list_agents(user_id).await?;
+
+        let mut reports = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let aid = agent.agent_id;
+            let events =
+                blocking_store(&self.store, move |s| Ok(s.list_usage_events_by_agent(&aid)?))
+                    .await?;
+            reports.push((agent, crate::usage::aggregate(&events, from, to)));
+        }
+        Ok(reports)
     }
 
     // =========================================================================
@@ -1331,6 +1502,35 @@ impl<S: Store + 'static, SC: SchedulerClient + 'static> ControlPlane
                 }
                 other => other,
             };
+
+            // A pod-active agent moving to Error means the pod crashed or
+            // failed its health check: close the billable interval. The
+            // Stopping → Error case is excluded — stop_agent already
+            // recorded a "stop" termination. Best-effort: a failed append
+            // must not fail the status update.
+            if effective_status == AgentState::Error
+                && matches!(
+                    agent.status,
+                    AgentState::Provisioning | AgentState::Running | AgentState::Idle
+                )
+            {
+                let (tier, hourly_price_cents) = event_pricing(&agent.spec);
+                let event = UsageEvent::new(
+                    aid,
+                    UsageEventKind::PodTerminated {
+                        tier,
+                        hourly_price_cents,
+                        reason: "crash".to_string(),
+                    },
+                );
+                if let Err(e) = s.append_usage_event(&event) {
+                    tracing::warn!(
+                        agent_id = %aid,
+                        error = %e,
+                        "Failed to append crash usage event; usage stats may undercount"
+                    );
+                }
+            }
 
             if err_msg.is_some() || effective_status == AgentState::Error {
                 s.update_agent_error(&aid, effective_status, err_msg)?;
@@ -2802,14 +3002,19 @@ mod tests {
         assert_eq!(outcome.tier, "standard");
         assert_eq!(outcome.agent.status, AgentState::Running);
 
-        // No pod churn beyond the create, and no usage event recorded.
+        // No pod churn beyond the create, and no tier-change event
+        // recorded (the only event is the create's PodScheduled).
         assert!(scheduler.terminated().is_empty());
         assert_eq!(scheduler.scheduled().len(), 1);
-        assert!(service
+        let events = service
             .store
             .list_usage_events_by_agent(&agent.agent_id)
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            UsageEventKind::PodScheduled { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2846,14 +3051,19 @@ mod tests {
         assert!(scheduler.terminated().is_empty());
         assert_eq!(scheduler.scheduled().len(), 1);
 
-        // TierChanged event with both hourly prices.
+        // TierChanged event with both hourly prices (after the create's
+        // PodScheduled).
         let events = service
             .store
             .list_usage_events_by_agent(&agent.agent_id)
             .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
             events[0].kind,
+            UsageEventKind::PodScheduled { .. }
+        ));
+        assert_eq!(
+            events[1].kind,
             UsageEventKind::TierChanged {
                 from: Some("standard".to_string()),
                 to: "pro".to_string(),
@@ -2907,19 +3117,43 @@ mod tests {
             .unwrap();
         assert_eq!(sess.status, SessionStatus::Closed);
 
-        // Downgrade event captured with both prices.
+        // Full event sequence: create's PodScheduled, then the recreate's
+        // terminate (priced at the OLD tier), the TierChanged record, and
+        // the replacement pod's schedule (priced at the NEW tier).
         let events = service
             .store
             .list_usage_events_by_agent(&agent.agent_id)
             .unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 4);
         assert_eq!(
             events[0].kind,
+            UsageEventKind::PodScheduled {
+                tier: Some("standard".to_string()),
+                hourly_price_cents: Some(BoxTier::Standard.hourly_price_cents()),
+            }
+        );
+        assert_eq!(
+            events[1].kind,
+            UsageEventKind::PodTerminated {
+                tier: Some("standard".to_string()),
+                hourly_price_cents: Some(BoxTier::Standard.hourly_price_cents()),
+                reason: "tier_change".to_string(),
+            }
+        );
+        assert_eq!(
+            events[2].kind,
             UsageEventKind::TierChanged {
                 from: Some("standard".to_string()),
                 to: "small".to_string(),
                 from_hourly_price_cents: Some(BoxTier::Standard.hourly_price_cents()),
                 to_hourly_price_cents: BoxTier::Small.hourly_price_cents(),
+            }
+        );
+        assert_eq!(
+            events[3].kind,
+            UsageEventKind::PodScheduled {
+                tier: Some("small".to_string()),
+                hourly_price_cents: Some(BoxTier::Small.hourly_price_cents()),
             }
         );
     }
@@ -2937,14 +3171,17 @@ mod tests {
         let result = service.change_tier(&user_id, &agent.agent_id, "pro").await;
         assert!(matches!(result, Err(ControlError::InvalidState { .. })));
 
-        // Nothing changed and no event was recorded.
+        // Nothing changed and no tier-change event was recorded (only the
+        // create's PodScheduled exists).
         let stored = service.store.get_agent(&agent.agent_id).unwrap().unwrap();
         assert_eq!(stored.spec.tier.as_deref(), Some("standard"));
-        assert!(service
+        let events = service
             .store
             .list_usage_events_by_agent(&agent.agent_id)
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.kind, UsageEventKind::TierChanged { .. })));
     }
 
     #[tokio::test]
@@ -3102,16 +3339,18 @@ mod tests {
             Err(ControlError::InsufficientCredits { .. })
         ));
 
-        // Pre-flight failed before any mutation: tier, state, and event log
-        // are all untouched.
+        // Pre-flight failed before any mutation: tier and state untouched,
+        // no tier-change event (only the create's PodScheduled exists).
         let stored = service.store.get_agent(&agent.agent_id).unwrap().unwrap();
         assert_eq!(stored.spec.tier.as_deref(), Some("standard"));
         assert_eq!(stored.status, AgentState::Running);
-        assert!(service
+        let events = service
             .store
             .list_usage_events_by_agent(&agent.agent_id)
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.kind, UsageEventKind::TierChanged { .. })));
     }
 
     #[tokio::test]
@@ -3138,5 +3377,214 @@ mod tests {
             .unwrap();
         assert!(outcome.changed);
         assert_eq!(outcome.tier, "pro");
+    }
+
+    // =========================================================================
+    // Usage events + aggregation (Swarm TEE upgrade phase 11)
+    // =========================================================================
+
+    fn event_kinds(service: &ControlPlaneService<RocksStore>, agent_id: &AgentId) -> Vec<String> {
+        service
+            .store
+            .list_usage_events_by_agent(agent_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.kind {
+                UsageEventKind::PodScheduled { .. } => "pod_scheduled".to_string(),
+                UsageEventKind::PodTerminated { reason, .. } => {
+                    format!("pod_terminated:{reason}")
+                }
+                UsageEventKind::Hibernated => "hibernated".to_string(),
+                UsageEventKind::Woke => "woke".to_string(),
+                UsageEventKind::TriggerFired { .. } => "trigger_fired".to_string(),
+                UsageEventKind::TierChanged { .. } => "tier_changed".to_string(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn create_emits_pod_scheduled_priced_at_event_time() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("usage-agent").with_tier("pro"))
+            .await
+            .unwrap();
+
+        let events = service
+            .store
+            .list_usage_events_by_agent(&agent.agent_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            UsageEventKind::PodScheduled {
+                tier: Some("pro".to_string()),
+                hourly_price_cents: Some(BoxTier::Pro.hourly_price_cents()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_lifecycle_emits_expected_event_sequence() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("usage-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+
+        // create → Running → hibernate → wake → Running → stop
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.hibernate_agent(&user_id, &aid).await.unwrap();
+        service.wake_agent(&user_id, &aid).await.unwrap();
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.stop_agent(&user_id, &aid).await.unwrap();
+
+        assert_eq!(
+            event_kinds(&service, &aid),
+            vec![
+                "pod_scheduled",
+                "pod_terminated:hibernate",
+                "hibernated",
+                "woke",
+                "pod_scheduled",
+                "pod_terminated:stop",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_error_emits_crash_termination() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("usage-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+
+        service
+            .update_agent_status_internal(&aid, AgentState::Error, Some("OOM".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            event_kinds(&service, &aid),
+            vec!["pod_scheduled", "pod_terminated:crash"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_to_error_does_not_double_count_termination() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("usage-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.stop_agent(&user_id, &aid).await.unwrap();
+
+        // The pod dies messily during the stop: stop already recorded the
+        // termination, the Error must not add a second one.
+        service
+            .update_agent_status_internal(&aid, AgentState::Error, Some("boom".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            event_kinds(&service, &aid),
+            vec!["pod_scheduled", "pod_terminated:stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_lifecycle_events_carry_no_pricing() {
+        let (service, _dir, user_id) = setup();
+        let legacy = legacy_agent(user_id, AgentState::Running);
+        service.store.put_agent(&legacy).unwrap();
+
+        service
+            .hibernate_agent(&user_id, &legacy.agent_id)
+            .await
+            .unwrap();
+
+        let events = service
+            .store
+            .list_usage_events_by_agent(&legacy.agent_id)
+            .unwrap();
+        assert_eq!(
+            events[0].kind,
+            UsageEventKind::PodTerminated {
+                tier: None,
+                hourly_price_cents: None,
+                reason: "hibernate".to_string(),
+            }
+        );
+        assert_eq!(events[1].kind, UsageEventKind::Hibernated);
+    }
+
+    #[tokio::test]
+    async fn get_agent_usage_aggregates_and_enforces_ownership() {
+        let (service, _dir, user_id) = setup();
+        let (agent, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("usage-agent"))
+            .await
+            .unwrap();
+        let aid = agent.agent_id;
+        service.store.update_agent_status(&aid, AgentState::Running).unwrap();
+        service.hibernate_agent(&user_id, &aid).await.unwrap();
+
+        // `to` is nudged past now so events appended in the same
+        // millisecond as the query are not flakily excluded.
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        let usage = service
+            .get_agent_usage(&user_id, &aid, now - chrono::Duration::hours(1), now)
+            .await
+            .unwrap();
+
+        // One closed interval (create's schedule → hibernate's terminate)
+        // at the standard rate, plus the raw events.
+        assert_eq!(usage.aggregation.intervals.len(), 1);
+        assert_eq!(
+            usage.aggregation.intervals[0].hourly_price_cents,
+            Some(BoxTier::Standard.hourly_price_cents())
+        );
+        assert!(usage.aggregation.open_interval_started_at.is_none());
+        assert_eq!(usage.recent_events.len(), 3); // scheduled, terminated, hibernated
+
+        let other = UserId::from_uuid(uuid::Uuid::new_v4());
+        let result = service
+            .get_agent_usage(&other, &aid, now - chrono::Duration::hours(1), now)
+            .await;
+        assert!(matches!(result, Err(ControlError::NotOwner { .. })));
+    }
+
+    #[tokio::test]
+    async fn get_user_usage_covers_only_the_users_agents() {
+        let (service, _dir, user_id) = setup();
+        let other = UserId::from_uuid(uuid::Uuid::new_v4());
+
+        let (mine, _) = service
+            .create_agent(&user_id, CreateAgentRequest::new("mine"))
+            .await
+            .unwrap();
+        service
+            .create_agent(&other, CreateAgentRequest::new("theirs"))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let reports = service
+            .get_user_usage(&user_id, now - chrono::Duration::hours(1), now)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0.agent_id, mine.agent_id);
+        // The agent is still provisioning: its open interval runs to the
+        // range end.
+        assert!(reports[0].1.awake_seconds <= 3600);
+        assert!(reports[0].1.open_interval_started_at.is_some());
     }
 }

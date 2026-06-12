@@ -460,8 +460,9 @@ pub struct ProcessTrigger {
 ///
 /// Events live in the `usage_events` CF keyed by
 /// `agent_id || timestamp_millis` (big-endian) so a per-agent prefix scan
-/// yields a time-ordered log. Phase 10 only writes [`UsageEventKind::TierChanged`];
-/// phase 11 adds the remaining kinds plus aggregation/APIs.
+/// yields a time-ordered log. Lifecycle transitions append events at the
+/// control plane; the usage aggregation layer pairs `PodScheduled` /
+/// `PodTerminated` into billable intervals priced at event time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// Unique event id.
@@ -496,13 +497,47 @@ impl UsageEvent {
 
 /// What a [`UsageEvent`] records.
 ///
-/// Internally tagged (`kind`) so phase 11 can extend the enum with
-/// `PodScheduled` / `PodTerminated` / `Hibernated` / `Woke` / `TriggerFired`
-/// without breaking CBOR decoding of already-persisted events: decoding
+/// Internally tagged (`kind`) so the enum can keep growing without
+/// breaking CBOR decoding of already-persisted events: decoding
 /// dispatches on the stored tag string, never on variant order.
+///
+/// Pricing fields capture the tier + hourly price **at event time**, so a
+/// later re-pricing of a tier never rewrites usage history. Legacy agents
+/// (no tier) get events with `tier: None` / `hourly_price_cents: None` —
+/// they are billed by cpu/mem-hours via zbilling, not a tier rate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UsageEventKind {
+    /// A pod was scheduled for the agent (create, start, wake, or the
+    /// schedule half of a tier-change recreate). Opens a billable interval.
+    PodScheduled {
+        /// Tier of the spec the pod was scheduled with; `None` for legacy.
+        tier: Option<String>,
+        /// Hourly price of that tier in cents at event time.
+        hourly_price_cents: Option<u32>,
+    },
+    /// The agent's pod was terminated. Closes the open billable interval.
+    PodTerminated {
+        /// Tier the pod was running as; `None` for legacy.
+        tier: Option<String>,
+        /// Hourly price of that tier in cents at event time.
+        hourly_price_cents: Option<u32>,
+        /// Why the pod went away, as known by the call site:
+        /// `hibernate` / `stop` / `tier_change` / `crash`.
+        reason: String,
+    },
+    /// The agent was put into hibernation (counter; the paired
+    /// `PodTerminated { reason: "hibernate" }` carries the pricing).
+    Hibernated,
+    /// The agent was woken from hibernation or a stopped state (counter;
+    /// the paired `PodScheduled` carries the pricing).
+    Woke,
+    /// The control-plane cron service delivered a process trigger to the
+    /// agent's pod.
+    TriggerFired {
+        /// The process the trigger fired into (opaque off-VM).
+        process_id: String,
+    },
     /// The agent's box tier changed (upgrade, downgrade, or legacy-agent
     /// early migration). Both hourly prices are captured at event time so
     /// cost intervals split exactly at the change.
@@ -734,6 +769,38 @@ mod tests {
         ciborium::into_writer(&event, &mut buf).unwrap();
         let parsed: UsageEvent = ciborium::from_reader(buf.as_slice()).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    /// Every phase-11 event kind survives a CBOR roundtrip.
+    #[test]
+    fn usage_event_kind_phase11_cbor_roundtrips() {
+        let kinds = [
+            UsageEventKind::PodScheduled {
+                tier: Some("standard".to_string()),
+                hourly_price_cents: Some(8),
+            },
+            UsageEventKind::PodScheduled {
+                tier: None,
+                hourly_price_cents: None,
+            },
+            UsageEventKind::PodTerminated {
+                tier: Some("pro".to_string()),
+                hourly_price_cents: Some(15),
+                reason: "hibernate".to_string(),
+            },
+            UsageEventKind::Hibernated,
+            UsageEventKind::Woke,
+            UsageEventKind::TriggerFired {
+                process_id: "proc-1".to_string(),
+            },
+        ];
+        for kind in kinds {
+            let event = UsageEvent::new(AgentId::generate(), kind);
+            let mut buf = Vec::new();
+            ciborium::into_writer(&event, &mut buf).unwrap();
+            let parsed: UsageEvent = ciborium::from_reader(buf.as_slice()).unwrap();
+            assert_eq!(parsed, event);
+        }
     }
 
     /// Forward-compatibility: phase 11 extends `UsageEventKind` with more

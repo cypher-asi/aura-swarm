@@ -1723,3 +1723,180 @@ async fn change_tier_mid_transition_returns_409() {
         .await
         .assert_status(axum::http::StatusCode::CONFLICT);
 }
+
+// ---------------------------------------------------------------------------
+// Usage / cost stats (Swarm TEE phase 11)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn usage_routes_require_auth() {
+    let (server, _tmp) = build_test_app();
+    let fake_id = "ee".repeat(16);
+
+    server
+        .get(&format!("/v1/agents/{fake_id}/usage"))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .get("/v1/usage")
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_usage_not_owner_forbidden() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+
+    let (hdr, val) = auth_header(OTHER_USER_UUID);
+    server
+        .get(&format!("/v1/agents/{agent_id}/usage"))
+        .add_header(hdr, val)
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_usage_invalid_range_returns_400() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+
+    // Unparseable timestamp.
+    server
+        .get(&format!("/v1/agents/{agent_id}/usage?from=yesterday"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // from after to.
+    server
+        .get(&format!(
+            "/v1/agents/{agent_id}/usage?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z"
+        ))
+        .add_header(hdr, val)
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn agent_usage_happy_path_reflects_lifecycle() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    // create (PodScheduled) → Running → hibernate (PodTerminated + Hibernated).
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+    server
+        .post(&format!("/v1/agents/{agent_id}/hibernate"))
+        .add_header(hdr.clone(), val.clone())
+        .await
+        .assert_status_ok();
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/usage"))
+        .add_header(hdr, val)
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+
+    assert_eq!(body["agent_id"], agent_id);
+    assert!(body.get("from").is_some());
+    assert!(body.get("to").is_some());
+    // One closed interval at the standard tier rate (priced at event time).
+    let intervals = body["intervals"].as_array().unwrap();
+    assert_eq!(intervals.len(), 1);
+    assert_eq!(intervals[0]["tier"], "standard");
+    assert_eq!(intervals[0]["hourly_price_cents"], 8);
+    assert!(body["awake_seconds"].as_u64().is_some());
+    assert!(body["cost_cents"].as_u64().is_some());
+    assert_eq!(body["wakes"], 0);
+    assert_eq!(body["triggers_fired"], 0);
+    assert_eq!(body["tier_changes"], 0);
+    // Raw events: PodScheduled, PodTerminated(hibernate), Hibernated.
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["kind"]["kind"], "pod_scheduled");
+    assert_eq!(events[1]["kind"]["kind"], "pod_terminated");
+    assert_eq!(events[1]["kind"]["reason"], "hibernate");
+    assert_eq!(events[2]["kind"]["kind"], "hibernated");
+}
+
+#[tokio::test]
+async fn user_usage_scoped_to_jwt_subject() {
+    let (server, _tmp) = build_test_app();
+
+    // One agent per user.
+    let my_agent = create_agent(&server, None).await;
+    let (other_hdr, other_val) = auth_header(OTHER_USER_UUID);
+    server
+        .post("/v1/agents")
+        .add_header(other_hdr.clone(), other_val.clone())
+        .json(&json!({"name": "their-agent"}))
+        .await
+        .assert_status(axum::http::StatusCode::CREATED);
+
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let resp = server.get("/v1/usage").add_header(hdr, val).await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+
+    let agents = body["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "only the caller's agents are included");
+    assert_eq!(agents[0]["agent_id"], my_agent);
+    assert_eq!(agents[0]["tier"], "standard");
+    assert!(body["total_awake_seconds"].as_u64().is_some());
+    assert!(body["total_cost_cents"].as_u64().is_some());
+
+    // The other user sees only theirs.
+    let resp = server
+        .get("/v1/usage")
+        .add_header(other_hdr, other_val)
+        .await;
+    let body: Value = resp.json();
+    let agents = body["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["name"], "their-agent");
+}
+
+#[tokio::test]
+async fn status_returns_real_usage_metrics() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = create_agent(&server, None).await;
+    let (hdr, val) = auth_header(TEST_USER_UUID);
+    let (internal_hdr, internal_val) = internal_auth_header();
+
+    server
+        .patch(&format!("/internal/agents/{agent_id}/status"))
+        .add_header(internal_hdr, internal_val)
+        .json(&json!({"status": "running"}))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    let resp = server
+        .get(&format!("/v1/agents/{agent_id}/status"))
+        .add_header(hdr, val)
+        .await;
+    resp.assert_status_ok();
+    let body: Value = resp.json();
+
+    assert_eq!(body["status"], "running");
+    assert_eq!(body["tier"], "standard");
+    // The pod was just scheduled: tiny real uptime, derived from the
+    // open billable interval (not the bogus created_at placeholder).
+    assert!(body["uptime_seconds"].as_u64().unwrap() < 60);
+    assert!(body["awake_seconds_24h"].as_u64().unwrap() < 60);
+    assert!(body["estimated_cost_cents_24h"].as_u64().is_some());
+    assert_eq!(body["wakes_24h"], 0);
+    assert_eq!(body["triggers_fired_24h"], 0);
+    // Backward-compatible placeholder fields now carry real values:
+    // allocated memory while the pod is active.
+    assert_eq!(body["resource_usage"]["memory_mb"], 2048);
+    assert_eq!(body["resource_usage"]["cpu_percent"], 0.0);
+}

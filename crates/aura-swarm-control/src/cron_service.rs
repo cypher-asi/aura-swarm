@@ -409,6 +409,24 @@ where
 
         match self.deliver_trigger(&agent_id, &process_id).await {
             Ok(()) => {
+                // Best-effort usage bookkeeping: a failed append must not
+                // turn a delivered trigger into a reported failure.
+                let event = aura_swarm_store::UsageEvent::new(
+                    agent_id,
+                    aura_swarm_store::UsageEventKind::TriggerFired {
+                        process_id: process_id.clone(),
+                    },
+                );
+                if let Err(e) =
+                    blocking_store(&self.store, move |s| Ok(s.append_usage_event(&event)?)).await
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        process_id = %process_id,
+                        error = %e,
+                        "Failed to append TriggerFired usage event; usage stats may undercount"
+                    );
+                }
                 tracing::info!(
                     agent_id = %agent_id,
                     process_id = %process_id,
@@ -818,6 +836,46 @@ mod tests {
         let outcome = service.tick(now).await.unwrap();
         assert_eq!(outcome, TickOutcome::default());
         assert!(pod.fired().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivered_trigger_appends_usage_event_failed_delivery_does_not() {
+        let (service, store, control, pod, _dir, user_id) = setup(test_config());
+        let agent_id = create_agent_in_state(&control, &store, &user_id, AgentState::Idle).await;
+
+        let now = Utc::now();
+        put_trigger(&store, &agent_id, "p1", "*/5 * * * *", true, Some(now), None);
+        service.tick(now).await.unwrap();
+
+        let fired: Vec<_> = store
+            .list_usage_events_by_agent(&agent_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                aura_swarm_store::UsageEventKind::TriggerFired { process_id } => Some(process_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fired, vec!["p1".to_string()], "delivery records the event");
+
+        // A failed delivery consumes the slot but records no event.
+        pod.fail.store(true, Ordering::SeqCst);
+        let stored = store.get_process_trigger(&agent_id, "p1").unwrap().unwrap();
+        let next = stored.next_run_at.unwrap();
+        service.tick(next).await.unwrap();
+
+        let count = store
+            .list_usage_events_by_agent(&agent_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    aura_swarm_store::UsageEventKind::TriggerFired { .. }
+                )
+            })
+            .count();
+        assert_eq!(count, 1, "failed delivery must not record TriggerFired");
     }
 
     // =========================================================================

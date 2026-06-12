@@ -17,7 +17,7 @@ use aura_swarm_control::ControlPlane;
 
 use crate::handlers::{
     agents, automaton, files, health, internal, process_triggers, run, secrets, sessions,
-    terminal, ws,
+    terminal, usage, ws,
 };
 use crate::state::GatewayState;
 
@@ -40,8 +40,12 @@ use crate::state::GatewayState;
 /// - `POST /v1/agents/:agent_id/wake` - Wake agent
 /// - `POST /v1/agents/:agent_id/tier` - Change box tier (upgrade/downgrade)
 /// - `GET /v1/agents/:agent_id/logs` - Get agent logs
-/// - `GET /v1/agents/:agent_id/status` - Get agent status
+/// - `GET /v1/agents/:agent_id/status` - Get agent status (real usage-derived metrics)
 /// - `GET /v1/agents/:agent_id/state` - Get remote agent state (lifecycle only)
+///
+/// ## Usage / cost stats (authenticated; zbilling stays the billing source of truth)
+/// - `GET /v1/agents/:agent_id/usage?from&to` - Billable intervals + counters + recent events
+/// - `GET /v1/usage?from&to` - Per-agent summaries + grand total for the caller's agents
 ///
 /// ## Terminal (authenticated, proxied to agent pod)
 /// - `GET /v1/agents/:agent_id/terminal/ws` - Terminal WebSocket (spawn/IO/kill)
@@ -145,6 +149,12 @@ where
             "/v1/agents/:agent_id/state",
             get(agents::get_agent_state::<C, V>),
         )
+        // Usage / cost stats (user-facing aggregation over usage events)
+        .route(
+            "/v1/agents/:agent_id/usage",
+            get(usage::get_agent_usage::<C, V>),
+        )
+        .route("/v1/usage", get(usage::get_user_usage::<C, V>))
         // Terminal proxy (single WS — spawn/IO/kill all flow as protocol messages)
         .route(
             "/v1/agents/:agent_id/terminal/ws",
