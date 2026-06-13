@@ -23,7 +23,7 @@ fail_check() {
 #------------------------------------------------------------------------------
 
 echo -e "${CYAN}Tools${NC}"
-for cmd in aws terraform kubectl docker jq curl git openssl base64 sha256sum; do
+for cmd in aws terraform kubectl helm docker jq curl git openssl base64 sha256sum; do
     if command -v "${cmd}" >/dev/null 2>&1; then
         echo -e "${GREEN}✓${NC} ${cmd}"
     else

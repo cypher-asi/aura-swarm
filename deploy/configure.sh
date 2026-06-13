@@ -78,28 +78,6 @@ show_config() {
     done
 }
 
-# Ensure PODVM_AMI_ID is set: keep an explicit value, otherwise auto-discover
-# the newest matching pod-VM AMI from AWS and persist it.
-ensure_podvm_ami_set() {
-    local ami="${PODVM_AMI_ID:-}"
-    [[ -n "${ami}" ]] && { echo -e "${GREEN}✓${NC} PODVM_AMI_ID already set: ${ami}"; return 0; }
-    if [[ -n "${PODVM_AMI_NAME_FILTER:-}" ]]; then
-        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (name='${PODVM_AMI_NAME_FILTER}', owners='${PODVM_AMI_OWNERS:-<any>}')..."
-    else
-        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (CoCo community 'podvm-fedora-amd64-${CAA_CHART_VERSION:-?}', else any podvm image)..."
-    fi
-    require_cmds aws
-    require_aws_auth
-    ami="$(resolve_podvm_ami)"
-    [[ -n "${ami}" ]] || step_fail "no pod-VM AMI found in ${AWS_REGION}. Options:
-  (1) pin a published image:   ./configure.sh PODVM_AMI_ID=ami-XXXX
-  (2) point discovery at one:  ./configure.sh PODVM_AMI_NAME_FILTER='podvm-fedora-amd64-*'
-  (3) build your own (SEV-SNP): confidential-containers/cloud-api-adaptor → src/cloud-api-adaptor/podvm-mkosi, TEE_PLATFORM=amd
-See deploy/PEER-PODS-PLAN.md (pod-VM image provenance) for the build/version-match details."
-    echo -e "${GREEN}✓${NC} Discovered pod-VM AMI: ${ami}"
-    apply_kv PODVM_AMI_ID "${ami}"
-}
-
 if [[ $# -eq 0 ]]; then
     show_config
     echo ""
@@ -135,7 +113,11 @@ while [[ ${i} -lt ${#PENDING[@]} ]]; do
 done
 
 if [[ "${DISCOVER_AMI}" -eq 1 ]]; then
-    ensure_podvm_ami_set
+    # Step 02 already does this automatically; this flag is just a manual
+    # override path (e.g. to re-pin after clearing PODVM_AMI_ID).
+    require_cmds aws
+    require_aws_auth
+    ensure_podvm_ami
 fi
 
 echo ""

@@ -28,6 +28,14 @@ step_banner "02" "Workers + Peer Pods/CAA infra (terraform)"
 require_cmds aws terraform kubectl jq
 require_aws_auth
 
+#------------------------------------------------------------------------------
+# Pod-VM AMI for the CAA-launched SEV-SNP pod VMs (consumed by step 03). Auto-
+# discover + persist it now so the rest of the flow needs no manual configure
+# step. Pin a specific image with: ./configure.sh PODVM_AMI_ID=ami-XXXX
+#------------------------------------------------------------------------------
+ensure_podvm_ami
+echo ""
+
 cd "${SCRIPT_DIR}/terraform"
 
 #------------------------------------------------------------------------------

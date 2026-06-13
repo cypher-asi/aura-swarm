@@ -779,6 +779,83 @@ resolve_podvm_ami() {
     printf '%s' "${ami}"
 }
 
+# Ensure PODVM_AMI_ID is set in config.env: keep an explicit value, otherwise
+# auto-discover the newest matching pod-VM AMI in AWS_REGION and persist it
+# (and export it into the current shell). Callers must require_aws_auth first.
+ensure_podvm_ami() {
+    if [[ -n "${PODVM_AMI_ID:-}" ]]; then
+        echo -e "${GREEN}✓${NC} PODVM_AMI_ID set: ${PODVM_AMI_ID}"
+        return 0
+    fi
+    if [[ -n "${PODVM_AMI_NAME_FILTER:-}" ]]; then
+        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (name='${PODVM_AMI_NAME_FILTER}', owners='${PODVM_AMI_OWNERS:-<any>}')..."
+    else
+        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (CoCo community 'podvm-fedora-amd64-${CAA_CHART_VERSION:-?}', else any podvm image)..."
+    fi
+    local ami
+    ami="$(resolve_podvm_ami)"
+    [[ -n "${ami}" ]] || step_fail "no pod-VM AMI found in ${AWS_REGION}. Pin one explicitly:
+  ./configure.sh PODVM_AMI_ID=ami-XXXX
+or point discovery at an image:
+  ./configure.sh PODVM_AMI_NAME_FILTER='podvm-fedora-amd64-*'
+or build a self-built SEV-SNP image (TEE_PLATFORM=amd; see deploy/PEER-PODS-PLAN.md §3)."
+    set_config_value PODVM_AMI_ID "${ami}"
+}
+
+# Dump describe(Events) + recent logs for the pods of a daemonset (diagnostics).
+dump_daemonset_diagnostics() {
+    local ns="$1" ds="$2" pod
+    echo -e "${YELLOW}--- ${ds} diagnostics ---${NC}"
+    kubectl -n "${ns}" get pods -o wide 2>&1 | sed 's/^/  /' || true
+    pod=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
+        | jq -r --arg ds "${ds}" '[.items[] | select((.metadata.ownerReferences // [])[]?.name == $ds) | .metadata.name][0] // ""' 2>/dev/null || echo "")
+    if [[ -n "${pod}" ]]; then
+        echo "  Events for ${pod}:"
+        kubectl -n "${ns}" describe pod "${pod}" 2>/dev/null | sed -n '/Events:/,$p' | sed 's/^/    /' || true
+        echo "  Logs (current) for ${pod}:"
+        kubectl -n "${ns}" logs "${pod}" --tail=50 2>&1 | sed 's/^/    /' || true
+        echo "  Logs (previous) for ${pod}:"
+        kubectl -n "${ns}" logs "${pod}" --previous --tail=50 2>&1 | sed 's/^/    /' || true
+    fi
+    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+}
+
+# Wait for a DaemonSet to be fully Ready, but FAIL FAST when its pods enter
+# CrashLoopBackOff or restart repeatedly instead of burning the whole timeout.
+# Dumps diagnostics on failure. Returns 0 Ready, 1 on crashloop/timeout.
+# Args: ns ds [timeout=300] [poll=10] [restart_threshold=3]
+wait_daemonset_ready() {
+    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" restarts="${5:-3}"
+    local elapsed=0 desired ready bad
+    echo "Waiting for daemonset ${ds} in ${ns} (fail-fast on CrashLoopBackOff, timeout ${timeout}s)..."
+    while (( elapsed <= timeout )); do
+        desired=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+        ready=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+        if [[ "${desired:-0}" -ge 1 && "${ready:-0}" -ge "${desired:-0}" ]]; then
+            echo -e "${GREEN}✓${NC} daemonset ${ds} Ready (${ready}/${desired})"
+            return 0
+        fi
+        # Fail fast: any owned pod with a CrashLoopBackOff container or restartCount >= threshold.
+        bad=$(kubectl -n "${ns}" get pods -o json 2>/dev/null | jq -r --arg ds "${ds}" --argjson n "${restarts}" '
+            [ .items[]
+              | select((.metadata.ownerReferences // [])[]?.name == $ds)
+              | . as $p | ($p.status.containerStatuses // [])[]
+              | select((.state.waiting.reason // "") == "CrashLoopBackOff" or (.restartCount // 0) >= $n)
+              | "\($p.metadata.name): \(.state.waiting.reason // ("restartCount=" + ((.restartCount // 0)|tostring)))"
+            ] | .[0] // ""' 2>/dev/null || echo "")
+        if [[ -n "${bad}" ]]; then
+            echo -e "${RED}✗${NC} daemonset ${ds} is failing fast — ${bad}"
+            dump_daemonset_diagnostics "${ns}" "${ds}"
+            return 1
+        fi
+        echo "  [${elapsed}s] ${ds} Ready: ${ready:-0}/${desired:-0}"
+        sleep "${poll}"; elapsed=$((elapsed + poll))
+    done
+    echo -e "${RED}✗${NC} daemonset ${ds} not Ready (${ready:-0}/${desired:-0}) after ${timeout}s"
+    dump_daemonset_diagnostics "${ns}" "${ds}"
+    return 1
+}
+
 # Read-only consistency check for the confidential (Peer Pods / CAA) config
 # (uses the already-sourced live values). Prints warnings; never mutates.
 # Returns the number of problems found so callers can decide.

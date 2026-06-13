@@ -353,18 +353,21 @@ data "aws_iam_policy_document" "caa" {
   # Per-pod VM lifecycle + discovery. RunInstances/TerminateInstances act on
   # ephemeral pod VMs whose ids are not known ahead of time, so resource is "*"
   # (CAA tags every pod VM; the smoke test asserts create + terminate).
+  #
+  # The write actions are explicit. For reads, CAA calls a range of ec2:Describe*
+  # operations (DescribeInstances, DescribeImages, DescribeInstanceTypes,
+  # DescribeSubnets, DescribeSecurityGroups, DescribeVpcs, DescribeKeyPairs,
+  # DescribeLaunchTemplates, ...) — granting ec2:Describe* avoids per-call
+  # whack-a-mole. All ec2:Describe* are read-only and cannot be resource-scoped
+  # (they require "*"), so enumerating them individually buys no extra safety.
   statement {
     sid    = "PodVMLifecycle"
     effect = "Allow"
     actions = [
       "ec2:RunInstances",
       "ec2:TerminateInstances",
-      "ec2:DescribeInstances",
       "ec2:CreateTags",
-      "ec2:DescribeImages",
-      "ec2:DescribeSubnets",
-      "ec2:DescribeSecurityGroups",
-      "ec2:DescribeVpcs",
+      "ec2:Describe*",
     ]
     resources = ["*"]
   }

@@ -33,15 +33,34 @@ CAA_CHART_VERSION="${CAA_CHART_VERSION:-}"
 [[ -n "${CAA_CHART_VERSION}" ]] \
     || step_fail "CAA_CHART_VERSION is empty — pin the Cloud API Adaptor chart version in config.env before installing"
 
-# CAA install targets (kept overridable; pinned defaults match the upstream chart).
+# CAA install targets (kept overridable; defaults match the upstream peerpods chart).
 CAA_NAMESPACE="${CAA_NAMESPACE:-confidential-containers-system}"
 CAA_RELEASE="${CAA_RELEASE:-cloud-api-adaptor}"
 CAA_DAEMONSET="${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}"
-# TODO: confirm the chart repo/name + value keys against
-# https://confidentialcontainers.org/docs/examples/aws-simple before first apply.
-# The CoCo project publishes the cloud-api-adaptor chart as an OCI artifact in GHCR.
-CAA_CHART_REF="${CAA_CHART_REF:-oci://ghcr.io/confidential-containers/cloud-api-adaptor/cloud-api-adaptor}"
+# The Cloud API Adaptor (Peer Pods) is published as the `peerpods` OCI chart
+# under the cloud-api-adaptor package — NOT a standalone `cloud-api-adaptor`
+# chart (that path 403s on GHCR; it does not exist). The chart bundles
+# kata-deploy (which creates the kata-remote RuntimeClass and installs the
+# remote shim on the workers), a peerpod controller, and a mutating webhook.
+# Inspect published versions with:
+#   helm show chart oci://ghcr.io/confidential-containers/cloud-api-adaptor/charts/peerpods --version <v>
+CAA_CHART_REF="${CAA_CHART_REF:-oci://ghcr.io/confidential-containers/cloud-api-adaptor/charts/peerpods}"
 CAA_INSTALL_TIMEOUT="${CAA_INSTALL_TIMEOUT_SECS:-600}"
+
+# The peerpods mutating webhook requires cert-manager to be installed. It is
+# disabled by default so step 03 runs without that prerequisite; install
+# cert-manager and set CAA_ENABLE_WEBHOOK=true for the production-correct
+# peer-pod resource scheduling (webhook injects the kata.peerpods.io/vm resource).
+CAA_ENABLE_WEBHOOK="${CAA_ENABLE_WEBHOOK:-false}"
+# The CAA DaemonSet hard-codes nodeSelector node.kubernetes.io/worker="" (it is
+# NOT a chart value), so the workers must carry that label or it stays at 0
+# desired. Label all nodes by default (every node here is a worker); narrow it
+# by setting CAA_WORKER_NODE_SELECTOR to a kubectl label selector.
+CAA_WORKER_NODE_SELECTOR="${CAA_WORKER_NODE_SELECTOR:-}"
+# A leftover CoCo operator in the namespace conflicts with the chart's bundled
+# kata-deploy (RuntimeClass / payload ownership); refuse to install over it
+# unless explicitly told to.
+CAA_IGNORE_COCO_OPERATOR="${CAA_IGNORE_COCO_OPERATOR:-false}"
 
 # Terraform-provided network/IAM wiring.
 AGENT_SUBNET_IDS_RAW="$(tf_output agent_subnet_ids)"
@@ -51,6 +70,10 @@ if printf '%s' "${AGENT_SUBNET_IDS_RAW}" | jq -e 'type=="array"' >/dev/null 2>&1
 else
     AGENT_SUBNET_IDS="${AGENT_SUBNET_IDS_RAW}"
 fi
+# The peerpods chart takes a SINGLE pod-VM subnet (AWS_SUBNET_ID), not a list;
+# launch pod VMs into the first agent subnet (must be EFS-reachable — see
+# PEER-PODS-PLAN §6.1). Override with CAA_PODVM_SUBNET_ID to pin another.
+CAA_PODVM_SUBNET_ID="${CAA_PODVM_SUBNET_ID:-${AGENT_SUBNET_IDS%%,*}}"
 NODE_SG_ID="$(tf_output node_security_group_id)"
 CAA_ROLE_ARN="$(tf_output caa_role_arn)"
 
@@ -67,77 +90,111 @@ echo "Installing Cloud API Adaptor (chart ${CAA_CHART_REF} @ ${CAA_CHART_VERSION
 echo "  pod-VM AMI:        ${PODVM_AMI_ID}"
 echo "  pod-VM type:       ${PODVM_INSTANCE_TYPE}"
 echo "  region:            ${AWS_REGION}"
-echo "  agent subnet(s):   ${AGENT_SUBNET_IDS}"
+echo "  pod-VM subnet:     ${CAA_PODVM_SUBNET_ID}"
 echo "  node SG:           ${NODE_SG_ID}"
 echo "  vxlan/forwarder:   ${CAA_VXLAN_PORT} / ${CAA_FORWARDER_PORT}"
+echo "  webhook:           ${CAA_ENABLE_WEBHOOK} (cert-manager required when true)"
+echo "  CAA image:         ${CAA_IMAGE_NAME}:${CAA_IMAGE_TAG:-<chart default>}"
 echo "  IRSA role:         ${CAA_ROLE_ARN:-<none — using node role>}"
 
 kubectl create namespace "${CAA_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# TODO: the --set value paths below mirror the aws-simple example's peer-pods
-# config; confirm each key against the pinned chart's values.yaml
-# (cloudProvider/aws.* and the service-account annotation path) before apply.
-CAA_SET_ARGS=(
-    --set "cloudProvider=aws"
-    --set "aws.region=${AWS_REGION}"
-    --set "aws.podvmAmiId=${PODVM_AMI_ID}"
-    --set "aws.podvmInstanceType=${PODVM_INSTANCE_TYPE}"
-    --set "aws.subnetIds=${AGENT_SUBNET_IDS}"
-    --set "aws.securityGroupIds=${NODE_SG_ID}"
-    --set "aws.disableCvm=false"
-    --set "aws.vxlanPort=${CAA_VXLAN_PORT}"
-    --set "aws.forwarderPort=${CAA_FORWARDER_PORT}"
-)
-if [[ -n "${CAA_ROLE_ARN}" ]]; then
-    CAA_SET_ARGS+=(--set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${CAA_ROLE_ARN}")
+# The bundled mutating webhook needs cert-manager; fail early with guidance
+# instead of midway through a half-applied release.
+if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]] \
+    && ! kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    step_fail "CAA_ENABLE_WEBHOOK=true but cert-manager is not installed (no certificates.cert-manager.io CRD).
+  Install cert-manager first, or set CAA_ENABLE_WEBHOOK=false to install without the peer-pod webhook."
 fi
 
+# A leftover CoCo operator owns kata RuntimeClasses and a kata-deploy payload
+# that collide with this chart's bundled kata-deploy. PEER-PODS-PLAN §4 has the
+# CAA Helm install REPLACE the operator, so stop until it is removed.
+if kubectl get deployment cc-operator-controller-manager -n "${CAA_NAMESPACE}" >/dev/null 2>&1 \
+    && [[ "${CAA_IGNORE_COCO_OPERATOR}" != "true" ]]; then
+    step_fail "the deprecated CoCo operator is still installed in ${CAA_NAMESPACE} and will conflict with the chart's bundled kata-deploy.
+  Remove it first (this step replaces it — see deploy/PEER-PODS-PLAN.md §4):
+    kubectl delete ccruntime --all -A --ignore-not-found
+    kubectl delete -n ${CAA_NAMESPACE} deployment cc-operator-controller-manager --ignore-not-found
+    kubectl delete -n ${CAA_NAMESPACE} daemonset cc-operator-daemon-install cc-operator-daemon-uninstall --ignore-not-found
+    kubectl get runtimeclass   # delete any operator-owned kata* RuntimeClasses that remain
+  Then re-run ./03-coco-operator.sh. (Override with CAA_IGNORE_COCO_OPERATOR=true only if you are sure they will not collide.)"
+fi
+
+# The CAA DaemonSet hard-codes nodeSelector node.kubernetes.io/worker="", so the
+# workers must carry that label or it stays at 0 desired (and the readiness
+# check below never passes). Label them before installing.
+if [[ -n "${CAA_WORKER_NODE_SELECTOR}" ]]; then
+    echo "Labeling nodes (-l ${CAA_WORKER_NODE_SELECTOR}) with node.kubernetes.io/worker=..."
+    kubectl label nodes -l "${CAA_WORKER_NODE_SELECTOR}" node.kubernetes.io/worker="" --overwrite >/dev/null
+else
+    echo "Labeling all nodes with node.kubernetes.io/worker= (CAA daemonset placement)..."
+    kubectl label nodes --all node.kubernetes.io/worker="" --overwrite >/dev/null
+fi
+
+# peerpods chart value keys: provider + env-style providerConfigs.aws.* (mirrors
+# the chart's providers/aws.yaml). --set-string keeps AMI ids / ports / bools as
+# the string env-vars CAA expects.
+#
+# AWS credentials: KEYLESS via IRSA. The chart's daemonset.serviceAccount
+# .annotations hook (chart >= 0.3.x) stamps the eks.amazonaws.com/role-arn
+# annotation onto the cloud-api-adaptor SA so the EKS identity webhook injects a
+# web-identity token, and the CAA AWS provider (>= appVersion v0.21, upstream PR
+# #3059) picks it up via the AWS SDK default chain. No static AWS keys, no
+# peer-pods-secret, no SSO creds (which expire). Requires CAA_CHART_VERSION with
+# IRSA support — 0.2.x charts only understand static keys and will CrashLoop.
+CAA_SET_ARGS=(
+    --set "provider=aws"
+    --set-string "providerConfigs.aws.AWS_REGION=${AWS_REGION}"
+    --set-string "providerConfigs.aws.AWS_SUBNET_ID=${CAA_PODVM_SUBNET_ID}"
+    --set-string "providerConfigs.aws.AWS_SG_IDS=${NODE_SG_ID}"
+    --set-string "providerConfigs.aws.PODVM_AMI_ID=${PODVM_AMI_ID}"
+    --set-string "providerConfigs.aws.PODVM_INSTANCE_TYPE=${PODVM_INSTANCE_TYPE}"
+    --set-string "providerConfigs.aws.DISABLECVM=false"
+    --set-string "providerConfigs.aws.VXLAN_PORT=${CAA_VXLAN_PORT}"
+    --set-string "providerConfigs.aws.FORWARDER_PORT=${CAA_FORWARDER_PORT}"
+    --set "webhook.enabled=${CAA_ENABLE_WEBHOOK}"
+)
+
+# Wire the IRSA role onto the CAA service account AT INSTALL TIME via the chart
+# hook. --set-json (not --set) because the annotation key has dots and a slash,
+# which plain --set would parse as nested map keys.
+if [[ -n "${CAA_ROLE_ARN}" ]]; then
+    CAA_SET_ARGS+=(--set-json "daemonset.serviceAccount.annotations={\"eks.amazonaws.com/role-arn\":\"${CAA_ROLE_ARN}\"}")
+fi
+
+# Override the chart's pinned CAA image. The 0.3.1 chart pins a v0.21.1 image
+# whose entrypoint still hard-requires static AWS keys; an image with the
+# IRSA-aware entrypoint (one_of AWS_SECRET_ACCESS_KEY/AWS_ROLE_ARN) is required
+# for keyless auth. Skipped when CAA_IMAGE_TAG is empty (use the chart default).
+if [[ -n "${CAA_IMAGE_TAG:-}" ]]; then
+    CAA_SET_ARGS+=(--set "image.name=${CAA_IMAGE_NAME}" --set-string "image.tag=${CAA_IMAGE_TAG}")
+fi
+
+# NOTE: no `--wait` here on purpose — helm --wait would block the full timeout
+# even when the daemonset pods are CrashLooping in the first few seconds. We let
+# helm return as soon as the manifests are applied, then fail FAST below.
 if ! helm upgrade --install "${CAA_RELEASE}" "${CAA_CHART_REF}" \
     --version "${CAA_CHART_VERSION}" \
     --namespace "${CAA_NAMESPACE}" \
-    "${CAA_SET_ARGS[@]}" \
-    --wait --timeout "${CAA_INSTALL_TIMEOUT}s"; then
-    echo ""
-    echo -e "${YELLOW}--- Cloud API Adaptor diagnostics ---${NC}"
-    kubectl get ds -n "${CAA_NAMESPACE}" -o wide 2>&1 | sed 's/^/  /' || true
-    kubectl get pods -n "${CAA_NAMESPACE}" -o wide 2>&1 | sed 's/^/  /' || true
-    CAA_POD=$(kubectl get pods -n "${CAA_NAMESPACE}" -l app=cloud-api-adaptor \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    if [[ -n "${CAA_POD}" ]]; then
-        echo "  Events for ${CAA_POD}:"
-        kubectl describe pod "${CAA_POD}" -n "${CAA_NAMESPACE}" 2>/dev/null | sed -n '/Events:/,$p' | sed 's/^/    /' || true
-        echo "  Logs (tail) for ${CAA_POD}:"
-        kubectl logs "${CAA_POD}" -n "${CAA_NAMESPACE}" --tail=50 2>&1 | sed 's/^/    /' || true
-    fi
-    echo -e "${YELLOW}--- end diagnostics ---${NC}"
-    step_fail "Cloud API Adaptor Helm install did not become ready within ${CAA_INSTALL_TIMEOUT}s"
+    "${CAA_SET_ARGS[@]}"; then
+    step_fail "helm upgrade --install ${CAA_RELEASE} (${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) failed — see helm output above"
 fi
-echo -e "${GREEN}✓${NC} Cloud API Adaptor Helm release ${CAA_RELEASE} installed"
+echo -e "${GREEN}✓${NC} Cloud API Adaptor Helm release ${CAA_RELEASE} applied"
+if [[ -n "${CAA_ROLE_ARN}" ]]; then
+    echo -e "${GREEN}✓${NC} CAA service account wired to IRSA role ${CAA_ROLE_ARN} (keyless; no static AWS keys)"
+fi
 echo ""
 
-# Verify: CAA daemonset Ready on the workers.
-DS_TIMEOUT="${CAA_INSTALL_TIMEOUT}"
-POLL=15
-ELAPSED=0
-DS_READY=0
-DS_DESIRED=0
-echo "Waiting for the CAA daemonset (${CAA_DAEMONSET}) to be Ready on the workers (timeout ${DS_TIMEOUT}s)..."
-while [[ ${ELAPSED} -le ${DS_TIMEOUT} ]]; do
-    DS_DESIRED=$(kubectl get ds "${CAA_DAEMONSET}" -n "${CAA_NAMESPACE}" \
-        -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
-    DS_READY=$(kubectl get ds "${CAA_DAEMONSET}" -n "${CAA_NAMESPACE}" \
-        -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-    if [[ "${DS_DESIRED:-0}" -ge 1 && "${DS_READY:-0}" -ge "${DS_DESIRED:-0}" ]]; then
-        break
-    fi
-    echo "  [${ELAPSED}s] CAA daemonset Ready: ${DS_READY:-0}/${DS_DESIRED:-0}"
-    sleep "${POLL}"
-    ELAPSED=$((ELAPSED + POLL))
-done
-if [[ "${DS_DESIRED:-0}" -lt 1 || "${DS_READY:-0}" -lt "${DS_DESIRED:-0}" ]]; then
-    step_fail "CAA daemonset ${CAA_DAEMONSET} not Ready (${DS_READY:-0}/${DS_DESIRED:-0}) after ${DS_TIMEOUT}s"
+# Verify: CAA daemonset Ready on the workers — fails fast on CrashLoopBackOff
+# (e.g. missing AWS creds / IRSA not injected) instead of waiting the full timeout.
+if ! wait_daemonset_ready "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}"; then
+    step_fail "CAA daemonset ${CAA_DAEMONSET} did not become Ready (diagnostics above).
+  If the logs show '\$AWS_ACCESS_KEY_ID is NOT set', the CAA image lacks the IRSA-aware
+  entrypoint — set CAA_IMAGE_TAG to an image that has it (config.env).
+  If they show 'At least one of these must be SET: AWS_SECRET_ACCESS_KEY AWS_ROLE_ARN',
+  the IRSA env was not injected — check the SA annotation + the cluster's IAM OIDC provider."
 fi
-echo -e "${GREEN}✓${NC} CAA daemonset Ready on ${DS_READY} worker(s)"
 
 # Verify: the kata-remote RuntimeClass exists.
 kubectl get runtimeclass kata-remote >/dev/null 2>&1 \
