@@ -47,11 +47,15 @@ CAA_DAEMONSET="${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}"
 CAA_CHART_REF="${CAA_CHART_REF:-oci://ghcr.io/confidential-containers/cloud-api-adaptor/charts/peerpods}"
 CAA_INSTALL_TIMEOUT="${CAA_INSTALL_TIMEOUT_SECS:-600}"
 
-# The peerpods mutating webhook requires cert-manager to be installed. It is
-# disabled by default so step 03 runs without that prerequisite; install
-# cert-manager and set CAA_ENABLE_WEBHOOK=true for the production-correct
-# peer-pod resource scheduling (webhook injects the kata.peerpods.io/vm resource).
-CAA_ENABLE_WEBHOOK="${CAA_ENABLE_WEBHOOK:-false}"
+# The peerpods mutating webhook rewrites kata-remote pods to request the
+# kata.peerpods.io/vm extended resource instead of cpu/memory, so confidential
+# agents schedule by pod-VM count rather than competing for worker CPU. It is
+# REQUIRED for correct peer-pod scheduling (without it agents go Unschedulable
+# "Insufficient cpu" on busy nodes), so it defaults ON. It needs cert-manager,
+# which this step auto-installs (CAA_AUTO_INSTALL_CERT_MANAGER). Set
+# CAA_ENABLE_WEBHOOK=false only on a throwaway cluster where you accept that
+# kata-remote pods burn real worker CPU.
+CAA_ENABLE_WEBHOOK="${CAA_ENABLE_WEBHOOK:-true}"
 # The CAA DaemonSet hard-codes nodeSelector node.kubernetes.io/worker="" (it is
 # NOT a chart value), so the workers must carry that label or it stays at 0
 # desired. Label all nodes by default (every node here is a worker); narrow it
@@ -105,12 +109,18 @@ echo "  IRSA role:         ${CAA_ROLE_ARN:-<none — using node role>}"
 
 kubectl create namespace "${CAA_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# The bundled mutating webhook needs cert-manager; fail early with guidance
-# instead of midway through a half-applied release.
-if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]] \
-    && ! kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
-    step_fail "CAA_ENABLE_WEBHOOK=true but cert-manager is not installed (no certificates.cert-manager.io CRD).
-  Install cert-manager first, or set CAA_ENABLE_WEBHOOK=false to install without the peer-pod webhook."
+# The bundled mutating webhook needs cert-manager. Ensure it BEFORE the CAA
+# release so the webhook's Certificate resources can be issued, instead of
+# failing midway through a half-applied release.
+if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]]; then
+    if kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} cert-manager present (peer-pods webhook prerequisite)"
+    elif [[ "${CAA_AUTO_INSTALL_CERT_MANAGER:-true}" == "true" ]]; then
+        ensure_cert_manager
+    else
+        step_fail "CAA_ENABLE_WEBHOOK=true but cert-manager is not installed (no certificates.cert-manager.io CRD) and CAA_AUTO_INSTALL_CERT_MANAGER=false.
+  Install cert-manager first, set CAA_AUTO_INSTALL_CERT_MANAGER=true, or set CAA_ENABLE_WEBHOOK=false to install without the peer-pod webhook."
+    fi
 fi
 
 # A leftover CoCo operator owns kata RuntimeClasses and a kata-deploy payload
@@ -206,5 +216,43 @@ fi
 kubectl get runtimeclass kata-remote >/dev/null 2>&1 \
     || step_fail "RuntimeClass kata-remote does not exist after the CAA install"
 echo -e "${GREEN}✓${NC} RuntimeClass kata-remote exists"
+
+# Verify: when enabled, the peer-pods mutating webhook is actually registered.
+# This is what makes kata-remote pods schedule by kata.peerpods.io/vm instead of
+# competing for worker CPU; without it the peer-pods smoke test (step 05) and
+# real agents go Unschedulable "Insufficient cpu" on busy nodes.
+if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]]; then
+    WEBHOOK_DEADLINE=$((SECONDS + ${CAA_WEBHOOK_WAIT_SECS:-60}))
+    until peerpods_webhook_present || [[ ${SECONDS} -ge ${WEBHOOK_DEADLINE} ]]; do
+        sleep 5
+    done
+    if peerpods_webhook_present; then
+        echo -e "${GREEN}✓${NC} Peer-pods mutating webhook registered (kata-remote pods get kata.peerpods.io/vm; cpu/memory stripped)"
+    else
+        step_fail "CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration appeared after the install — kata-remote pods would keep their cpu/memory and go Unschedulable. Check the CAA release / cert-manager, or set CAA_ENABLE_WEBHOOK=false to opt out."
+    fi
+fi
+
+#------------------------------------------------------------------------------
+# Worker host prerequisite: fuse / mount.fuse.
+#
+# kata-remote pulls the workload image inside the guest pod VM and presents it
+# to containerd via the nydus-overlayfs snapshotter — a FUSE mount that needs
+# the `mount.fuse` helper on the worker. Stock EKS AL2/AL2023 AMIs don't ship
+# `fuse`, so without this every kata-remote pod sandbox fails with
+# 'exec: "mount.fuse": executable file not found in $PATH' (stuck in
+# ContainerCreating). Install it via a privileged DaemonSet (idempotent; also
+# covers nodes added by later scale-ups).
+#------------------------------------------------------------------------------
+echo ""
+echo "Ensuring the kata-remote host prerequisite (fuse/mount.fuse) on workers..."
+FUSE_DS_MANIFEST="${DEPLOY_DIR}/k8s/coco-node-fuse-installer.yaml"
+[[ -f "${FUSE_DS_MANIFEST}" ]] || step_fail "missing fuse installer manifest: ${FUSE_DS_MANIFEST}"
+sed "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" "${FUSE_DS_MANIFEST}" | kubectl apply -f - >/dev/null
+if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-fuse-installer" "${CAA_INSTALL_TIMEOUT}"; then
+    step_fail "the fuse installer daemonset did not become Ready — workers still lack mount.fuse, which kata-remote needs.
+  Inspect: kubectl -n ${CAA_NAMESPACE} logs ds/kata-remote-fuse-installer"
+fi
+echo -e "${GREEN}✓${NC} Worker fuse prerequisite ensured (mount.fuse present for nydus-overlayfs)"
 
 step_ok "04 (./04-trustee-kbs.sh)"

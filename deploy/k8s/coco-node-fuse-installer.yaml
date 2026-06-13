@@ -1,0 +1,77 @@
+# kata-remote host prerequisite: fuse / mount.fuse
+#
+# kata-remote (Peer Pods) pulls the workload image INSIDE the guest pod VM
+# (CoCo "image_guest_pull"). On the worker it presents that image to containerd
+# via the nydus-overlayfs snapshotter, which is a FUSE filesystem mounted with
+# the `mount.fuse` helper. Stock EKS AL2/AL2023 worker AMIs do NOT ship the
+# `fuse` package, so every kata-remote pod sandbox fails with:
+#   failed to mount ... -t .../nydus-overlayfs: exec: "mount.fuse": executable
+#   file not found in $PATH
+#
+# This privileged DaemonSet installs fuse on each worker host (idempotent), and
+# because it is a DaemonSet it also covers nodes added by future scale-ups. It
+# targets the same nodes the CAA daemonset does (node.kubernetes.io/worker="").
+# Applied by ./03-coco-operator.sh (namespace templated as __CAA_NAMESPACE__).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kata-remote-fuse-installer
+  namespace: __CAA_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: kata-remote-fuse-installer
+    app.kubernetes.io/part-of: cloud-api-adaptor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kata-remote-fuse-installer
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kata-remote-fuse-installer
+    spec:
+      # Same workers the CAA daemonset targets (03 labels nodes with this).
+      nodeSelector:
+        node.kubernetes.io/worker: ""
+      # PID1 + privileged so we can install packages in the host namespaces.
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: installer
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          securityContext:
+            privileged: true
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              # Run on the host via PID1's namespaces (uses the host's package
+              # manager + filesystem); the container image only needs nsenter.
+              host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+              if host sh -c 'command -v mount.fuse >/dev/null 2>&1'; then
+                echo "mount.fuse already present on host - nothing to do"
+              else
+                echo "installing fuse + fuse3 on host (kata-remote nydus-overlayfs prereq)..."
+                host sh -c 'dnf install -y fuse fuse3 || yum install -y fuse fuse3'
+              fi
+              host sh -c 'command -v mount.fuse' \
+                || { echo "ERROR: mount.fuse still missing after install"; exit 1; }
+              echo "fuse prerequisite ensured on host"
+              # Stay running so the DaemonSet pod is Ready (readiness probe below
+              # keeps verifying the host still has mount.fuse).
+              sleep infinity
+          readinessProbe:
+            exec:
+              command: ["nsenter", "-t", "1", "-m", "--", "sh", "-c", "command -v mount.fuse"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
