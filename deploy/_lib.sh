@@ -316,12 +316,30 @@ oidc_thumbprint() {
 # error): re-run ./01-iam.sh after ./02-snp-node-group.sh creates the cluster.
 # Returns 0 when provisioned, 2 when deferred.
 ensure_oidc_provider_and_caa_role() {
-    local issuer
+    # Distinguish "cluster absent" (legit pre-cluster defer) from "org-admin
+    # lacks eks:DescribeCluster" (an access problem that must be surfaced, not
+    # silently deferred as if the cluster did not exist).
+    local issuer rc
     issuer=$(aws eks describe-cluster --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}" \
-        --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || echo "")
+        --query 'cluster.identity.oidc.issuer' --output text 2>&1)
+    rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        if echo "${issuer}" | grep -qiE 'ResourceNotFound|No cluster found'; then
+            echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} not found yet — deferring OIDC provider + CAA IRSA role."
+            echo "  Re-run ./01-iam.sh (org-admin) AFTER ./02-snp-node-group.sh creates the cluster."
+            return 2
+        fi
+        if echo "${issuer}" | grep -qiE 'AccessDenied|not authorized|UnauthorizedException'; then
+            step_fail "org-admin cannot eks:DescribeCluster ${EKS_CLUSTER_NAME} (needed to read the OIDC issuer for the CAA role).
+  This means ${ORG_IAM_POLICY} is not attached to the ${ORG_SSO_PERMISSION_SET} permission set yet — that policy grants
+  eks:DescribeCluster. Attach it from the Identity Center management/delegated-admin account (see the guidance
+  printed by the '== Permission sets ==' phase), re-login, and re-run ./01-iam.sh.
+  (aws said: ${issuer})"
+        fi
+        step_fail "eks describe-cluster ${EKS_CLUSTER_NAME} failed: ${issuer}"
+    fi
     if [[ -z "${issuer}" || "${issuer}" == "None" ]]; then
-        echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} not found yet — deferring OIDC provider + CAA IRSA role."
-        echo "  Re-run ./01-iam.sh (org-admin) AFTER ./02-snp-node-group.sh creates the cluster."
+        echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} has no OIDC issuer yet — deferring CAA IRSA role."
         return 2
     fi
     local host="${issuer#https://}"
