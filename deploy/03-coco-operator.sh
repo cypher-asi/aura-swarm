@@ -246,15 +246,31 @@ fi
 # This is what makes kata-remote pods schedule by kata.peerpods.io/vm instead of
 # competing for worker CPU; without it the peer-pods smoke test (step 05) and
 # real agents go Unschedulable "Insufficient cpu" on busy nodes.
+# A merely-registered webhook is not enough: if cert-manager has not injected its
+# clientConfig.caBundle (or its service has no ready endpoints) the API server
+# cannot call it, and with failurePolicy=Ignore it SILENTLY admits kata-remote
+# pods unmutated. Wait for the webhook to be *effective*, allowing time for
+# cert-manager CA injection after the install.
 if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]]; then
-    WEBHOOK_DEADLINE=$((SECONDS + ${CAA_WEBHOOK_WAIT_SECS:-60}))
-    until peerpods_webhook_present || [[ ${SECONDS} -ge ${WEBHOOK_DEADLINE} ]]; do
+    WEBHOOK_DEADLINE=$((SECONDS + ${CAA_WEBHOOK_WAIT_SECS:-120}))
+    while ! peerpods_webhook_effective >/dev/null 2>&1 && [[ ${SECONDS} -lt ${WEBHOOK_DEADLINE} ]]; do
         sleep 5
     done
-    if peerpods_webhook_present; then
-        echo -e "${GREEN}✓${NC} Peer-pods mutating webhook registered (kata-remote pods get kata.peerpods.io/vm; cpu/memory stripped)"
+    WEBHOOK_DIAG=""
+    WEBHOOK_RC=0
+    WEBHOOK_DIAG=$(peerpods_webhook_effective) || WEBHOOK_RC=$?
+    if [[ ${WEBHOOK_RC} -eq 0 ]]; then
+        echo -e "${GREEN}✓${NC} Peer-pods mutating webhook effective (kata-remote pods get kata.peerpods.io/vm; cpu/memory stripped)"
+        printf '%s\n' "${WEBHOOK_DIAG}" | sed 's/^/  /'
     else
-        step_fail "CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration appeared after the install — kata-remote pods would keep their cpu/memory and go Unschedulable. Check the CAA release / cert-manager, or set CAA_ENABLE_WEBHOOK=false to opt out."
+        echo -e "${YELLOW}--- peer-pods webhook diagnostics ---${NC}"
+        printf '%s\n' "${WEBHOOK_DIAG}" | sed 's/^/  /'
+        echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        if [[ ${WEBHOOK_RC} -eq 2 ]]; then
+            step_fail "CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration appeared after the install — kata-remote pods would keep their cpu/memory and go Unschedulable. Check the CAA release / cert-manager, or set CAA_ENABLE_WEBHOOK=false to opt out."
+        else
+            step_fail "the peer-pods mutating webhook is registered but NOT effective (see diagnostics above): its clientConfig.caBundle is empty or its service has no ready endpoints, so the API server cannot call it. With failurePolicy=Ignore it SILENTLY admits kata-remote pods unmutated, so they keep cpu/memory and go Unschedulable 'Insufficient cpu'. Fix cert-manager CA injection (cainjector Running, the webhook Certificate Ready so the caBundle is injected) then re-run ./03-coco-operator.sh."
+        fi
     fi
 fi
 

@@ -1062,6 +1062,100 @@ wait_daemonset_ready() {
     return 1
 }
 
+# Idempotently install cert-manager (the TLS issuer the peer-pods mutating
+# webhook depends on). No-op when the CRDs are already present. Pins
+# CERT_MANAGER_VERSION and waits for the cert-manager deployments to be Ready so
+# the CAA webhook's Certificate resources can be issued immediately after.
+ensure_cert_manager() {
+    local version="${CERT_MANAGER_VERSION:-v1.16.2}"
+    local ns="${CERT_MANAGER_NAMESPACE:-cert-manager}"
+    if kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+        local have
+        have=$(kubectl get crd certificates.cert-manager.io \
+            -o jsonpath='{.metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null)
+        echo -e "${GREEN}✓${NC} cert-manager already present (${have:-version unknown}) — skipping install"
+        return 0
+    fi
+    echo "Installing cert-manager ${version} (peer-pods webhook prerequisite) into ${ns}..."
+    helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null 2>&1 || true
+    helm repo update >/dev/null 2>&1 || true
+    if ! helm upgrade --install cert-manager jetstack/cert-manager \
+        --namespace "${ns}" --create-namespace \
+        --version "${version}" \
+        --set crds.enabled=true \
+        --wait --timeout "${CERT_MANAGER_INSTALL_TIMEOUT:-5m}"; then
+        step_fail "cert-manager ${version} install failed — install it manually or set CAA_ENABLE_WEBHOOK=false to skip the peer-pods webhook"
+    fi
+    kubectl get crd certificates.cert-manager.io >/dev/null 2>&1 \
+        || step_fail "cert-manager install finished but the certificates.cert-manager.io CRD is missing"
+    echo -e "${GREEN}✓${NC} cert-manager ${version} installed and Ready"
+}
+
+# True when a peer-pods / CoCo MutatingWebhookConfiguration is registered (the
+# admission webhook that rewrites kata-remote pods to request kata.peerpods.io/vm
+# instead of cpu/memory).
+peerpods_webhook_present() {
+    kubectl get mutatingwebhookconfigurations -o name 2>/dev/null \
+        | grep -qiE 'peer-?pod|coco|cc-operator|confidential'
+}
+
+# Inspect the peer-pods mutating webhook and report whether it is *effective*
+# (registered AND actually callable by the API server) — not merely present.
+#
+# The classic, silent failure: a registered MutatingWebhookConfiguration whose
+# clientConfig.caBundle was never injected by cert-manager (cainjector down, or
+# the webhook Certificate not Ready), or whose service has no ready endpoints.
+# The API server then cannot call the webhook; with failurePolicy=Ignore it
+# SILENTLY admits kata-remote pods UNMUTATED, so they keep cpu/memory and go
+# Unschedulable ("Insufficient cpu") instead of scheduling on kata.peerpods.io/vm.
+# peerpods_webhook_present() can't catch this — the config object exists.
+#
+# Prints an indented multi-line summary (config/webhook, failurePolicy, caBundle
+# bytes, service + endpoint count) on stdout. Return codes:
+#   0 = effective (caBundle present AND service has >=1 ready endpoint)
+#   1 = present but NOT effective (the dangerous, silent case)
+#   2 = absent (no peer-pods MutatingWebhookConfiguration at all)
+peerpods_webhook_effective() {
+    local json loc cfg whname fields failpol cabundle svcns svcname eps
+    json=$(kubectl get mutatingwebhookconfigurations -o json 2>/dev/null) || return 2
+    # Locate the peer-pods webhook by config name OR webhook name (mirrors the
+    # pattern peerpods_webhook_present uses); take the first match.
+    loc=$(printf '%s' "${json}" | jq -r '
+        .items[] | .metadata.name as $cfg | (.webhooks // [])[]
+        | select(($cfg | test("peer-?pod|coco|cc-operator|confidential";"i"))
+                 or ((.name // "") | test("peer-?pod|kata|coco|confidential";"i")))
+        | "\($cfg)\t\(.name)"' 2>/dev/null | head -1 || true)
+    [[ -n "${loc}" ]] || return 2
+    cfg="${loc%%$'\t'*}"
+    whname="${loc##*$'\t'}"
+
+    fields=$(printf '%s' "${json}" | jq -r --arg cfg "${cfg}" --arg wh "${whname}" '
+        .items[] | select(.metadata.name==$cfg) | .webhooks[] | select(.name==$wh)
+        | [ (.failurePolicy // "<unset>"),
+            ((.clientConfig.caBundle // "") | length | tostring),
+            (.clientConfig.service.namespace // "<none>"),
+            (.clientConfig.service.name // "<none>") ] | @tsv' 2>/dev/null || true)
+    IFS=$'\t' read -r failpol cabundle svcns svcname <<<"${fields}" || true
+
+    eps="0"
+    if [[ -n "${svcname:-}" && "${svcname:-<none>}" != "<none>" ]]; then
+        eps=$(kubectl -n "${svcns}" get endpoints "${svcname}" \
+            -o jsonpath='{range .subsets[*]}{.addresses[*].ip}{"\n"}{end}' 2>/dev/null \
+            | tr ' ' '\n' | sed '/^$/d' | wc -l | tr -d ' ' || echo 0)
+    fi
+
+    echo "config:        ${cfg} (webhook ${whname})"
+    echo "failurePolicy: ${failpol:-<unset>}"
+    if [[ "${cabundle:-0}" == "0" ]]; then
+        echo "caBundle:      0 bytes  <-- EMPTY: cert-manager did not inject the CA; the API server cannot call the webhook"
+    else
+        echo "caBundle:      ${cabundle} bytes"
+    fi
+    echo "service:       ${svcns:-<none>}/${svcname:-<none>}  endpoints=${eps:-0}"
+
+    [[ "${cabundle:-0}" != "0" && "${eps:-0}" -ge 1 ]]
+}
+
 # Read-only consistency check for the confidential (Peer Pods / CAA) config
 # (uses the already-sourced live values). Prints warnings; never mutates.
 # Returns the number of problems found so callers can decide.
@@ -1071,6 +1165,28 @@ validate_confidential_runtime_config() {
     if [[ -z "${PODVM_AMI_ID:-}" ]]; then
         echo -e "${YELLOW}⚠${NC} PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
         problems=$((problems + 1))
+    fi
+    # The peer-pods webhook is what lets kata-remote pods schedule by pod-VM
+    # count instead of competing for worker CPU. Flag (don't fail) when it is
+    # expected but absent OR present-but-not-effective — both surface as agents
+    # stuck Pending "Insufficient cpu".
+    if [[ "${CAA_ENABLE_WEBHOOK:-true}" == "true" ]]; then
+        local whout="" whrc=0
+        whout=$(peerpods_webhook_effective) || whrc=$?
+        case "${whrc}" in
+            0)
+                echo -e "${GREEN}✓${NC} Peer-pods mutating webhook effective (kata-remote pods schedule via kata.peerpods.io/vm)"
+                ;;
+            1)
+                echo -e "${YELLOW}⚠${NC} Peer-pods webhook is registered but NOT effective — the API server cannot call it, so kata-remote pods stay unmutated (cpu/memory kept) and go Unschedulable 'Insufficient cpu'. Check cert-manager CA injection:"
+                printf '%s\n' "${whout}" | sed 's/^/    /'
+                problems=$((problems + 1))
+                ;;
+            *)
+                echo -e "${YELLOW}⚠${NC} CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration found — kata-remote pods will keep their cpu/memory requests and can go Unschedulable on busy nodes. Run ./03-coco-operator.sh."
+                problems=$((problems + 1))
+                ;;
+        esac
     fi
     return "${problems}"
 }

@@ -200,6 +200,28 @@ echo -e "${GREEN}✓${NC} Scratch resource provisioned in KBS"
 # 2. Throwaway kata-remote pod: CAA boots a pod VM that attests + fetches via CDH
 #------------------------------------------------------------------------------
 
+# Pre-flight: the peer-pods mutating webhook MUST be effective (registered AND
+# callable) or this pod will never schedule — it keeps its cpu/memory and goes
+# Unschedulable "Insufficient cpu". Fail now with the precise cause instead of
+# burning the launch timeout. Set PEER_PODS_REQUIRE_WEBHOOK=false to skip (e.g.
+# on a cluster where you deliberately run kata-remote without the webhook).
+if [[ "${PEER_PODS_REQUIRE_WEBHOOK:-true}" == "true" ]]; then
+    WH_DIAG=""
+    WH_RC=0
+    WH_DIAG=$(peerpods_webhook_effective) || WH_RC=$?
+    if [[ ${WH_RC} -ne 0 ]]; then
+        echo -e "${YELLOW}--- peer-pods webhook diagnostics ---${NC}"
+        printf '%s\n' "${WH_DIAG}" | sed 's/^/  /'
+        echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        if [[ ${WH_RC} -eq 2 ]]; then
+            step_fail "no peer-pods MutatingWebhookConfiguration is registered — kata-remote pods keep cpu/memory and never schedule. Run ./03-coco-operator.sh (CAA_ENABLE_WEBHOOK=true) first, or set PEER_PODS_REQUIRE_WEBHOOK=false to skip this guard."
+        else
+            step_fail "the peer-pods mutating webhook is registered but NOT effective (see diagnostics above): empty caBundle or no ready endpoints, so the API server cannot call it and (with failurePolicy=Ignore) would SILENTLY admit this pod unmutated. Fix cert-manager CA injection then re-run, or set PEER_PODS_REQUIRE_WEBHOOK=false to bypass."
+        fi
+    fi
+    echo -e "${GREEN}✓${NC} Peer-pods mutating webhook is effective (kata-remote pods get rewritten to kata.peerpods.io/vm)"
+fi
+
 echo ""
 echo "Launching throwaway pod on kata-remote (CAA pod-VM boot + attestation can take a few minutes)..."
 kubectl apply -f - >/dev/null <<EOF
@@ -267,6 +289,12 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     # Detect a stuck-Unschedulable pod and bail with a precise diagnosis.
     if [[ "${SCHED}" == Unschedulable:* || "${SCHED}" == *"Unschedulable"* ]]; then
         UNSCHED_ELAPSED=$((UNSCHED_ELAPSED + POLL))
+        # Print the likely cause on the FIRST Unschedulable poll so a Ctrl-C
+        # before the ${UNSCHED_GRACE}s full dump still shows what to look at.
+        if [[ "${UNSCHED_HINTED:-0}" == "0" ]]; then
+            UNSCHED_HINTED=1
+            echo -e "  ${YELLOW}↳${NC} Unschedulable — if this is 'Insufficient cpu' the peer-pods webhook did NOT rewrite this pod (a mutated pod has NO cpu request and asks for kata.peerpods.io/vm:1). Full diagnostics in ${UNSCHED_GRACE}s."
+        fi
         if [[ ${UNSCHED_ELAPSED} -ge ${UNSCHED_GRACE} ]]; then
             CPU_REQ=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
                 -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null || true)
@@ -275,11 +303,8 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
             echo -e "${YELLOW}--- unschedulable diagnostics ---${NC}"
             echo "  pod still requests cpu=${CPU_REQ:-<none>}, kata.peerpods.io/vm=${VM_RES:-<none>}"
             echo "  (a webhook-mutated kata-remote pod has NO cpu request and kata.peerpods.io/vm=1)"
-            echo "  peer-pods webhook config:"
-            kubectl get mutatingwebhookconfiguration -o json 2>/dev/null \
-                | jq -r '.items[] | select(.webhooks[]?.name | test("peer|kata";"i"))
-                         | "    name=\(.metadata.name)  failurePolicy=\(.webhooks[0].failurePolicy)  namespaceSelector=\(.webhooks[0].namespaceSelector // {})"' 2>/dev/null \
-                | sed 's/^/  /' || true
+            echo "  peer-pods webhook effectiveness (caBundle/failurePolicy/endpoints):"
+            peerpods_webhook_effective 2>/dev/null | sed 's/^/    /' || true
             echo "  node allocatable kata.peerpods.io/vm:"
             kubectl get nodes -o json 2>/dev/null \
                 | jq -r '.items[] | "    \(.metadata.name): \(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
