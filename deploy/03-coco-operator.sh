@@ -217,6 +217,31 @@ kubectl get runtimeclass kata-remote >/dev/null 2>&1 \
     || step_fail "RuntimeClass kata-remote does not exist after the CAA install"
 echo -e "${GREEN}✓${NC} RuntimeClass kata-remote exists"
 
+# Zero the kata-remote RuntimeClass pod overhead.
+#
+# Peer Pods scheduling goes through the kata.peerpods.io/vm extended resource
+# (the webhook strips a pod's cpu/memory and requests kata.peerpods.io/vm:1).
+# But kata-deploy stamps a DEFAULT kata overhead (podFixed cpu/memory) on the
+# kata-remote RuntimeClass, and the scheduler ADDS that overhead to every
+# kata-remote pod's effective requests. On a busy node pool that makes pods go
+# Unschedulable "Insufficient cpu" even though their containers request 0 cpu
+# (the real compute runs off-cluster in the pod VM). Scheduling must rely solely
+# on the extended resource, so zero the overhead. kata-deploy re-stamps it on
+# each install, so this is re-applied here every run.
+CURRENT_OVERHEAD="$(kubectl get runtimeclass kata-remote -o jsonpath='{.overhead.podFixed}' 2>/dev/null || true)"
+if [[ -n "${CURRENT_OVERHEAD}" && "${CURRENT_OVERHEAD}" != '{"cpu":"0","memory":"0"}' && "${CURRENT_OVERHEAD}" != "map[cpu:0 memory:0]" ]]; then
+    if kubectl patch runtimeclass kata-remote --type=merge \
+        -p '{"overhead":{"podFixed":{"cpu":"0","memory":"0"}}}' >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Zeroed kata-remote RuntimeClass overhead (was ${CURRENT_OVERHEAD}; peer-pods schedules via kata.peerpods.io/vm)"
+    else
+        echo -e "${YELLOW}⚠${NC} Could not patch the kata-remote RuntimeClass overhead (${CURRENT_OVERHEAD})."
+        echo "  kata-remote pods may go Unschedulable 'Insufficient cpu' on a busy pool; add node CPU or"
+        echo "  patch it manually: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
+    fi
+else
+    echo -e "${GREEN}✓${NC} kata-remote RuntimeClass overhead already zero (scheduling via kata.peerpods.io/vm)"
+fi
+
 # Verify: when enabled, the peer-pods mutating webhook is actually registered.
 # This is what makes kata-remote pods schedule by kata.peerpods.io/vm instead of
 # competing for worker CPU; without it the peer-pods smoke test (step 05) and
