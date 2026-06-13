@@ -1039,13 +1039,13 @@ render_k8s_manifests() {
     efs_id=$(tf_output efs_filesystem_id)
     [[ -n "${efs_id}" ]] || step_fail "could not read EFS filesystem ID from terraform output"
 
-    local anthropic openai zero_id zbilling token
-    anthropic=$(load_secret "ANTHROPIC_API_KEY")
-    openai=$(load_secret "OPENAI_API_KEY")
+    # Agents reason via the aura-router proxy (AURA_ROUTER_URL), so no raw LLM
+    # provider keys are injected here. Only the internal token + zbilling/zero-id
+    # secrets are wired in.
+    local zero_id zbilling token
     zero_id=$(load_secret "ZERO_ID_SECRET")
     zbilling=$(load_secret "Z_BILLING_API_KEY")
     token=$(load_secret "INTERNAL_TOKEN")
-    [[ -n "${anthropic}" ]] || step_fail "missing .secrets/ANTHROPIC_API_KEY"
     [[ -n "${token}" ]] || step_fail "missing .secrets/INTERNAL_TOKEN (run ./04-trustee-kbs.sh first)"
 
     local tmp_dir
@@ -1057,8 +1057,6 @@ render_k8s_manifests() {
     local secrets_yaml="${tmp_dir}/03-secrets.yaml"
     sed -i "s|REPLACE_WITH_ECR_REGISTRY/RESOURCE_PREFIX-runtime:v0.1.0|${registry}/${RESOURCE_PREFIX}-runtime:${image_tag}|g" "${secrets_yaml}"
     sed -i "s|ECR_REGISTRY/RESOURCE_PREFIX-harness:IMAGE_TAG|${PINNED_HARNESS_IMAGE}|g" "${secrets_yaml}"
-    sed -i "s|__ANTHROPIC_API_KEY__|${anthropic}|g" "${secrets_yaml}"
-    sed -i "s|__OPENAI_API_KEY__|${openai:-placeholder-not-set}|g" "${secrets_yaml}"
     sed -i "s|__ZERO_ID_SECRET__|${zero_id:-placeholder-not-set}|g" "${secrets_yaml}"
     sed -i "s|__Z_BILLING_API_KEY__|${zbilling:-}|g" "${secrets_yaml}"
     sed -i "s|__INTERNAL_TOKEN__|${token}|g" "${secrets_yaml}"
