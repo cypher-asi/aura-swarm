@@ -206,6 +206,20 @@ if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
     fi
 fi
 
+# Same hazard for peer-pods-cm: a prior `kubectl patch` (e.g. hand-editing
+# DISABLECVM or PODVM_AMI_ID) takes the "kubectl-patch" field-manager. The chart
+# applies that ConfigMap via server-side apply, so on re-run helm conflicts:
+#   conflict with "kubectl-patch" using v1: .data.DISABLECVM
+# Clear the stale field-manager ownership (managedFields) so helm's apply re-owns
+# those fields. Lossless: helm rewrites the cm from the --set values below, and
+# running CAA pods read it only at start (helm recreates it in this same upgrade).
+if kubectl get configmap peer-pods-cm -n "${CAA_NAMESPACE}" >/dev/null 2>&1; then
+    if kubectl patch configmap peer-pods-cm -n "${CAA_NAMESPACE}" --type=json \
+        -p='[{"op":"remove","path":"/metadata/managedFields"}]' >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Reset peer-pods-cm field ownership before upgrade (cleared stale kubectl-patch manager)"
+    fi
+fi
+
 # NOTE: no `--wait` here on purpose — helm --wait would block the full timeout
 # even when the daemonset pods are CrashLooping in the first few seconds. We let
 # helm return as soon as the manifests are applied, then fail FAST below.
@@ -213,7 +227,10 @@ if ! helm upgrade --install "${CAA_RELEASE}" "${CAA_CHART_REF}" \
     --version "${CAA_CHART_VERSION}" \
     --namespace "${CAA_NAMESPACE}" \
     "${CAA_SET_ARGS[@]}"; then
-    step_fail "helm upgrade --install ${CAA_RELEASE} (${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) failed — see helm output above"
+    step_fail "helm upgrade --install ${CAA_RELEASE} (${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) failed — see helm output above.
+  If it is a server-side-apply field conflict (e.g. 'conflict with \"kubectl-patch\" ... .data.<key>'),
+  a manual kubectl patch owns that field. Clear the stale manager and re-run:
+    kubectl patch <kind> <name> -n ${CAA_NAMESPACE} --type=json -p='[{\"op\":\"remove\",\"path\":\"/metadata/managedFields\"}]'"
 fi
 echo -e "${GREEN}✓${NC} Cloud API Adaptor Helm release ${CAA_RELEASE} applied"
 if [[ -n "${CAA_ROLE_ARN}" ]]; then
