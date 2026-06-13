@@ -54,7 +54,7 @@ spec:
               if ! command -v nsenter >/dev/null 2>&1; then
                 echo "installing util-linux-core (for nsenter) in the installer container..."
                 (dnf -y install util-linux-core || dnf -y install util-linux \
-                  || yum -y install util-linux) >/dev/null 2>&1 || true
+                  || yum -y install util-linux) || true
               fi
               command -v nsenter >/dev/null 2>&1 \
                 || { echo "ERROR: could not obtain nsenter in the installer container"; exit 1; }
@@ -80,9 +80,12 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 15
             failureThreshold: 3
+          # dnf (in the container for nsenter, and on the host for fuse, which
+          # runs in this container's cgroup via nsenter) needs real memory —
+          # 64Mi OOM-kills it mid-install. Give it room.
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 50m
+              memory: 128Mi
             limits:
-              memory: 64Mi
+              memory: 512Mi
