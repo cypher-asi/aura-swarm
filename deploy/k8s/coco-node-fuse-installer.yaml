@@ -48,8 +48,17 @@ spec:
           args:
             - |
               set -eu
-              # Run on the host via PID1's namespaces (uses the host's package
-              # manager + filesystem); the container image only needs nsenter.
+              # The amazonlinux base image does NOT ship nsenter; install it
+              # (util-linux-core) so we can enter the host namespaces. The
+              # container has dnf + NAT egress (it just pulled from public ECR).
+              if ! command -v nsenter >/dev/null 2>&1; then
+                echo "installing util-linux-core (for nsenter) in the installer container..."
+                (dnf -y install util-linux-core || dnf -y install util-linux \
+                  || yum -y install util-linux) >/dev/null 2>&1 || true
+              fi
+              command -v nsenter >/dev/null 2>&1 \
+                || { echo "ERROR: could not obtain nsenter in the installer container"; exit 1; }
+              # Run on the host via PID1's namespaces (host package manager + fs).
               host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
               if host sh -c 'command -v mount.fuse >/dev/null 2>&1'; then
                 echo "mount.fuse already present on host - nothing to do"
@@ -60,12 +69,14 @@ spec:
               host sh -c 'command -v mount.fuse' \
                 || { echo "ERROR: mount.fuse still missing after install"; exit 1; }
               echo "fuse prerequisite ensured on host"
-              # Stay running so the DaemonSet pod is Ready (readiness probe below
-              # keeps verifying the host still has mount.fuse).
+              # Stay running so the DaemonSet pod is Ready. The readiness probe
+              # re-verifies the host still has mount.fuse; touch a marker so the
+              # probe does not depend on nsenter being on the container PATH yet.
+              touch /tmp/fuse-ready
               sleep infinity
           readinessProbe:
             exec:
-              command: ["nsenter", "-t", "1", "-m", "--", "sh", "-c", "command -v mount.fuse"]
+              command: ["/bin/sh", "-c", "test -f /tmp/fuse-ready"]
             initialDelaySeconds: 5
             periodSeconds: 15
             failureThreshold: 3
