@@ -15,10 +15,9 @@
 # here; they are configured alongside the DEK lifecycle work (R1 attest-boot
 # phase) via kbs-client.
 #
-# Peer Pods note: this KBS deploy is identical for both confidential runtimes
-# (on-node kata-qemu-snp vs CAA kata-remote pod VM) — the KBS still lives in
-# swarm-system and releases the per-agent DEK after SNP attestation; only the
-# CDH moves into the AWS pod VM. The one thing that is NOT portable is the
+# Peer Pods note: the KBS lives in swarm-system and releases the per-agent DEK
+# after SNP attestation; with Peer Pods (CAA kata-remote) the CDH runs inside
+# the AWS-managed pod VM. The one thing to watch is the
 # attestation policy: under Peer Pods the AS reference values / policy.rego MUST
 # be re-baselined to the AWS-managed pod-VM launch measurement. The pod-VM image
 # and firmware (OVMF/IGVM) are AWS/CoCo-built, so any launch measurement or

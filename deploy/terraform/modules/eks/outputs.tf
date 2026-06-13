@@ -59,6 +59,6 @@ output "cluster_role_arn" {
 }
 
 output "caa_role_arn" {
-  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role (empty string when enable_caa=false)"
-  value       = var.enable_caa ? aws_iam_role.caa[0].arn : ""
+  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role"
+  value       = aws_iam_role.caa.arn
 }

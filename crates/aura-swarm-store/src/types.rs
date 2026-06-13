@@ -267,12 +267,13 @@ impl IsolationLevel {
     /// Get the Kubernetes `RuntimeClass` name for this isolation level.
     ///
     /// Returns `None` for container isolation (uses default runtime) or
-    /// `Some("kata-qemu-snp")` for confidential VM isolation.
+    /// `Some("kata-remote")` for confidential VM isolation (Peer Pods /
+    /// Cloud API Adaptor: a per-agent AWS-managed SEV-SNP pod VM).
     #[must_use]
     pub const fn runtime_class(&self) -> Option<&'static str> {
         match self {
             Self::Container => None, // Use default container runtime
-            Self::ConfidentialVM => Some("kata-qemu-snp"),
+            Self::ConfidentialVM => Some("kata-remote"),
         }
     }
 }
@@ -637,7 +638,7 @@ mod tests {
         assert_eq!(IsolationLevel::Container.runtime_class(), None);
         assert_eq!(
             IsolationLevel::ConfidentialVM.runtime_class(),
-            Some("kata-qemu-snp")
+            Some("kata-remote")
         );
     }
 

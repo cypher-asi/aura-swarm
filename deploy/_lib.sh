@@ -394,11 +394,11 @@ nodegroup_status() {
         --query 'nodegroup.status' --output text 2>/dev/null || echo "MISSING"
 }
 
-# Wait until both managed node groups report ACTIVE (uses DescribeNodegroup,
+# Wait until the managed node group reports ACTIVE (uses DescribeNodegroup,
 # NOT DescribeUpdate). Returns 0 on convergence, 1 on timeout.
 wait_nodegroups_active() {
     local timeout="${1:-1800}" poll=30 elapsed=0
-    local groups=("${RESOURCE_PREFIX}-node-group" "${RESOURCE_PREFIX}-confidential-node-group")
+    local groups=("${RESOURCE_PREFIX}-node-group")
     while [[ ${elapsed} -le ${timeout} ]]; do
         local all_ok=true g status
         for g in "${groups[@]}"; do
@@ -411,108 +411,6 @@ wait_nodegroups_active() {
         elapsed=$((elapsed + poll))
     done
     return 1
-}
-
-# Count of confidential/SNP nodes whose Ready condition is True.
-snp_ready_node_count() {
-    kubectl get nodes -l swarm.io/confidential-node=true -o json 2>/dev/null \
-        | jq '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length' 2>/dev/null || echo 0
-}
-
-# Ensures at least one confidential (SNP) node is Ready, recovering common
-# managed-node-group snags automatically:
-#   - desired count below target -> raises it
-#   - DEGRADED + AsgInstanceLaunchFailures (stale failed launch after capacity
-#     freed) -> bounces desired 0 -> target to force a clean relaunch
-# Prints live EC2 / node-group / node status while waiting. Fails definitively
-# only on a real capacity/quota wall or timeout.
-ensure_snp_node_ready() {
-    local ng="${RESOURCE_PREFIX}-confidential-node-group"
-    local want="${CONFIDENTIAL_NODE_DESIRED_COUNT:-1}"
-    local min="${CONFIDENTIAL_NODE_MIN_COUNT:-0}"
-    local max="${CONFIDENTIAL_NODE_MAX_COUNT:-3}"
-    local timeout="${SNP_NODE_JOIN_TIMEOUT_SECS:-1800}" poll=30 elapsed=0 bounced=0
-
-    if [[ "$(snp_ready_node_count)" -ge 1 ]]; then
-        echo -e "${GREEN}✓${NC} Confidential (SNP) node already Ready"
-        return 0
-    fi
-
-    echo "No SNP node Ready yet — ensuring the confidential node group provisions one..."
-
-    local ng_status cur_desired
-    ng_status=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-        --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
-    cur_desired=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-        --region "${AWS_REGION}" --query 'nodegroup.scalingConfig.desiredSize' --output text 2>/dev/null || echo "?")
-
-    # Raise desired if it's below target and we're ACTIVE.
-    if [[ "${ng_status}" == "ACTIVE" && "${cur_desired}" =~ ^[0-9]+$ && "${cur_desired}" -lt "${want}" ]]; then
-        echo "  desired=${cur_desired} < ${want}; requesting desiredSize=${want}..."
-        aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-            --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=${want}" >/dev/null 2>&1 || true
-    fi
-
-    while (( elapsed <= timeout )); do
-        if [[ "$(snp_ready_node_count)" -ge 1 ]]; then
-            echo -e "${GREEN}✓${NC} Confidential (SNP) node is Ready"
-            return 0
-        fi
-
-        local health status
-        status=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-            --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
-        health=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-            --region "${AWS_REGION}" --query 'nodegroup.health.issues' --output json 2>/dev/null || echo '[]')
-
-        echo "  [${elapsed}s] node group: ${status}"
-        echo "    EC2 instances:"
-        aws ec2 describe-instances --region "${AWS_REGION}" \
-            --filters "Name=tag:eks:nodegroup-name,Values=${ng}" \
-                      "Name=instance-state-name,Values=pending,running,shutting-down,stopping" \
-            --query 'Reservations[].Instances[].{id:InstanceId,type:InstanceType,state:State.Name}' \
-            --output text 2>/dev/null | sed 's/^/      /' || echo "      (none)"
-        local snp_nodes
-        snp_nodes=$(kubectl get nodes -l swarm.io/confidential-node=true \
-            -o custom-columns='NAME:.metadata.name,READY:.status.conditions[-1].type' --no-headers 2>/dev/null)
-        echo "    SNP nodes: ${snp_nodes:-<none registered>}"
-
-        # Auto-clear a stale launch failure once (capacity has usually freed by
-        # the time we get here; the bounce forces the ASG to retry).
-        if echo "${health}" | jq -e '.[]? | select(.code=="AsgInstanceLaunchFailures")' >/dev/null 2>&1; then
-            local msg
-            msg=$(echo "${health}" | jq -r '[.[]? | select(.code=="AsgInstanceLaunchFailures") | .message][0]')
-            echo -e "    ${YELLOW}⚠${NC} AsgInstanceLaunchFailures: ${msg}"
-            if [[ "${status}" == "ACTIVE" ]]; then
-                if (( bounced == 0 )); then
-                    echo "    Auto-bouncing desired 0 -> ${want} to clear the stale failed launch..."
-                    aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-                        --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=0" >/dev/null 2>&1 || true
-                    local e2=0 s2
-                    while (( e2 < 300 )); do
-                        s2=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-                            --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
-                        [[ "${s2}" == "ACTIVE" ]] && break
-                        sleep 15; e2=$((e2 + 15))
-                    done
-                    aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
-                        --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=${want}" >/dev/null 2>&1 || true
-                    bounced=1
-                    echo "    Re-requested desiredSize=${want}."
-                else
-                    echo -e "    ${RED}✗${NC} Launch still failing after a desired bounce — capacity/quota wall."
-                    echo "      Free standard On-Demand vCPUs or raise EC2 quota L-1216C47A"
-                    echo "      (one ${CONFIDENTIAL_NODE_INSTANCE_TYPE} needs 192 vCPU of headroom)."
-                    step_fail "confidential node cannot launch due to EC2 vCPU quota/capacity"
-                fi
-            fi
-        fi
-
-        sleep "${poll}"
-        elapsed=$((elapsed + poll))
-    done
-
-    step_fail "no confidential (SNP) node became Ready within ${timeout}s — check the node group health and EC2 quota"
 }
 
 # True when the saved plan creates or updates an aws_eks_node_group (i.e.
@@ -881,34 +779,16 @@ resolve_podvm_ami() {
     printf '%s' "${ami}"
 }
 
-# Read-only consistency check for the confidential-runtime knobs (uses the
-# already-sourced live values). Prints warnings; never mutates. Echoes nothing
-# fatal — returns the number of problems found so callers can decide.
+# Read-only consistency check for the confidential (Peer Pods / CAA) config
+# (uses the already-sourced live values). Prints warnings; never mutates.
+# Returns the number of problems found so callers can decide.
 validate_confidential_runtime_config() {
-    local runtime="${CONFIDENTIAL_RUNTIME:-snp_local}" problems=0
-    case "${runtime}" in
-        snp_local)
-            echo -e "${GREEN}✓${NC} CONFIDENTIAL_RUNTIME=snp_local (on-node kata-qemu-snp; SEV-SNP metal pool)"
-            ;;
-        peer_pods)
-            echo -e "${GREEN}✓${NC} CONFIDENTIAL_RUNTIME=peer_pods (CAA kata-remote; per-agent pod VM)"
-            if [[ "${ENABLE_CAA:-false}" != "true" ]]; then
-                echo -e "${YELLOW}⚠${NC} ENABLE_CAA is not true — terraform will not create the CAA IAM/SG (run: ./configure.sh --peer-pods)"
-                problems=$((problems + 1))
-            fi
-            if [[ -z "${PODVM_AMI_ID:-}" ]]; then
-                echo -e "${YELLOW}⚠${NC} PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
-                problems=$((problems + 1))
-            fi
-            if [[ "${CONFIDENTIAL_NODE_DESIRED_COUNT:-0}" != "0" ]]; then
-                echo -e "${YELLOW}⚠${NC} CONFIDENTIAL_NODE_DESIRED_COUNT=${CONFIDENTIAL_NODE_DESIRED_COUNT:-?} — metal pool still on; retire it after convergence (./configure.sh --retire-metal)"
-            fi
-            ;;
-        *)
-            echo -e "${YELLOW}⚠${NC} CONFIDENTIAL_RUNTIME='${runtime}' is unrecognized; the scheduler treats it as snp_local"
-            problems=$((problems + 1))
-            ;;
-    esac
+    local problems=0
+    echo -e "${GREEN}✓${NC} Confidential agents run as Peer Pods (CAA kata-remote; per-agent SEV-SNP pod VM)"
+    if [[ -z "${PODVM_AMI_ID:-}" ]]; then
+        echo -e "${YELLOW}⚠${NC} PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
+        problems=$((problems + 1))
+    fi
     return "${problems}"
 }
 
@@ -960,21 +840,13 @@ private_subnet_cidr = "${PRIVATE_SUBNET_CIDR}"
 agent_subnet_cidr   = "${AGENT_SUBNET_CIDR}"
 storage_subnet_cidr = "${STORAGE_SUBNET_CIDR}"
 
-# EKS configuration
+# EKS configuration. Agents run as Peer Pods (off-cluster SEV-SNP pod VMs);
+# there is no on-node confidential pool, and the CAA IAM/SG are always created.
 eks_version         = "${EKS_VERSION}"
 node_instance_type  = "${NODE_INSTANCE_TYPE}"
 node_desired_count  = ${NODE_DESIRED_COUNT}
 node_min_count      = ${NODE_MIN_COUNT}
 node_max_count      = ${NODE_MAX_COUNT}
-
-# Confidential (SEV-SNP bare metal) node group
-confidential_node_instance_type = "${CONFIDENTIAL_NODE_INSTANCE_TYPE}"
-confidential_node_desired_count = ${CONFIDENTIAL_NODE_DESIRED_COUNT}
-confidential_node_min_count     = ${CONFIDENTIAL_NODE_MIN_COUNT}
-confidential_node_max_count     = ${CONFIDENTIAL_NODE_MAX_COUNT}
-
-# Peer Pods / Cloud API Adaptor (no-op until true; metal SNP stays the default)
-enable_caa = ${ENABLE_CAA:-false}
 
 # Feature flags — preserved from previous state
 enable_network = ${existing_network}
@@ -1210,6 +1082,8 @@ apply_platform_manifests() {
     local tmp_dir
     tmp_dir=$(render_k8s_manifests "${image_tag}")
 
+    # Note: the kata-remote RuntimeClass is created by the Cloud API Adaptor
+    # Helm chart (./03-coco-operator.sh), not by a manifest here.
     local manifests=(
         "00-namespaces.yaml"
         "01-storage-class.yaml"
@@ -1220,18 +1094,11 @@ apply_platform_manifests() {
         "06-control.yaml"
         "07-scheduler.yaml"
         "08-network-policies.yaml"
-        "09-runtime-class.yaml"
-        "10-coco-ccruntime.yaml"
         "11-trustee.yaml"
     )
 
     local manifest
     for manifest in "${manifests[@]}"; do
-        if [[ "${manifest}" == "10-coco-ccruntime.yaml" ]] && \
-           ! kubectl get crd ccruntimes.confidentialcontainers.org >/dev/null 2>&1; then
-            echo -e "${YELLOW}⚠${NC} Skipping ${manifest} (CoCo operator not installed — run ./03-coco-operator.sh)"
-            continue
-        fi
         echo "Applying ${manifest}..."
         kubectl apply -f "${tmp_dir}/${manifest}" >/dev/null
     done

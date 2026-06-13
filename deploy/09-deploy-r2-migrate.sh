@@ -125,11 +125,11 @@ echo "Monitoring the rolling recreation (timeout ${TIMEOUT}s)..."
 LEGACY_LEFT="${PRE_LEGACY}"
 while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     LEGACY_LEFT=$(count_pods_on_runtime_class "kata-fc")
-    SNP_NOW=$(count_pods_on_runtime_class "kata-qemu-snp")
+    SNP_NOW=$(count_pods_on_runtime_class "kata-remote")
     if [[ "${LEGACY_LEFT}" == "0" ]]; then
         break
     fi
-    echo "  [${ELAPSED}s] pods remaining on kata-fc: ${LEGACY_LEFT}  (on kata-qemu-snp: ${SNP_NOW})"
+    echo "  [${ELAPSED}s] pods remaining on kata-fc: ${LEGACY_LEFT}  (on kata-remote: ${SNP_NOW})"
     sleep "${POLL}"
     ELAPSED=$((ELAPSED + POLL))
 done

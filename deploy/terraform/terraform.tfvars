@@ -2,9 +2,9 @@
 # Environment: dev
 # Generated: 2026-06-13T16:35:08Z
 
-aws_region          = "us-east-2"
-project_name        = "aura-swarm"
-environment         = "dev"
+aws_region   = "us-east-2"
+project_name = "aura-swarm"
+environment  = "dev"
 
 # Network configuration
 vpc_cidr            = "10.0.0.0/16"
@@ -13,21 +13,13 @@ private_subnet_cidr = "10.0.2.0/24"
 agent_subnet_cidr   = "10.0.3.0/24"
 storage_subnet_cidr = "10.0.4.0/24"
 
-# EKS configuration
-eks_version         = "1.31"
-node_instance_type  = "m5.2xlarge"
-node_desired_count  = 3
-node_min_count      = 1
-node_max_count      = 5
-
-# Confidential (SEV-SNP bare metal) node group
-confidential_node_instance_type = "m6a.metal"
-confidential_node_desired_count = 1
-confidential_node_min_count     = 0
-confidential_node_max_count     = 3
-
-# Peer Pods / Cloud API Adaptor (no-op until true; metal SNP stays the default)
-enable_caa = true
+# EKS configuration. Agents run as Peer Pods (off-cluster SEV-SNP pod VMs);
+# there is no on-node confidential pool, and the CAA IAM/SG are always created.
+eks_version        = "1.31"
+node_instance_type = "m5.2xlarge"
+node_desired_count = 3
+node_min_count     = 1
+node_max_count     = 5
 
 # Feature flags — preserved from previous state
 enable_network = true

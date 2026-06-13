@@ -106,29 +106,6 @@ pub struct ActiveAgentInfo {
     pub spec: aura_swarm_store::AgentSpec,
 }
 
-/// Backend used to realize a confidential (`ConfidentialVM`) agent pod.
-///
-/// Selects *how* a confidential pod runs, independent of the agent's
-/// [`IsolationLevel`]:
-///
-/// - [`SnpLocal`](ConfidentialRuntime::SnpLocal): on-node `kata-qemu-snp`.
-///   The pod boots its SEV-SNP guest on a tainted bare-metal worker, so it
-///   carries the `swarm.io/confidential-node` node selector + toleration.
-///   The current default; byte-identical to the pre-Peer-Pods behavior.
-/// - [`PeerPods`](ConfidentialRuntime::PeerPods): CAA `kata-remote`. The
-///   workload runs in an off-cluster AWS-managed SEV-SNP pod VM; the shim
-///   runs on an ordinary worker, so the SNP node selector/toleration are
-///   dropped. Attestation still happens via the in-guest CDH.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfidentialRuntime {
-    /// On-node `kata-qemu-snp` on the SEV-SNP bare-metal pool (default).
-    #[default]
-    SnpLocal,
-    /// CAA `kata-remote` per-agent AWS-managed SEV-SNP pod VM.
-    PeerPods,
-}
-
 /// Configuration for the Kubernetes scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
@@ -170,32 +147,10 @@ pub struct SchedulerConfig {
     /// receive this variable.
     #[serde(default = "default_kbs_url")]
     pub kbs_url: String,
-    /// Backend used to realize confidential (`ConfidentialVM`) agent pods.
-    /// `SnpLocal` (default) keeps on-node `kata-qemu-snp`; `PeerPods`
-    /// switches confidential pods to the CAA `kata-remote` runtime and
-    /// drops the SNP node selector/toleration. Selected via
-    /// `CONFIDENTIAL_RUNTIME`.
-    #[serde(default)]
-    pub confidential_runtime: ConfidentialRuntime,
-    /// Effective `runtimeClassName` for confidential pods. Defaults to
-    /// `kata-qemu-snp` (derived from `IsolationLevel::ConfidentialVM`) in
-    /// `SnpLocal` mode and `kata-remote` in `PeerPods` mode; an explicit
-    /// `CONFIDENTIAL_RUNTIME_CLASS` overrides both.
-    #[serde(default = "default_confidential_runtime_class")]
-    pub confidential_runtime_class: String,
 }
 
 fn default_kbs_url() -> String {
     "http://kbs.swarm-system.svc.cluster.local:8080".to_string()
-}
-
-/// Default confidential `runtimeClassName`: the on-node SNP class, sourced
-/// from [`IsolationLevel::ConfidentialVM`] so the two stay in lockstep.
-fn default_confidential_runtime_class() -> String {
-    IsolationLevel::ConfidentialVM
-        .runtime_class()
-        .unwrap_or("kata-qemu-snp")
-        .to_string()
 }
 
 impl Default for SchedulerConfig {
@@ -217,8 +172,6 @@ impl Default for SchedulerConfig {
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
             kbs_url: default_kbs_url(),
-            confidential_runtime: ConfidentialRuntime::SnpLocal,
-            confidential_runtime_class: default_confidential_runtime_class(),
         }
     }
 }
@@ -254,12 +207,6 @@ impl SchedulerConfig {
     /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
     /// - `KBS_URL`: Trustee KBS URL injected into confidential agent pods
     ///   as `AURA_KBS_URL`
-    /// - `CONFIDENTIAL_RUNTIME`: confidential backend, `snp_local`
-    ///   (default) or `peer_pods` (case-insensitive; anything else falls
-    ///   back to `snp_local`)
-    /// - `CONFIDENTIAL_RUNTIME_CLASS`: explicit override of the
-    ///   confidential `runtimeClassName`; when set and non-empty it wins
-    ///   over the mode-derived default
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -330,30 +277,6 @@ impl SchedulerConfig {
             config.kbs_url = val;
         }
 
-        // Confidential runtime backend. Be lenient: an unset, empty, or
-        // unrecognized value falls back to `snp_local` (the safe, no-churn
-        // default) rather than failing the scheduler.
-        config.confidential_runtime = match std::env::var("CONFIDENTIAL_RUNTIME") {
-            // Only `peer_pods` opts into the remote backend; `snp_local`,
-            // unset, empty, and anything unrecognized all map to the safe
-            // on-node default.
-            Ok(val) if val.trim().eq_ignore_ascii_case("peer_pods") => {
-                ConfidentialRuntime::PeerPods
-            }
-            _ => ConfidentialRuntime::SnpLocal,
-        };
-
-        // Effective runtime class: an explicit non-empty override wins;
-        // otherwise derive it from the selected mode.
-        config.confidential_runtime_class =
-            match std::env::var("CONFIDENTIAL_RUNTIME_CLASS") {
-                Ok(val) if !val.trim().is_empty() => val,
-                _ => match config.confidential_runtime {
-                    ConfidentialRuntime::SnpLocal => default_confidential_runtime_class(),
-                    ConfidentialRuntime::PeerPods => "kata-remote".to_string(),
-                },
-            };
-
         config
     }
 
@@ -411,9 +334,11 @@ mod tests {
         let config = SchedulerConfig::default();
         assert_eq!(config.namespace, "swarm-agents");
         assert_eq!(config.default_isolation, IsolationLevel::ConfidentialVM);
+        // Confidential agents always run as Peer Pods (CAA kata-remote);
+        // there is no other confidential runtime.
         assert_eq!(
             config.default_isolation.runtime_class(),
-            Some("kata-qemu-snp")
+            Some("kata-remote")
         );
         assert_eq!(config.default_cpu_millicores, 500);
         assert_eq!(config.default_memory_mb, 512);
@@ -421,53 +346,6 @@ mod tests {
             config.kbs_url,
             "http://kbs.swarm-system.svc.cluster.local:8080"
         );
-        // Default confidential backend is on-node SNP (no fleet churn on
-        // deploy); the effective class mirrors `IsolationLevel`.
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::SnpLocal);
-        assert_eq!(config.confidential_runtime_class, "kata-qemu-snp");
-    }
-
-    // Confidential-runtime env parsing. Mutating process-global env is not
-    // parallel-safe, so all cases live in one serialized test that
-    // set/asserts/removes the vars itself. No other test in this crate
-    // touches `CONFIDENTIAL_RUNTIME*`.
-    #[test]
-    fn from_env_confidential_runtime_modes() {
-        std::env::remove_var("CONFIDENTIAL_RUNTIME");
-        std::env::remove_var("CONFIDENTIAL_RUNTIME_CLASS");
-
-        // Unset -> snp_local / kata-qemu-snp (unchanged behavior).
-        let config = SchedulerConfig::from_env();
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::SnpLocal);
-        assert_eq!(config.confidential_runtime_class, "kata-qemu-snp");
-
-        // peer_pods -> kata-remote.
-        std::env::set_var("CONFIDENTIAL_RUNTIME", "peer_pods");
-        let config = SchedulerConfig::from_env();
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::PeerPods);
-        assert_eq!(config.confidential_runtime_class, "kata-remote");
-
-        // Case-insensitive.
-        std::env::set_var("CONFIDENTIAL_RUNTIME", "PEER_PODS");
-        let config = SchedulerConfig::from_env();
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::PeerPods);
-        assert_eq!(config.confidential_runtime_class, "kata-remote");
-
-        // Unrecognized -> snp_local fallback.
-        std::env::set_var("CONFIDENTIAL_RUNTIME", "bogus");
-        let config = SchedulerConfig::from_env();
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::SnpLocal);
-        assert_eq!(config.confidential_runtime_class, "kata-qemu-snp");
-
-        // Explicit class override wins over the mode-derived default.
-        std::env::set_var("CONFIDENTIAL_RUNTIME", "peer_pods");
-        std::env::set_var("CONFIDENTIAL_RUNTIME_CLASS", "foo");
-        let config = SchedulerConfig::from_env();
-        assert_eq!(config.confidential_runtime, ConfidentialRuntime::PeerPods);
-        assert_eq!(config.confidential_runtime_class, "foo");
-
-        std::env::remove_var("CONFIDENTIAL_RUNTIME");
-        std::env::remove_var("CONFIDENTIAL_RUNTIME_CLASS");
     }
 
     #[test]

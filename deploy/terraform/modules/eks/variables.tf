@@ -58,46 +58,6 @@ variable "node_disk_size" {
   default     = 100
 }
 
-variable "confidential_node_instance_type" {
-  description = "EC2 instance type for confidential (SEV-SNP) worker nodes - must be AMD bare metal"
-  type        = string
-  default     = "m6a.metal"
-}
-
-variable "confidential_node_desired_count" {
-  description = "Desired number of confidential worker nodes"
-  type        = number
-  default     = 1
-}
-
-variable "confidential_node_min_count" {
-  description = "Minimum number of confidential worker nodes (0 allows scale-to-zero)"
-  type        = number
-  default     = 0
-}
-
-variable "confidential_node_max_count" {
-  description = "Maximum number of confidential worker nodes"
-  type        = number
-  default     = 3
-}
-
-variable "confidential_node_disk_size" {
-  description = "Disk size in GB for confidential worker nodes (guest images + kata artifacts)"
-  type        = number
-  default     = 200
-}
-
-#------------------------------------------------------------------------------
-# Peer Pods / Cloud API Adaptor (CAA)
-#------------------------------------------------------------------------------
-
-variable "enable_caa" {
-  description = "Enable Peer Pods / Cloud API Adaptor IAM + security-group resources (CAA IRSA role, pod-VM EC2 permissions, worker <-> pod-VM ingress). Default false keeps the metal SNP path the no-op fallback."
-  type        = bool
-  default     = false
-}
-
 variable "tags" {
   description = "Common tags for all resources"
   type        = map(string)

@@ -8,27 +8,22 @@ use aura_swarm_store::{AgentSpec, IsolationLevel};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
-    ResourceRequirements, SecretKeySelector, SecurityContext, Toleration, Volume, VolumeMount,
+    ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
-use crate::types::ConfidentialRuntime;
 use crate::SchedulerConfig;
 
 /// The container port for the Aura runtime HTTP server.
 const AURA_PORT: i32 = 8080;
 
-/// Node label and taint key for the SEV-SNP bare-metal node group.
-/// Confidential pods select these nodes and tolerate the matching taint.
-const CONFIDENTIAL_NODE_KEY: &str = "swarm.io/confidential-node";
-
 /// Build a Kubernetes pod spec for an agent.
 ///
 /// This creates a complete pod specification including:
-/// - `kata-qemu-snp` runtime class for confidential VM isolation
+/// - `kata-remote` runtime class for confidential VM isolation (Peer Pods)
 /// - Resource requests and limits
 /// - Environment variables for agent configuration
 /// - Volume mounts for persistent state
@@ -146,35 +141,12 @@ fn build_pod_spec(
 ) -> PodSpec {
     // Use agent's isolation level if specified, otherwise use scheduler default
     let isolation = spec.isolation.unwrap_or(config.default_isolation);
-    let confidential = isolation == IsolationLevel::ConfidentialVM;
-    // Confidential pods get the configured confidential runtime class
-    // (`kata-qemu-snp` for snp_local, `kata-remote` for peer_pods, or an
-    // explicit override). Container (dev-mode) pods get the default runtime.
-    let runtime_class_name =
-        confidential.then(|| config.confidential_runtime_class.clone());
-
-    // SNP scheduling constraints (node selector + toleration) only apply to
-    // on-node `snp_local` confidential pods, which must land on the tainted
-    // SEV-SNP metal pool. In `peer_pods` mode the workload runs off-cluster
-    // in an AWS pod VM and the shim runs on an ordinary worker, so the pod
-    // must carry neither (there is no metal pool to land on). Container
-    // (dev-mode) pods never get them.
-    let attach_snp_scheduling =
-        confidential && config.confidential_runtime == ConfidentialRuntime::SnpLocal;
-    let node_selector = attach_snp_scheduling.then(|| {
-        let mut selector = BTreeMap::new();
-        selector.insert(CONFIDENTIAL_NODE_KEY.to_string(), "true".to_string());
-        selector
-    });
-    let tolerations = attach_snp_scheduling.then(|| {
-        vec![Toleration {
-            key: Some(CONFIDENTIAL_NODE_KEY.to_string()),
-            operator: Some("Equal".to_string()),
-            value: Some("true".to_string()),
-            effect: Some("NoSchedule".to_string()),
-            ..Default::default()
-        }]
-    });
+    // Confidential pods run as Peer Pods (CAA `kata-remote`): the per-agent
+    // SEV-SNP pod VM is launched off-cluster, the kata shim runs on an
+    // ordinary worker, and attestation happens via the in-guest CDH. The pod
+    // carries no node selector/toleration (there is no on-node metal pool).
+    // Container (dev-mode) pods get the default runtime.
+    let runtime_class_name = isolation.runtime_class().map(str::to_string);
 
     PodSpec {
         runtime_class_name,
@@ -187,8 +159,6 @@ fn build_pod_spec(
             &config.image,
             isolation,
         )],
-        node_selector,
-        tolerations,
         volumes: Some(vec![build_state_volume(config)]),
         restart_policy: Some("Always".to_string()),
         termination_grace_period_seconds: Some(30),
@@ -592,7 +562,7 @@ mod tests {
         let pod_spec = pod.spec.as_ref().unwrap();
         assert_eq!(
             pod_spec.runtime_class_name.as_deref(),
-            Some("kata-qemu-snp")
+            Some("kata-remote")
         );
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Always"));
         assert_eq!(pod_spec.termination_grace_period_seconds, Some(30));
@@ -664,7 +634,7 @@ mod tests {
 
         assert_eq!(
             pod_spec.runtime_class_name.as_deref(),
-            Some("kata-qemu-snp")
+            Some("kata-remote")
         );
     }
 
@@ -732,7 +702,7 @@ mod tests {
     // dual-mode window — is fulfilled).
 
     #[test]
-    fn confidential_pod_gets_snp_wiring() {
+    fn confidential_pod_uses_kata_remote_without_node_scheduling() {
         let agent_id = test_agent_id();
         let key_id = format!("swarm/agents/{agent_id}/state-key");
         let spec = AgentSpec {
@@ -750,27 +720,20 @@ mod tests {
         let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
-        // Runtime class
-        assert_eq!(
-            pod_spec.runtime_class_name.as_deref(),
-            Some("kata-qemu-snp")
-        );
+        // Confidential pods always run as Peer Pods (CAA kata-remote).
+        assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-remote"));
 
-        // SNP node selector
-        let selector = pod_spec.node_selector.as_ref().unwrap();
-        assert_eq!(
-            selector.get("swarm.io/confidential-node"),
-            Some(&"true".to_string())
+        // No node selector / toleration: the per-agent SEV-SNP pod VM runs
+        // off-cluster and the kata shim lands on an ordinary worker (there is
+        // no on-node metal pool to target).
+        assert!(
+            pod_spec.node_selector.is_none(),
+            "confidential pods must not carry an on-node SNP node selector"
         );
-
-        // Matching toleration
-        let tolerations = pod_spec.tolerations.as_ref().unwrap();
-        assert_eq!(tolerations.len(), 1);
-        let tol = &tolerations[0];
-        assert_eq!(tol.key.as_deref(), Some("swarm.io/confidential-node"));
-        assert_eq!(tol.operator.as_deref(), Some("Equal"));
-        assert_eq!(tol.value.as_deref(), Some("true"));
-        assert_eq!(tol.effect.as_deref(), Some("NoSchedule"));
+        assert!(
+            pod_spec.tolerations.is_none(),
+            "confidential pods must not carry an on-node SNP toleration"
+        );
 
         // Confidential env vars, appended after the base set
         let env = pod_spec.containers[0].env.as_ref().unwrap();
@@ -796,17 +759,8 @@ mod tests {
         assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
     }
 
-    /// A scheduler config in `peer_pods` mode (CAA `kata-remote`).
-    fn peer_pods_config() -> SchedulerConfig {
-        SchedulerConfig {
-            confidential_runtime: ConfidentialRuntime::PeerPods,
-            confidential_runtime_class: "kata-remote".to_string(),
-            ..SchedulerConfig::default()
-        }
-    }
-
     #[test]
-    fn peer_pods_confidential_pod_uses_kata_remote_without_snp_scheduling() {
+    fn confidential_pod_preserves_root_in_guest_and_kbs_env() {
         let agent_id = test_agent_id();
         let key_id = format!("swarm/agents/{agent_id}/state-key");
         let spec = AgentSpec {
@@ -816,24 +770,12 @@ mod tests {
             },
             ..test_spec(&agent_id)
         };
-        let config = peer_pods_config();
+        let config = SchedulerConfig::default();
 
         let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
         let pod_spec = pod.spec.as_ref().unwrap();
 
-        // Runtime class is the CAA remote class, not on-node SNP.
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-remote"));
-
-        // The SNP node selector + toleration must be dropped: a peer pod
-        // runs off-cluster, the shim lands on an ordinary worker.
-        assert!(
-            pod_spec.node_selector.is_none(),
-            "peer-pod confidential pods must not carry the SNP node selector"
-        );
-        assert!(
-            pod_spec.tolerations.is_none(),
-            "peer-pod confidential pods must not carry the SNP toleration"
-        );
 
         // Root-in-guest security context is preserved (the guest is still
         // the boundary, only the VM's location moves).

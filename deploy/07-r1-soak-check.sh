@@ -5,9 +5,9 @@
 #
 # Checks (printed as a pass/fail checklist at the end):
 #   platform-health   deployments ready + /internal/health ok
-#   fleet-read-only   tiered agents on kata-qemu-snp, legacy agents on
+#   fleet-read-only   tiered agents on kata-remote, legacy agents on
 #                     kata-fc, no error-state regressions
-#   test-agent        new agent lands on SNP with sealed env
+#   test-agent        new agent lands on kata-remote with sealed env
 #   vault             PUT / GET(reveal) / LIST / DELETE secrets round-trip
 #   tier-change       standard -> pro -> standard with pod recreate
 #   cron-cycle        process registration + hibernate -> cron/wake -> run
@@ -128,7 +128,7 @@ snapshot_agent_pods "${PODS_JSON}"
 TIERED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier != null)] | length')
 LEGACY=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier == null)] | length')
 ERRORED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.status == "error")] | length')
-BAD_PODS=$(jq '[.[] | select(.runtime_class != "kata-qemu-snp" and .runtime_class != "kata-fc")] | length' "${PODS_JSON}")
+BAD_PODS=$(jq '[.[] | select(.runtime_class != "kata-remote" and .runtime_class != "kata-fc")] | length' "${PODS_JSON}")
 echo "  Agents: ${TIERED} tiered (TEE), ${LEGACY} legacy, ${ERRORED} in error"
 jq -r 'group_by(.runtime_class) | .[] | "  pods on \(.[0].runtime_class): \(length)"' "${PODS_JSON}"
 rm -f "${PODS_JSON}"
@@ -156,8 +156,8 @@ elif wait_test_agent_running 600; then
     RC=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o jsonpath='{.spec.runtimeClassName}')
     SEALED=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o json \
         | jq -r '[.spec.containers[0].env[]? | select(.name=="AURA_STATE_ENCRYPTION") | .value] | first // ""')
-    if [[ "${RC}" == "kata-qemu-snp" && "${SEALED}" == "sealed" ]]; then
-        record "test-agent" PASS "agent ${TEST_AGENT_ID} on SNP, sealed"
+    if [[ "${RC}" == "kata-remote" && "${SEALED}" == "sealed" ]]; then
+        record "test-agent" PASS "agent ${TEST_AGENT_ID} on kata-remote, sealed"
     else
         record "test-agent" FAIL "runtime_class=${RC} sealed=${SEALED}"
     fi

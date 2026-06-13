@@ -161,8 +161,9 @@ locals {
 
   # Worker <-> pod-VM ingress required by CAA: agent-protocol-forwarder (15150)
   # and vxlan (9000 tcp+udp). Ports are fixed by the CAA wire protocol and match
-  # CAA_FORWARDER_PORT / CAA_VXLAN_PORT in config.env (consumed by the Phase 4
-  # Helm install). Only materialized when enable_caa=true.
+  # CAA_FORWARDER_PORT / CAA_VXLAN_PORT in config.env (consumed by the
+  # 03-coco-operator CAA Helm install). Peer Pods is the only confidential
+  # runtime, so these are always created.
   caa_ingress_rules = [
     {
       description = "Peer Pods agent-protocol-forwarder (worker to/from pod VM)"
@@ -222,11 +223,9 @@ resource "aws_security_group" "node" {
   }
 
   # Peer Pods / CAA: worker <-> pod-VM traffic (agent-protocol-forwarder + vxlan),
-  # scoped to the VPC CIDR (pod VMs launch into the agent subnets). The iterator
-  # is empty when enable_caa=false, so this SG stays byte-identical to the
-  # metal-SNP baseline until Peer Pods is opted into.
+  # scoped to the VPC CIDR (pod VMs launch into the agent subnets).
   dynamic "ingress" {
-    for_each = var.enable_caa ? local.caa_ingress_rules : []
+    for_each = local.caa_ingress_rules
     content {
       description = ingress.value.description
       from_port   = ingress.value.from_port
@@ -266,11 +265,11 @@ resource "aws_security_group_rule" "cluster_to_nodes" {
 # Hosts the platform system components (gateway, scheduler, CoreDNS, EFS
 # CSI, CoCo operator controller, Trustee): it is the only untainted pool.
 #
-# R3 cleanup: this group used to double as the kata-fc microVM agent pool
-# (labeled katacontainers.io/kata-runtime=true). The kata-fc runtime was
-# retired with the legacy agents — all agent pods now run on the tainted
-# confidential (SEV-SNP) pool below — so the kata label is gone and the
-# group is sized for system workloads only.
+# Hosts the platform system components AND the agent pods. Agents run as Peer
+# Pods (kata-remote): the kata shim + agent-protocol-forwarder run here on the
+# ordinary worker while the per-agent SEV-SNP workload runs off-cluster in an
+# AWS-managed pod VM. There is no on-node confidential pool. Size this pool for
+# system components plus per-agent shim overhead.
 #------------------------------------------------------------------------------
 
 resource "aws_eks_node_group" "main" {
@@ -310,80 +309,16 @@ resource "aws_eks_node_group" "main" {
 }
 
 #------------------------------------------------------------------------------
-# EKS Managed Node Group - Confidential (SEV-SNP bare metal)
-#
-# Bare-metal AMD nodes for Confidential Containers (kata-qemu-snp).
-# Labeled swarm.io/confidential-node=true (matched by the scheduler's node
-# selector and the kata-qemu-snp RuntimeClass) and tainted NO_SCHEDULE so
-# only confidential agent pods (which carry the matching toleration) and
-# the CoCo operator daemonsets land here.
-#
-# This is the metal SNP fallback path and stays the default. In peer_pods mode
-# the operator scales it to zero (CONFIDENTIAL_NODE_DESIRED_COUNT=0 /
-# CONFIDENTIAL_NODE_MIN_COUNT=0): confidential_node_min_count already permits 0,
-# so the group is cleanly zeroable without deleting the resource (kept so we can
-# revert to on-node kata-qemu-snp by flipping the counts back).
-#------------------------------------------------------------------------------
-
-resource "aws_eks_node_group" "confidential" {
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${var.resource_prefix}-confidential-node-group"
-  node_role_arn   = aws_iam_role.node_group.arn
-  subnet_ids      = var.agent_subnet_ids
-
-  instance_types = [var.confidential_node_instance_type]
-  capacity_type  = "ON_DEMAND"
-
-  disk_size = var.confidential_node_disk_size
-
-  scaling_config {
-    desired_size = var.confidential_node_desired_count
-    min_size     = var.confidential_node_min_count
-    max_size     = var.confidential_node_max_count
-  }
-
-  update_config {
-    max_unavailable = 1
-  }
-
-  labels = {
-    role = "agent"
-    # Matched by the scheduler node selector and kata-qemu-snp RuntimeClass
-    "swarm.io/confidential-node" = "true"
-  }
-
-  # Keep general workloads off the bare-metal pool; confidential agent pods
-  # and the CoCo operator daemonsets tolerate this taint.
-  taint {
-    key    = "swarm.io/confidential-node"
-    value  = "true"
-    effect = "NO_SCHEDULE"
-  }
-
-  tags = merge(var.tags, {
-    Name = "${var.resource_prefix}-confidential-node-group"
-  })
-
-  depends_on = [
-    aws_iam_role_policy_attachment.node_worker_policy,
-    aws_iam_role_policy_attachment.node_cni_policy,
-    aws_iam_role_policy_attachment.node_ecr_read,
-  ]
-}
-
-#------------------------------------------------------------------------------
 # Peer Pods / Cloud API Adaptor (CAA) IAM (IRSA)
 #
 # Dedicated IRSA role bound to the CAA service account
 # (cloud-api-adaptor / confidential-containers-system) via the cluster OIDC
 # provider. Grants CAA permission to create/terminate the per-agent AWS-managed
-# SEV-SNP "pod VM" EC2 instances. Gated by enable_caa (default false) so this is
-# a pure no-op until Peer Pods is opted into; the metal SNP path is unaffected.
+# SEV-SNP "pod VM" EC2 instances. Peer Pods is the only confidential runtime,
+# so this is always created.
 #------------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "caa_assume_role" {
-  count = var.enable_caa ? 1 : 0
-
   statement {
     effect  = "Allow"
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -408,17 +343,13 @@ data "aws_iam_policy_document" "caa_assume_role" {
 }
 
 resource "aws_iam_role" "caa" {
-  count = var.enable_caa ? 1 : 0
-
   name               = "${var.resource_prefix}-caa-role"
-  assume_role_policy = data.aws_iam_policy_document.caa_assume_role[0].json
+  assume_role_policy = data.aws_iam_policy_document.caa_assume_role.json
 
   tags = var.tags
 }
 
 data "aws_iam_policy_document" "caa" {
-  count = var.enable_caa ? 1 : 0
-
   # Per-pod VM lifecycle + discovery. RunInstances/TerminateInstances act on
   # ephemeral pod VMs whose ids are not known ahead of time, so resource is "*"
   # (CAA tags every pod VM; the smoke test asserts create + terminate).
@@ -451,11 +382,9 @@ data "aws_iam_policy_document" "caa" {
 }
 
 resource "aws_iam_role_policy" "caa" {
-  count = var.enable_caa ? 1 : 0
-
   name   = "${var.resource_prefix}-caa-policy"
-  role   = aws_iam_role.caa[0].id
-  policy = data.aws_iam_policy_document.caa[0].json
+  role   = aws_iam_role.caa.id
+  policy = data.aws_iam_policy_document.caa.json
 }
 
 #------------------------------------------------------------------------------

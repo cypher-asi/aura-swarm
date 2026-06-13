@@ -1,19 +1,19 @@
-# Plan: Confidential agents via Peer Pods / Cloud API Adaptor (`kata-remote`)
+# Confidential agents via Peer Pods / Cloud API Adaptor (`kata-remote`)
 
-Status: **proposed** · Owner: deploy · Architecture: replace on-node
-`kata-qemu-snp` (CoCo on `m6a.metal`) with **Peer Pods / Cloud API Adaptor
-(CAA)** using the `kata-remote` RuntimeClass on ordinary EKS workers.
+Status: **implemented (sole confidential runtime)** · Owner: deploy ·
+Architecture: confidential agents run as **Peer Pods / Cloud API Adaptor (CAA)**
+— a per-agent AWS-managed SEV-SNP "pod VM" launched off-cluster — using the
+`kata-remote` RuntimeClass on ordinary EKS workers.
 
-> **Direction.** This is the **chosen** path forward; [SNP-AMI-PLAN.md](./SNP-AMI-PLAN.md)
-> (build a custom SNP-host AMI and keep `kata-qemu-snp` on metal) becomes the
-> **fallback**. Be honest about the trade: Peer Pods is the larger migration —
-> it changes the scheduler runtime path, the node topology, the IAM/network
-> surface, and (the biggest unknown) how per-agent sealed EFS state reaches an
-> off-cluster pod VM — whereas the AMI swap is gated behind a single config
-> value and is byte-identical to today until set. We pick Peer Pods because it
-> moves the SNP-host burden to AWS (no kernel/KVM/OVMF ownership), turns
-> confidential compute into a **per-active-agent** cost instead of a fixed
-> ~$6.1k/mo metal node, and scales elastically per pod.
+> **Direction.** Peer Pods is the **only** confidential path. The on-node
+> `kata-qemu-snp` / SEV-SNP metal alternative (and the old `CONFIDENTIAL_RUNTIME`
+> switch, `snp_local` mode, confidential metal node group, and the SNP-host AMI
+> plan) have been **removed** to streamline the codebase. Confidential agents
+> derive `kata-remote` directly from `IsolationLevel::ConfidentialVM`; there is
+> no runtime toggle. This moves the SNP-host burden to AWS (no kernel/KVM/OVMF
+> ownership), makes confidential compute a **per-active-agent** cost, and scales
+> elastically per pod. Sections below that still describe the switchable
+> migration are **historical** — kept for the cost/attestation/EFS analysis.
 
 ---
 
@@ -27,7 +27,7 @@ failed to create shim task: This system doesn't support Confidential Computing (
 
 ### Root cause (premise — verified)
 
-`kata-qemu-snp` runs the confidential VM on the worker node, so the node's own hypervisor must launch AMD SEV-SNP guests. A **stock** `m6a.metal` EKS node cannot: the AL2023 AMI has no SNP-host kernel (needs Linux 6.11+), AWS Nitro needs a CCP-deferral workaround, and AWS's *managed* SEV-SNP is **guest-only** (per-pod), not a host capability. Fixing it on-node is exactly what [SNP-AMI-PLAN.md](./SNP-AMI-PLAN.md) does (custom Ubuntu AMI + patched KVM/OVMF). It works, but we own a host kernel forever.
+`kata-qemu-snp` runs the confidential VM on the worker node, so the node's own hypervisor must launch AMD SEV-SNP guests. A **stock** `m6a.metal` EKS node cannot: the AL2023 AMI has no SNP-host kernel (needs Linux 6.11+), AWS Nitro needs a CCP-deferral workaround, and AWS's *managed* SEV-SNP is **guest-only** (per-pod), not a host capability. Fixing it on-node would mean owning a custom SNP-host AMI (Ubuntu + patched KVM/OVMF) and a host kernel forever — which is why we chose Peer Pods instead and removed the on-node path.
 
 ### Today's shape (verified, the baseline this plan changes)
 
@@ -68,7 +68,7 @@ a code rollback.
 | Option                                                   | SNP host owned by | Confidential   | Cost model            | Notes                                                                         |
 | -------------------------------------------------------- | ----------------- | -------------- | --------------------- | ----------------------------------------------------------------------------- |
 | **3. Peer Pods / CAA (this plan)**                       | **AWS**           | ✅ (per-pod VM) | per-active-agent      | Larger runtime rework; biggest unknown is EFS/sealed-state in the pod VM (§6) |
-| 1. SNP-host AMI on metal ([fallback](./SNP-AMI-PLAN.md)) | us                | ✅ (on node)    | fixed ~$6.1k/mo/metal | Smallest code change; ongoing AMI/kernel ownership                            |
+| 1. SNP-host AMI on metal (rejected, removed)             | us                | ✅ (on node)    | fixed ~$6.1k/mo/metal | Smallest code change; ongoing AMI/kernel ownership                            |
 | 2. `kata-qemu` on stock metal                            | —                 | ❌              | fixed                 | VM isolation only, no TEE/attestation — fails the v0.2.0 threat model         |
 | 4. Hard cutover (no fallback switch)                     | AWS               | ✅              | per-active-agent      | Less config surface, but no quick revert if CAA/EFS blocks us                 |
 

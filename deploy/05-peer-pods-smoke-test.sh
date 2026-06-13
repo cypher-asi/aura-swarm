@@ -2,8 +2,8 @@
 # 05-peer-pods-smoke-test.sh - End-to-end attestation proof for the Peer Pods
 # (Cloud API Adaptor / kata-remote) runtime BEFORE any product traffic.
 #
-# Unlike the on-node 05-snp-smoke-test.sh, the confidential VM here is an
-# off-cluster AWS-managed SEV-SNP "pod VM" that CAA launches per pod. The pod's
+# The confidential VM here is an off-cluster AWS-managed SEV-SNP "pod VM" that
+# CAA launches per pod. The pod's
 # kata shim + agent-protocol-forwarder run on an ordinary worker; the workload,
 # guest kernel and CDH run inside the pod VM.
 #

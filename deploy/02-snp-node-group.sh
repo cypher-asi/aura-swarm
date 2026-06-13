@@ -1,20 +1,19 @@
 #!/bin/bash
-# 02-snp-node-group.sh - Terraform plan/apply for the SNP bare-metal node
-# group (and any related infra drift), with the EFS-encryption replacement
-# hazard guarded explicitly.
+# 02-snp-node-group.sh - Terraform plan/apply for the worker node group + Peer
+# Pods / CAA infra (IAM/SG), with the EFS-encryption replacement hazard guarded
+# explicitly.
+#
+# Confidential agents run as Peer Pods (per-agent AWS-managed SEV-SNP pod VMs
+# launched off-cluster by CAA), so there is NO on-node SEV-SNP metal pool: the
+# ordinary workers host the kata-remote shim + agent-protocol-forwarder, and
+# terraform provisions the CAA IRSA role + worker<->pod-VM security-group rules.
 #
 # CRITICAL GUARD: the storage module now hardcodes encrypted=true on the EFS
 # filesystem. If the live filesystem is UNENCRYPTED, terraform will plan a
 # REPLACEMENT (delete + create) — destroying all agent state. This script
 # detects that and ABORTS, pointing at ./02b-efs-encryption-migration.sh.
 #
-# Verifies (CONFIDENTIAL_RUNTIME=snp_local, default): SNP nodes joined, labeled
-# swarm.io/confidential-node=true, tainted.
-# Verifies (CONFIDENTIAL_RUNTIME=peer_pods): NO confidential metal pool present
-# (or scaled to 0) and ordinary workers Ready — peer_pods runs confidential
-# workloads in per-agent AWS-managed pod VMs, so no SEV-SNP metal node is needed.
-# The EFS-replacement hazard guard and eks:DescribeUpdate fallback run in BOTH
-# modes (they protect the shared filesystem / let the apply converge).
+# Verifies: ordinary workers Ready and the CAA IAM/SG infra is applied.
 #
 # Usage: ./02-snp-node-group.sh
 
@@ -24,11 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "02" "SNP node group (terraform)"
-
-# snp_local = on-node kata-qemu-snp metal pool (default/fallback);
-# peer_pods = CAA kata-remote, confidential workloads run in AWS pod VMs (no metal pool).
-CONFIDENTIAL_RUNTIME="${CONFIDENTIAL_RUNTIME:-snp_local}"
+step_banner "02" "Workers + Peer Pods/CAA infra (terraform)"
 
 require_cmds aws terraform kubectl jq
 require_aws_auth
@@ -102,78 +97,30 @@ fi
 confirm_plan "${PLAN_FILE}"
 
 echo ""
-echo "Applying (bare-metal node provisioning can take 15-25 minutes)..."
-apply_with_describeupdate_fallback "${PLAN_FILE}" "${SNP_NODE_JOIN_TIMEOUT_SECS:-1800}"
+echo "Applying..."
+apply_with_describeupdate_fallback "${PLAN_FILE}" "${NODE_JOIN_TIMEOUT_SECS:-1800}"
 echo ""
 
 #------------------------------------------------------------------------------
-# Verify (mode-dependent):
-#   snp_local  -> SNP nodes joined, labeled, tainted
-#   peer_pods  -> no confidential metal pool (or scaled to 0) + workers Ready
+# Verify: ordinary workers Ready (they host the kata-remote shim +
+# agent-protocol-forwarder) and the CAA IAM/SG infra is applied. Confidential
+# workloads run in per-agent AWS-managed pod VMs, so there is no metal pool.
 #------------------------------------------------------------------------------
 
 ensure_kubectl_context
 
-if [[ "${CONFIDENTIAL_RUNTIME}" == "peer_pods" ]]; then
-    # peer_pods runs confidential workloads in AWS-managed pod VMs via kata-remote,
-    # so the SEV-SNP metal node group must be absent or scaled to 0; ordinary
-    # workers only host the kata shim + agent-protocol-forwarder.
-    echo "CONFIDENTIAL_RUNTIME=peer_pods — verifying the confidential metal pool is gone (or 0) and workers are Ready..."
-
-    CONF_NG="${RESOURCE_PREFIX}-confidential-node-group"
-    NG_STATUS="$(nodegroup_status "${CONF_NG}")"
-    CONF_DESIRED="${CONFIDENTIAL_NODE_DESIRED_COUNT:-0}"
-    SNP_NODES=$(kubectl get nodes -l swarm.io/confidential-node=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
-
-    if [[ "${NG_STATUS}" != "MISSING" && "${CONF_DESIRED}" != "0" ]]; then
-        step_fail "peer_pods needs no metal pool, but '${CONF_NG}' exists with CONFIDENTIAL_NODE_DESIRED_COUNT=${CONF_DESIRED}; set it to 0 (or remove the node group) and re-run"
-    fi
-    if [[ "${SNP_NODES}" -ne 0 ]]; then
-        step_fail "peer_pods needs no metal pool, but ${SNP_NODES} confidential metal node(s) are still registered (swarm.io/confidential-node=true); scale CONFIDENTIAL_NODE_* to 0 and let them drain"
-    fi
-    if [[ "${NG_STATUS}" == "MISSING" ]]; then
-        echo -e "${GREEN}✓${NC} No confidential metal node group present (${CONF_NG})"
-    else
-        echo -e "${GREEN}✓${NC} Confidential metal node group present but scaled to 0 (no SNP nodes registered)"
-    fi
-
-    WORKERS_READY=$(kubectl get nodes -l '!swarm.io/confidential-node' -o json 2>/dev/null \
-        | jq '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length')
-    if [[ "${WORKERS_READY:-0}" -lt 1 ]]; then
-        step_fail "no ordinary worker nodes are Ready; peer_pods needs healthy workers to host the kata-remote shim + agent-protocol-forwarder"
-    fi
-    echo -e "${GREEN}✓${NC} ${WORKERS_READY} ordinary worker node(s) Ready"
-    echo -e "${YELLOW}ℹ${NC} Peer Pods needs no SEV-SNP metal pool — confidential VMs run as per-agent AWS-managed pod VMs."
-else
-    EXPECTED_SNP_NODES="${CONFIDENTIAL_NODE_DESIRED_COUNT}"
-    TIMEOUT="${SNP_NODE_JOIN_TIMEOUT_SECS:-1800}"
-    POLL=30
-    ELAPSED=0
-    SNP_READY=0
-
-    echo "Waiting for ${EXPECTED_SNP_NODES} SNP node(s) to join and become Ready (timeout ${TIMEOUT}s)..."
-    while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
-        SNP_READY=$(kubectl get nodes -l swarm.io/confidential-node=true -o json 2>/dev/null \
-            | jq '[.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True"))] | length')
-        if [[ "${SNP_READY}" -ge "${EXPECTED_SNP_NODES}" ]]; then
-            break
-        fi
-        echo "  [${ELAPSED}s] SNP nodes Ready: ${SNP_READY}/${EXPECTED_SNP_NODES}"
-        sleep "${POLL}"
-        ELAPSED=$((ELAPSED + POLL))
-    done
-
-    if [[ "${SNP_READY}" -lt "${EXPECTED_SNP_NODES}" ]]; then
-        step_fail "only ${SNP_READY}/${EXPECTED_SNP_NODES} SNP node(s) Ready after ${TIMEOUT}s"
-    fi
-    echo -e "${GREEN}✓${NC} ${SNP_READY} SNP node(s) Ready with label swarm.io/confidential-node=true"
-
-    UNTAINTED=$(kubectl get nodes -l swarm.io/confidential-node=true -o json \
-        | jq '[.items[] | select([.spec.taints[]? | select(.key=="swarm.io/confidential-node" and .effect=="NoSchedule")] | length == 0)] | length')
-    if [[ "${UNTAINTED}" != "0" ]]; then
-        step_fail "${UNTAINTED} SNP node(s) missing the swarm.io/confidential-node:NoSchedule taint"
-    fi
-    echo -e "${GREEN}✓${NC} All SNP nodes carry the swarm.io/confidential-node:NoSchedule taint"
+WORKERS_READY=$(kubectl get nodes -o json 2>/dev/null \
+    | jq '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length')
+if [[ "${WORKERS_READY:-0}" -lt 1 ]]; then
+    step_fail "no worker nodes are Ready; Peer Pods needs healthy workers to host the kata-remote shim + agent-protocol-forwarder"
 fi
+echo -e "${GREEN}✓${NC} ${WORKERS_READY} worker node(s) Ready"
+
+CAA_ROLE_ARN="$(tf_output caa_role_arn)"
+if [[ -z "${CAA_ROLE_ARN}" ]]; then
+    step_fail "terraform output caa_role_arn is empty — the CAA IRSA role was not applied (check the EKS module)"
+fi
+echo -e "${GREEN}✓${NC} CAA IRSA role applied (${CAA_ROLE_ARN})"
+echo -e "${YELLOW}ℹ${NC} No SEV-SNP metal pool — confidential agents run as per-agent AWS-managed pod VMs (Peer Pods)."
 
 step_ok "03 (./03-coco-operator.sh)"

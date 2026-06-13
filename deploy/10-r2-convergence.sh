@@ -3,7 +3,7 @@
 # fleet has fully converged on the new architecture:
 #   - gateway reports store schema_version=2
 #   - every agent record carries a tier + sealed storage (billing sku source)
-#   - every running swarm-agent pod is on kata-qemu-snp
+#   - every running swarm-agent pod is on kata-remote
 #   - zero pods on kata-fc
 #   - spot-check: N agent pods report the sealed-state env contract
 #
@@ -82,7 +82,7 @@ snapshot_agent_pods "${PODS_JSON}"
 # under the wrong isolation, and must not falsely fail (or pass) the gate.
 POD_TOTAL=$(jq '[.[] | select(.phase == "Running")] | length' "${PODS_JSON}")
 KATA_FC=$(jq '[.[] | select(.runtime_class == "kata-fc" and .phase == "Running")] | length' "${PODS_JSON}")
-NON_SNP=$(jq '[.[] | select(.phase == "Running" and .runtime_class != "kata-qemu-snp")] | length' "${PODS_JSON}")
+NON_SNP=$(jq '[.[] | select(.phase == "Running" and .runtime_class != "kata-remote")] | length' "${PODS_JSON}")
 
 [[ "${KATA_FC}" == "0" ]] && RES=0 || RES=1
 gate "${RES}" \
@@ -94,8 +94,8 @@ fi
 
 [[ "${NON_SNP}" == "0" ]] && RES=0 || RES=1
 gate "${RES}" \
-    "All ${POD_TOTAL} running agent pod(s) on kata-qemu-snp" \
-    "${NON_SNP}/${POD_TOTAL} pod(s) not on kata-qemu-snp"
+    "All ${POD_TOTAL} running agent pod(s) on kata-remote" \
+    "${NON_SNP}/${POD_TOTAL} pod(s) not on kata-remote"
 
 #------------------------------------------------------------------------------
 # 4. Spot-check N pods for the sealed-state env contract

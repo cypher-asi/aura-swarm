@@ -101,7 +101,7 @@ output "node_security_group_id" {
 }
 
 output "caa_role_arn" {
-  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role (empty string when enable_caa=false)"
+  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role (empty string when the EKS/network modules are disabled)"
   value       = var.enable_eks && var.enable_network ? module.eks[0].caa_role_arn : ""
 }
 

@@ -5,7 +5,7 @@
 #
 # Verifies: rollouts complete, /internal/health OK, legacy agent pods
 # untouched (same pods, same runtime class, same spec hash), and one new
-# test agent lands on kata-qemu-snp with a sealed env and a billing sku.
+# test agent lands on kata-remote with a sealed env and a billing sku.
 #
 # Usage:
 #   ./06-deploy-r1.sh                 # deploys SWARM_R1_REF (default fa93895)
@@ -147,9 +147,9 @@ else
 
     POD_JSON=$(kubectl get pod "${POD_NAME}" -n "${K8S_NAMESPACE_AGENTS}" -o json)
     RUNTIME_CLASS=$(echo "${POD_JSON}" | jq -r '.spec.runtimeClassName // "<none>"')
-    [[ "${RUNTIME_CLASS}" == "kata-qemu-snp" ]] \
-        || step_fail "test agent pod is on '${RUNTIME_CLASS}', expected kata-qemu-snp"
-    echo -e "${GREEN}✓${NC} Test agent pod on kata-qemu-snp"
+    [[ "${RUNTIME_CLASS}" == "kata-remote" ]] \
+        || step_fail "test agent pod is on '${RUNTIME_CLASS}', expected kata-remote"
+    echo -e "${GREEN}✓${NC} Test agent pod on kata-remote"
 
     SEALED=$(echo "${POD_JSON}" | jq -r '[.spec.containers[0].env[]? | select(.name == "AURA_STATE_ENCRYPTION") | .value] | first // ""')
     KBS_ENV=$(echo "${POD_JSON}" | jq -r '[.spec.containers[0].env[]? | select(.name == "AURA_KBS_URL") | .value] | first // ""')

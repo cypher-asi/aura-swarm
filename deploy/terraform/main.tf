@@ -90,16 +90,6 @@ module "eks" {
   node_max_count     = var.node_max_count
   node_disk_size     = var.node_disk_size
 
-  # Confidential (SEV-SNP bare metal) node group for CoCo / kata-qemu-snp
-  confidential_node_instance_type = var.confidential_node_instance_type
-  confidential_node_desired_count = var.confidential_node_desired_count
-  confidential_node_min_count     = var.confidential_node_min_count
-  confidential_node_max_count     = var.confidential_node_max_count
-  confidential_node_disk_size     = var.confidential_node_disk_size
-
-  # Peer Pods / Cloud API Adaptor (no-op until enable_caa=true)
-  enable_caa = var.enable_caa
-
   tags = local.common_tags
 }
 
