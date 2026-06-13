@@ -32,6 +32,9 @@ CAA_FORWARDER_PORT="${CAA_FORWARDER_PORT:-15150}"
 CAA_CHART_VERSION="${CAA_CHART_VERSION:-}"
 [[ -n "${CAA_CHART_VERSION}" ]] \
     || step_fail "CAA_CHART_VERSION is empty — pin the Cloud API Adaptor chart version in config.env before installing"
+CAA_PEERPODS_LIMIT_PER_NODE="${CAA_PEERPODS_LIMIT_PER_NODE:-10}"
+[[ "${CAA_PEERPODS_LIMIT_PER_NODE}" =~ ^[1-9][0-9]*$ ]] \
+    || step_fail "CAA_PEERPODS_LIMIT_PER_NODE must be a positive integer (got '${CAA_PEERPODS_LIMIT_PER_NODE}')"
 
 # CAA install targets (kept overridable; defaults match the upstream peerpods chart).
 CAA_NAMESPACE="${CAA_NAMESPACE:-confidential-containers-system}"
@@ -103,6 +106,7 @@ echo "  region:            ${AWS_REGION}"
 echo "  pod-VM subnet:     ${CAA_PODVM_SUBNET_ID}"
 echo "  node SG:           ${NODE_SG_ID}"
 echo "  vxlan/forwarder:   ${CAA_VXLAN_PORT} / ${CAA_FORWARDER_PORT}"
+echo "  peer-pod capacity: ${CAA_PEERPODS_LIMIT_PER_NODE} VMs per worker"
 echo "  webhook:           ${CAA_ENABLE_WEBHOOK} (cert-manager required when true)"
 echo "  CAA image:         ${CAA_IMAGE_NAME}:${CAA_IMAGE_TAG:-<chart default>}"
 echo "  IRSA role:         ${CAA_ROLE_ARN:-<none — using node role>}"
@@ -167,6 +171,7 @@ CAA_SET_ARGS=(
     --set-string "providerConfigs.aws.PODVM_AMI_ID=${PODVM_AMI_ID}"
     --set-string "providerConfigs.aws.PODVM_INSTANCE_TYPE=${PODVM_INSTANCE_TYPE}"
     --set-string "providerConfigs.aws.DISABLECVM=false"
+    --set-string "providerConfigs.aws.PEERPODS_LIMIT_PER_NODE=${CAA_PEERPODS_LIMIT_PER_NODE}"
     --set-string "providerConfigs.aws.VXLAN_PORT=${CAA_VXLAN_PORT}"
     --set-string "providerConfigs.aws.FORWARDER_PORT=${CAA_FORWARDER_PORT}"
     --set "webhook.enabled=${CAA_ENABLE_WEBHOOK}"
@@ -247,6 +252,12 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_T
   entrypoint — set CAA_IMAGE_TAG to an image that has it (config.env).
   If they show 'At least one of these must be SET: AWS_SECRET_ACCESS_KEY AWS_ROLE_ARN',
   the IRSA env was not injected — check the SA annotation + the cluster's IAM OIDC provider."
+fi
+if ! wait_peerpods_node_capacity "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}"; then
+    step_fail "CAA daemonset is Ready but workers do not advertise kata.peerpods.io/vm.
+  Mutated kata-remote pods will stay Pending with 'Insufficient kata.peerpods.io/vm'.
+  Check that peer-pods-cm has PEERPODS_LIMIT_PER_NODE=${CAA_PEERPODS_LIMIT_PER_NODE}
+  and that the cloud-api-adaptor service account can patch nodes/status."
 fi
 
 # Verify: the kata-remote RuntimeClass exists.

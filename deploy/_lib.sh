@@ -1156,6 +1156,48 @@ peerpods_webhook_effective() {
     [[ "${cabundle:-0}" != "0" && "${eps:-0}" -ge 1 ]]
 }
 
+# Print worker node peer-pod capacity/allocatable values. CAA advertises the
+# kata.peerpods.io/vm extended resource by patching nodes/status.
+peerpods_node_capacity_summary() {
+    kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
+        | jq -r '.items[] | "    \(.metadata.name): capacity=\(.status.capacity["kata.peerpods.io/vm"] // "<none>") allocatable=\(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
+}
+
+# Wait until every CAA worker advertises at least one kata.peerpods.io/vm unit.
+# The mutating webhook can work perfectly and pods can still stay Pending if
+# this nodes/status patch never lands.
+wait_peerpods_node_capacity() {
+    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}"
+    local elapsed=0 total advertised cm_limit can_patch
+    echo "Waiting for worker nodes to advertise kata.peerpods.io/vm capacity (timeout ${timeout}s)..."
+    while (( elapsed <= timeout )); do
+        total=$(kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
+            | jq '[.items[]] | length' 2>/dev/null || echo 0)
+        advertised=$(kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
+            | jq '[.items[] | select(((.status.allocatable["kata.peerpods.io/vm"] // "0") | tonumber? // 0) >= 1)] | length' 2>/dev/null || echo 0)
+        if [[ "${total:-0}" -ge 1 && "${advertised:-0}" -ge "${total:-0}" ]]; then
+            echo -e "${GREEN}✓${NC} Worker nodes advertise kata.peerpods.io/vm capacity (${advertised}/${total})"
+            peerpods_node_capacity_summary
+            return 0
+        fi
+        echo "  [${elapsed}s] nodes advertising kata.peerpods.io/vm: ${advertised:-0}/${total:-0}"
+        sleep "${poll}"; elapsed=$((elapsed + poll))
+    done
+
+    echo -e "${RED}✗${NC} worker nodes did not advertise kata.peerpods.io/vm capacity after ${timeout}s"
+    cm_limit=$(kubectl -n "${ns}" get configmap peer-pods-cm \
+        -o jsonpath='{.data.PEERPODS_LIMIT_PER_NODE}' 2>/dev/null || true)
+    can_patch=$(kubectl auth can-i patch nodes/status \
+        --as="system:serviceaccount:${ns}:cloud-api-adaptor" 2>/dev/null || true)
+    echo "  peer-pods-cm PEERPODS_LIMIT_PER_NODE: ${cm_limit:-<missing>}"
+    echo "  cloud-api-adaptor SA can patch nodes/status: ${can_patch:-<unknown>}"
+    echo "  node capacity/allocatable kata.peerpods.io/vm:"
+    peerpods_node_capacity_summary
+    echo "  CAA daemonset log (tail):"
+    kubectl logs -n "${ns}" ds/"${ds}" --tail=80 2>/dev/null | sed 's/^/    /' || true
+    return 1
+}
+
 # Read-only consistency check for the confidential (Peer Pods / CAA) config
 # (uses the already-sourced live values). Prints warnings; never mutates.
 # Returns the number of problems found so callers can decide.

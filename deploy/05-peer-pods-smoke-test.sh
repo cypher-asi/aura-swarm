@@ -263,10 +263,10 @@ TIMEOUT="${PEER_PODS_SMOKE_TIMEOUT_SECS:-900}"
 POLL=10
 ELAPSED=0
 PHASE=""
-# Fail fast if the pod stays Unschedulable: a kata-remote pod that the peer-pods
-# webhook mutated requests kata.peerpods.io/vm (cpu/memory stripped) and lands
-# immediately; persistent "Insufficient cpu" means it was NOT mutated and will
-# never schedule on this node pool. Don't burn the whole timeout on it.
+# Fail fast if the pod stays Unschedulable. A kata-remote pod can fail here for
+# two distinct reasons: the webhook did not mutate it (still requests cpu), or it
+# was mutated but workers do not advertise/free kata.peerpods.io/vm capacity.
+# Neither condition self-resolves during this smoke test.
 UNSCHED_GRACE="${PEER_PODS_UNSCHED_GRACE_SECS:-60}"
 UNSCHED_ELAPSED=0
 # Also fail fast on a stuck container-create error (e.g. the workload image being
@@ -298,7 +298,11 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
         # before the ${UNSCHED_GRACE}s full dump still shows what to look at.
         if [[ "${UNSCHED_HINTED:-0}" == "0" ]]; then
             UNSCHED_HINTED=1
-            echo -e "  ${YELLOW}↳${NC} Unschedulable — if this is 'Insufficient cpu' the peer-pods webhook did NOT rewrite this pod (a mutated pod has NO cpu request and asks for kata.peerpods.io/vm:1). Full diagnostics in ${UNSCHED_GRACE}s."
+            if [[ "${SCHED}" == *"Insufficient kata.peerpods.io/vm"* ]]; then
+                echo -e "  ${YELLOW}↳${NC} Unschedulable — the pod was likely mutated, but workers have no/free kata.peerpods.io/vm capacity. Full diagnostics in ${UNSCHED_GRACE}s."
+            else
+                echo -e "  ${YELLOW}↳${NC} Unschedulable — if this is 'Insufficient cpu' the peer-pods webhook did NOT rewrite this pod (a mutated pod has NO cpu request and asks for kata.peerpods.io/vm:1). Full diagnostics in ${UNSCHED_GRACE}s."
+            fi
         fi
         if [[ ${UNSCHED_ELAPSED} -ge ${UNSCHED_GRACE} ]]; then
             CPU_REQ=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
@@ -310,14 +314,17 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
             echo "  (a webhook-mutated kata-remote pod has NO cpu request and kata.peerpods.io/vm=1)"
             echo "  peer-pods webhook effectiveness (caBundle/failurePolicy/endpoints):"
             peerpods_webhook_effective 2>/dev/null | sed 's/^/    /' || true
-            echo "  node allocatable kata.peerpods.io/vm:"
-            kubectl get nodes -o json 2>/dev/null \
-                | jq -r '.items[] | "    \(.metadata.name): \(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
+            echo "  peer-pods-cm PEERPODS_LIMIT_PER_NODE:"
+            kubectl -n "${CAA_NAMESPACE:-confidential-containers-system}" get configmap peer-pods-cm \
+                -o jsonpath='    {.data.PEERPODS_LIMIT_PER_NODE}{"\n"}' 2>/dev/null || true
+            echo "  node capacity/allocatable kata.peerpods.io/vm:"
+            peerpods_node_capacity_summary
             echo -e "${YELLOW}--- end diagnostics ---${NC}"
-            step_fail "kata-remote smoke pod stayed Unschedulable for ${UNSCHED_ELAPSED}s (${SCHED}).
+            if [[ -n "${CPU_REQ:-}" ]]; then
+                step_fail "kata-remote smoke pod stayed Unschedulable for ${UNSCHED_ELAPSED}s (${SCHED}).
   It still carries a cpu request, so the peer-pods mutating webhook did NOT rewrite it
-  (mutated pods drop cpu/memory and request kata.peerpods.io/vm:1, which the CAA daemonset
-  advertises). The webhook is registered but not effective — check, in order:
+  (mutated pods drop cpu/memory and request kata.peerpods.io/vm:1). The webhook is
+  registered but not effective for this namespace — check, in order:
     1. the webhook pod is Ready and serving (cert-manager issued its cert):
          kubectl get pods -n ${CAA_NAMESPACE:-confidential-containers-system} | grep -i webhook
          kubectl get certificate,secret -n ${CAA_NAMESPACE:-confidential-containers-system} | grep -i webhook
@@ -325,6 +332,19 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     3. failurePolicy=Ignore silently admits unmutated pods when the webhook call fails
   If the webhook only targets ${K8S_NAMESPACE_AGENTS}, run the smoke test there
   (PEER_PODS_SMOKE_NAMESPACE) or label ${K8S_NAMESPACE_SYSTEM} for the webhook."
+            elif [[ -n "${VM_RES:-}" ]]; then
+                step_fail "kata-remote smoke pod stayed Unschedulable for ${UNSCHED_ELAPSED}s (${SCHED}).
+  The peer-pods webhook DID rewrite it (cpu=<none>, kata.peerpods.io/vm=${VM_RES}),
+  but the scheduler cannot find worker capacity for kata.peerpods.io/vm. Re-run
+  ./03-coco-operator.sh so CAA applies PEERPODS_LIMIT_PER_NODE and patches
+  nodes/status; if it still fails, inspect peer-pods-cm, CAA logs, and whether
+  the cloud-api-adaptor service account can patch nodes/status."
+            else
+                step_fail "kata-remote smoke pod stayed Unschedulable for ${UNSCHED_ELAPSED}s (${SCHED}).
+  The pod has neither a cpu request nor kata.peerpods.io/vm request in the first
+  container, so the peer-pods mutation result is unexpected. Inspect the pod spec
+  and peer-pods webhook logs."
+            fi
         fi
     else
         UNSCHED_ELAPSED=0
