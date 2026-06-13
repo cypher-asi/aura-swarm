@@ -187,6 +187,25 @@ if [[ -n "${CAA_IMAGE_TAG:-}" ]]; then
     CAA_SET_ARGS+=(--set "image.name=${CAA_IMAGE_NAME}" --set-string "image.tag=${CAA_IMAGE_TAG}")
 fi
 
+# A prior run zeroed the kata-remote RuntimeClass overhead with `kubectl patch`
+# (see below), which takes the "kubectl-patch" field-manager. The chart applies
+# that RuntimeClass via server-side apply, so on re-run helm conflicts:
+#   conflicts with "kubectl-patch" ... .overhead.podFixed.cpu/.memory
+# Recreate the RuntimeClass cleanly first so helm re-owns it. Safe at deploy
+# time; skip when any kata-remote pod is Running so a re-run never disrupts live
+# confidential agents (the overhead is already zero from the prior run then).
+if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
+    KR_RUNNING=$(kubectl get pods -A -o json 2>/dev/null \
+        | jq '[.items[] | select(.spec.runtimeClassName=="kata-remote" and .status.phase=="Running")] | length' 2>/dev/null || echo 0)
+    if [[ "${KR_RUNNING:-0}" -eq 0 ]]; then
+        kubectl delete runtimeclass kata-remote --ignore-not-found >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓${NC} Reset kata-remote RuntimeClass field ownership before upgrade (no running kata-remote pods)"
+    else
+        echo -e "${YELLOW}⚠${NC} ${KR_RUNNING} kata-remote pod(s) Running — leaving the RuntimeClass in place."
+        echo "  If helm upgrade hits an overhead field-manager conflict, drain those pods and re-run."
+    fi
+fi
+
 # NOTE: no `--wait` here on purpose — helm --wait would block the full timeout
 # even when the daemonset pods are CrashLooping in the first few seconds. We let
 # helm return as soon as the manifests are applied, then fail FAST below.
