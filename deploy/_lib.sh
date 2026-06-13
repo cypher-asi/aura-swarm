@@ -1017,7 +1017,7 @@ resolve_pinned_harness_image() {
     fi
 
     if [[ -z "${PINNED_HARNESS_IMAGE}" ]]; then
-        step_fail "could not resolve an immutable harness digest; run legacy/07-build-images.sh --harness or set AURA_HARNESS_IMAGE=<image@sha256:...>"
+        step_fail "could not resolve an immutable harness digest; run ./06-build-harness.sh or set AURA_HARNESS_IMAGE=<image@sha256:...>"
     fi
     if [[ ! "${PINNED_HARNESS_IMAGE}" =~ @sha256:[a-f0-9]{64}$ ]]; then
         step_fail "AURA_HARNESS_IMAGE must be pinned to an immutable digest (got: ${PINNED_HARNESS_IMAGE})"

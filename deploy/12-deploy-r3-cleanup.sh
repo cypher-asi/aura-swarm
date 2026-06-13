@@ -1,5 +1,5 @@
 #!/bin/bash
-# 11-deploy-r3-cleanup.sh - Deploy the R3 (cleanup) builds, retire the legacy
+# 12-deploy-r3-cleanup.sh - Deploy the R3 (cleanup) builds, retire the legacy
 # kata-fc runtime class, and shrink the old node group into the system pool.
 #
 # Refuses to run until the R2 convergence gate (step 10) passes.
@@ -7,8 +7,8 @@
 # Verifies: no kata-fc artifacts remain (RuntimeClass or pods), fleet healthy.
 #
 # Usage:
-#   ./11-deploy-r3-cleanup.sh                  # deploys SWARM_R3_REF (default master)
-#   ./11-deploy-r3-cleanup.sh --ref <git-ref>
+#   ./12-deploy-r3-cleanup.sh                  # deploys SWARM_R3_REF (default master)
+#   ./12-deploy-r3-cleanup.sh --ref <git-ref>
 #
 # System pool sizing comes from NODE_DESIRED_COUNT / NODE_MIN_COUNT /
 # NODE_MAX_COUNT in config.env (override via env to shrink further).
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "11" "Deploy R3 (cleanup) at ref ${REF}"
+step_banner "12" "Deploy R3 (cleanup) at ref ${REF}"
 
 require_cmds aws kubectl jq curl docker git terraform openssl
 require_aws_auth
@@ -40,7 +40,7 @@ trap gw_stop_port_forward EXIT
 
 KATA_FC=$(count_pods_on_runtime_class "kata-fc")
 [[ "${KATA_FC}" == "0" ]] \
-    || step_fail "${KATA_FC} pod(s) still on kata-fc — run ./10-r2-convergence.sh until it passes before R3"
+    || step_fail "${KATA_FC} pod(s) still on kata-fc — run ./11-r2-convergence.sh until it passes before R3"
 
 gw_start_port_forward || step_fail "gateway port-forward failed"
 SCHEMA=$(gw_schema_version || echo "null")
@@ -88,7 +88,7 @@ echo "Planning the shrunk system pool (${NODE_DESIRED_COUNT} x ${NODE_INSTANCE_T
 terraform plan -out="${PLAN_FILE}"
 
 if plan_replaces_efs "${PLAN_FILE}"; then
-    step_fail "plan would replace the EFS filesystem — investigate before applying (see ./02b-efs-encryption-migration.sh)"
+    step_fail "plan would replace the EFS filesystem — investigate before applying (see ./efs-encryption-migration.sh)"
 fi
 
 confirm_plan "${PLAN_FILE}"
@@ -117,4 +117,4 @@ fi
 
 print_fleet_report
 
-step_ok "12 (./12-finalize.sh)"
+step_ok "13 (./13-finalize.sh)"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 12-finalize.sh - Final fleet health report + EFS backup retention handling.
+# 13-finalize.sh - Final fleet health report + EFS backup retention handling.
 #
 # Prints the end-state report (nodes, runtime classes, schema version, KBS,
 # zbilling) and reminds about the pre-R2 EFS recovery point. The recovery
@@ -7,8 +7,8 @@
 # retention window (default 14 days) has elapsed.
 #
 # Usage:
-#   ./12-finalize.sh
-#   EFS_BACKUP_RETENTION_DAYS=30 ./12-finalize.sh
+#   ./13-finalize.sh
+#   EFS_BACKUP_RETENTION_DAYS=30 ./13-finalize.sh
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "12" "Finalize: fleet report + backup retention"
+step_banner "13" "Finalize: fleet report + backup retention"
 
 require_cmds aws kubectl jq curl
 require_aws_auth
@@ -120,7 +120,7 @@ else
             rm -f "${EFS_BACKUP_STATE_FILE}"
             echo -e "  ${GREEN}✓${NC} Recovery point deleted"
         else
-            echo "  Kept. Re-run ./12-finalize.sh whenever you want to revisit."
+            echo "  Kept. Re-run ./13-finalize.sh whenever you want to revisit."
         fi
     fi
 fi
@@ -133,4 +133,4 @@ echo ""
 if [[ ${FAILURES} -gt 0 ]]; then
     step_fail "${FAILURES} final health check(s) failed"
 fi
-step_ok "— rollout complete. Run ./07-r1-soak-check.sh any time for a fleet spot-check."
+step_ok "— rollout complete. Run ./08-r1-soak-check.sh any time for a fleet spot-check."

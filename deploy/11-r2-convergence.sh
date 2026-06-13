@@ -1,5 +1,5 @@
 #!/bin/bash
-# 10-r2-convergence.sh - R2 convergence GATE. Refuses to pass unless the
+# 11-r2-convergence.sh - R2 convergence GATE. Refuses to pass unless the
 # fleet has fully converged on the new architecture:
 #   - gateway reports store schema_version=2
 #   - every agent record carries a tier + sealed storage (billing sku source)
@@ -10,8 +10,8 @@
 # Safe to run repeatedly while stragglers (hibernating agents) wake/migrate.
 #
 # Usage:
-#   ./10-r2-convergence.sh
-#   R2_SPOT_CHECK_COUNT=5 ./10-r2-convergence.sh
+#   ./11-r2-convergence.sh
+#   R2_SPOT_CHECK_COUNT=5 ./11-r2-convergence.sh
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "10" "R2 convergence gate"
+step_banner "11" "R2 convergence gate"
 
 require_cmds aws kubectl jq curl
 require_aws_auth
@@ -135,4 +135,4 @@ fi
 if [[ ${FAILURES} -gt 0 ]]; then
     step_fail "${FAILURES} convergence check(s) failed — wake/migrate the stragglers and re-run this gate"
 fi
-step_ok "11 (./11-deploy-r3-cleanup.sh)"
+step_ok "12 (./12-deploy-r3-cleanup.sh)"

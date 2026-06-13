@@ -1,5 +1,5 @@
 #!/bin/bash
-# 02b-efs-encryption-migration.sh - Guided migration from an UNENCRYPTED EFS
+# efs-encryption-migration.sh - Guided migration from an UNENCRYPTED EFS
 # filesystem to a new ENCRYPTED one. Only needed when ./02-snp-node-group.sh
 # aborted with the EFS replacement hazard.
 #
@@ -19,7 +19,7 @@
 # deployments are scaled back up by the next deploy step (06) — or manually
 # with the commands printed at the end.
 #
-# Usage: ./02b-efs-encryption-migration.sh
+# Usage: ./efs-encryption-migration.sh
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "02b" "EFS unencrypted -> encrypted migration (guided)"
+step_banner "EFS" "EFS unencrypted -> encrypted migration (guided, conditional)"
 
 require_cmds aws terraform kubectl jq
 require_aws_auth
@@ -373,7 +373,7 @@ echo "Delete it manually once the migration has soaked:"
 echo "    aws efs delete-file-system --file-system-id ${OLD_FS_ID}   # after deleting its mount targets"
 echo ""
 echo "Platform deployments are still scaled to 0. The next deploy step"
-echo "(./06-deploy-r1.sh) re-applies manifests and scales everything back up;"
+echo "(./07-deploy-r1.sh) re-applies manifests and scales everything back up;"
 echo "to restore service sooner: kubectl scale deployment/aura-swarm-{gateway,control,scheduler} -n ${K8S_NAMESPACE_SYSTEM} --replicas=1"
 
 step_ok "02 (re-run ./02-snp-node-group.sh — the plan should now be clean)"

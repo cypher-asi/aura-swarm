@@ -39,7 +39,7 @@ echo -e "${GREEN}✓${NC} Namespaces ${K8S_NAMESPACE_SYSTEM} / ${K8S_NAMESPACE_A
 
 # INTERNAL_TOKEN: the service bearer token shared by gateway, scheduler and
 # the deploy tooling. Generated once into .secrets/; injected into the
-# aura-swarm-secrets manifest by the deploy steps (06/09/11).
+# aura-swarm-secrets manifest by the deploy steps (07/10/12).
 ensure_internal_token
 
 #------------------------------------------------------------------------------

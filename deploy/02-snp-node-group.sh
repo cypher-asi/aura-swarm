@@ -11,7 +11,7 @@
 # CRITICAL GUARD: the storage module now hardcodes encrypted=true on the EFS
 # filesystem. If the live filesystem is UNENCRYPTED, terraform will plan a
 # REPLACEMENT (delete + create) — destroying all agent state. This script
-# detects that and ABORTS, pointing at ./02b-efs-encryption-migration.sh.
+# detects that and ABORTS, pointing at ./efs-encryption-migration.sh.
 #
 # Verifies: ordinary workers Ready and the CAA IAM/SG infra is applied.
 #
@@ -61,12 +61,12 @@ if plan_replaces_efs "${PLAN_FILE}"; then
     echo ""
     echo "Do NOT apply this plan. Instead run the guided migration:"
     echo ""
-    echo "    ./02b-efs-encryption-migration.sh"
+    echo "    ./efs-encryption-migration.sh"
     echo ""
     echo "which creates a new encrypted filesystem, copies the data, repoints"
     echo "terraform state, and verifies — then re-run this script (the plan"
     echo "will no longer touch the EFS filesystem)."
-    step_fail "terraform plan would replace the EFS filesystem (unencrypted -> encrypted); run ./02b-efs-encryption-migration.sh first"
+    step_fail "terraform plan would replace the EFS filesystem (unencrypted -> encrypted); run ./efs-encryption-migration.sh first"
 fi
 echo -e "${GREEN}✓${NC} EFS hazard check passed (plan does not replace the filesystem)"
 

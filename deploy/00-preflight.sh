@@ -57,7 +57,7 @@ fi
 echo ""
 
 #------------------------------------------------------------------------------
-# Docker (needed for image builds in steps 06/09/11; warn only)
+# Docker (needed for image builds in steps 06/07/10/12; warn only)
 #------------------------------------------------------------------------------
 
 echo -e "${CYAN}Docker${NC}"
@@ -65,7 +65,7 @@ DOCKER_INFO_TIMEOUT=15
 if docker_daemon_ok "${DOCKER_INFO_TIMEOUT}"; then
     echo -e "${GREEN}✓${NC} Docker daemon is running"
 else
-    echo -e "${YELLOW}⚠${NC} Docker daemon not running (or not responding within ${DOCKER_INFO_TIMEOUT}s) — required before steps 06/09/11 (image builds)"
+    echo -e "${YELLOW}⚠${NC} Docker daemon not running (or not responding within ${DOCKER_INFO_TIMEOUT}s) — required before steps 06/07/10/12 (image builds)"
 fi
 echo ""
 

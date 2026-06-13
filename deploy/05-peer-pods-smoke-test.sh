@@ -330,4 +330,4 @@ echo -e "${GREEN}✓${NC} Pod VM ${NEW_PODVM_ID} is ${PODVM_STATE} after pod del
 # Already terminating/terminated, so the cleanup safety net has nothing to do.
 NEW_PODVM_ID=""
 
-step_ok "06 (./06-deploy-r1.sh)"
+step_ok "06 (./06-build-harness.sh)"
