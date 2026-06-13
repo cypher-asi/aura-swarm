@@ -1,19 +1,22 @@
 #!/bin/bash
 # 02-snp-node-group.sh - Terraform plan/apply for the worker node group + Peer
-# Pods / CAA infra (IAM/SG), with the EFS-encryption replacement hazard guarded
-# explicitly.
+# Pods / CAA security-group rules, with the EFS-encryption replacement hazard
+# guarded explicitly.
 #
 # Confidential agents run as Peer Pods (per-agent AWS-managed SEV-SNP pod VMs
 # launched off-cluster by CAA), so there is NO on-node SEV-SNP metal pool: the
 # ordinary workers host the kata-remote shim + agent-protocol-forwarder, and
-# terraform provisions the CAA IRSA role + worker<->pod-VM security-group rules.
+# terraform provisions the worker<->pod-VM security-group rules. ALL IAM (the
+# cluster/node service roles terraform reads + passes, the IRSA OIDC provider,
+# and the CAA IRSA role) is owned by org-admin's ./01-iam.sh — this step has no
+# IAM-write permission and only reads/passes the pre-created roles.
 #
 # CRITICAL GUARD: the storage module now hardcodes encrypted=true on the EFS
 # filesystem. If the live filesystem is UNENCRYPTED, terraform will plan a
 # REPLACEMENT (delete + create) — destroying all agent state. This script
 # detects that and ABORTS, pointing at ./efs-encryption-migration.sh.
 #
-# Verifies: ordinary workers Ready and the CAA IAM/SG infra is applied.
+# Verifies: ordinary workers Ready and the worker security-group is applied.
 #
 # Usage: ./02-snp-node-group.sh
 
@@ -23,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "02" "Workers + Peer Pods/CAA infra (terraform)"
+step_banner "02" "Workers + Peer Pods/CAA infra (terraform)" "ops-admin"
 
 require_cmds aws terraform kubectl jq
 require_aws_auth
@@ -89,7 +92,7 @@ if plan_changes_nodegroup "${PLAN_FILE}"; then
             echo -e "${YELLOW}⚠${NC} eks:DescribeUpdate is currently DENIED for this principal."
             echo "  terraform's post-update wait will fail; the apply will fall back to"
             echo "  direct node-group polling so the rollout still converges."
-            echo "  Permanent fix: attach ${DEPLOY_IAM_POLICY} to the ${DEPLOY_SSO_PERMISSION_SET} permission set"
+            echo "  Permanent fix: attach ${OPS_IAM_POLICY} to the ${OPS_SSO_PERMISSION_SET} permission set"
             echo "  (./01-iam.sh as an Identity Center admin) and clear any SCP denying eks:DescribeUpdate."
             ;;
         allowed)
@@ -111,8 +114,9 @@ echo ""
 
 #------------------------------------------------------------------------------
 # Verify: ordinary workers Ready (they host the kata-remote shim +
-# agent-protocol-forwarder) and the CAA IAM/SG infra is applied. Confidential
-# workloads run in per-agent AWS-managed pod VMs, so there is no metal pool.
+# agent-protocol-forwarder) and the worker security-group is applied.
+# Confidential workloads run in per-agent AWS-managed pod VMs, so there is no
+# metal pool. The CAA IRSA role is org-admin's (./01-iam.sh), not a tf output.
 #------------------------------------------------------------------------------
 
 ensure_kubectl_context
@@ -124,11 +128,12 @@ if [[ "${WORKERS_READY:-0}" -lt 1 ]]; then
 fi
 echo -e "${GREEN}✓${NC} ${WORKERS_READY} worker node(s) Ready"
 
-CAA_ROLE_ARN="$(tf_output caa_role_arn)"
-if [[ -z "${CAA_ROLE_ARN}" ]]; then
-    step_fail "terraform output caa_role_arn is empty — the CAA IRSA role was not applied (check the EKS module)"
+NODE_SG_ID="$(tf_output node_security_group_id)"
+if [[ -z "${NODE_SG_ID}" ]]; then
+    step_fail "terraform output node_security_group_id is empty — the worker SG (incl. CAA worker<->pod-VM rules) was not applied"
 fi
-echo -e "${GREEN}✓${NC} CAA IRSA role applied (${CAA_ROLE_ARN})"
+echo -e "${GREEN}✓${NC} Worker security-group applied (${NODE_SG_ID})"
 echo -e "${YELLOW}ℹ${NC} No SEV-SNP metal pool — confidential agents run as per-agent AWS-managed pod VMs (Peer Pods)."
+echo -e "${YELLOW}ℹ${NC} Next: re-run ./01-iam.sh (org-admin) to provision the CAA IRSA role now that the cluster exists."
 
-step_ok "03 (./03-coco-operator.sh)"
+step_ok "01 re-run (org-admin: ./01-iam.sh — CAA IRSA role), then 03 (./03-coco-operator.sh)"

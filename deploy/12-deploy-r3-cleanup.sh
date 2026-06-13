@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "12" "Deploy R3 (cleanup) at ref ${REF}"
+step_banner "12" "Deploy R3 (cleanup) at ref ${REF}" "ops-admin"
 
 require_cmds aws kubectl jq curl docker git terraform openssl
 require_aws_auth

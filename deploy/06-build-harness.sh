@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "06" "Build + pin the aura-harness image"
+step_banner "06" "Build + pin the aura-harness image" "ops-admin"
 
 HARNESS_REPO_URL="${HARNESS_REPO_URL:-https://github.com/cypher-asi/aura-harness}"
 HARNESS_REF="${HARNESS_REF:-main}"

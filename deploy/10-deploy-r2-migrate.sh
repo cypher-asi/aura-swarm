@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "10" "Deploy R2 (migration) at ref ${REF}"
+step_banner "10" "Deploy R2 (migration) at ref ${REF}" "ops-admin"
 
 require_cmds aws kubectl jq curl docker git openssl
 require_aws_auth

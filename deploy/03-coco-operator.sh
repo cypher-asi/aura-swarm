@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "03" "Confidential runtime (Cloud API Adaptor / Peer Pods)"
+step_banner "03" "Confidential runtime (Cloud API Adaptor / Peer Pods)" "ops-admin"
 
 require_cmds helm aws kubectl jq
 require_aws_auth
@@ -75,15 +75,21 @@ fi
 # PEER-PODS-PLAN §6.1). Override with CAA_PODVM_SUBNET_ID to pin another.
 CAA_PODVM_SUBNET_ID="${CAA_PODVM_SUBNET_ID:-${AGENT_SUBNET_IDS%%,*}}"
 NODE_SG_ID="$(tf_output node_security_group_id)"
-CAA_ROLE_ARN="$(tf_output caa_role_arn)"
+
+# The CAA IRSA role is owned by org-admin's ./01-iam.sh (IAM left terraform for
+# separation of duties), so its ARN is derived deterministically from the
+# account + resource prefix rather than read from a terraform output. ops-admin
+# has iam:GetRole on it, which also validates that org-admin provisioned it.
+CAA_ROLE_NAME="${RESOURCE_PREFIX}-caa-role"
+CAA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${CAA_ROLE_NAME}"
 
 [[ -n "${AGENT_SUBNET_IDS}" ]] \
-    || step_fail "terraform output agent_subnet_ids is empty — apply the CAA infra (subnets/SG/IRSA) first (./02-snp-node-group.sh)"
+    || step_fail "terraform output agent_subnet_ids is empty — apply the CAA infra (subnets/SG) first (./02-snp-node-group.sh)"
 [[ -n "${NODE_SG_ID}" ]] \
     || step_fail "terraform output node_security_group_id is empty — apply the CAA infra first (./02-snp-node-group.sh)"
-if [[ -z "${CAA_ROLE_ARN}" ]]; then
-    echo -e "${YELLOW}⚠${NC} terraform output caa_role_arn is empty — CAA will fall back to the node instance role."
-    echo "  Prefer a dedicated IRSA role (PEER-PODS-PLAN §3 CAA IAM); set caa_role_arn in terraform."
+if ! aws iam get-role --role-name "${CAA_ROLE_NAME}" >/dev/null 2>&1; then
+    step_fail "CAA IRSA role ${CAA_ROLE_NAME} not found. It is provisioned by org-admin's ./01-iam.sh on a
+  cluster-aware re-run AFTER ./02-snp-node-group.sh. Re-run ./01-iam.sh (org-admin) before this step."
 fi
 
 echo "Installing Cloud API Adaptor (chart ${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) into ${CAA_NAMESPACE}..."

@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "08" "R1 soak check (repeatable)"
+step_banner "08" "R1 soak check (repeatable)" "ops-admin"
 
 require_cmds aws kubectl jq curl
 require_aws_auth

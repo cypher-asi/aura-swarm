@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "11" "R2 convergence gate"
+step_banner "11" "R2 convergence gate" "ops-admin"
 
 require_cmds aws kubectl jq curl
 require_aws_auth

@@ -50,24 +50,37 @@ R3_DEFAULT_REF="master"
 #------------------------------------------------------------------------------
 
 STEP_ID=""
+# Responsible Identity Center user for this stage (separation of duties): either
+# "org-admin" (all IAM) or "ops-admin" (everything else). Set by step_banner's
+# optional 3rd arg and appended in brackets to every OK/FAILED line.
+STEP_OWNER=""
 
 step_banner() {
     STEP_ID="$1"
     local title="$2"
+    STEP_OWNER="${3:-}"
     echo "=============================================="
     echo "  Aura Swarm TEE Rollout - Step ${STEP_ID}"
     echo "  ${title}"
+    if [[ -n "${STEP_OWNER}" ]]; then
+        echo "  Run as: ${STEP_OWNER}"
+    fi
     echo "=============================================="
     echo ""
+}
+
+# Bracketed owner suffix (e.g. " [ops-admin]") or empty when no owner is set.
+_step_owner_tag() {
+    [[ -n "${STEP_OWNER}" ]] && printf ' [%s]' "${STEP_OWNER}"
 }
 
 step_ok() {
     local next="${1:-}"
     echo ""
     if [[ -n "${next}" ]]; then
-        echo -e "${GREEN}STEP ${STEP_ID} OK — proceed to ${next}${NC}"
+        echo -e "${GREEN}STEP ${STEP_ID} OK$(_step_owner_tag) — proceed to ${next}${NC}"
     else
-        echo -e "${GREEN}STEP ${STEP_ID} OK${NC}"
+        echo -e "${GREEN}STEP ${STEP_ID} OK$(_step_owner_tag)${NC}"
     fi
 }
 
@@ -75,7 +88,7 @@ step_ok() {
 # (e.g. failures inside render_k8s_manifests).
 step_fail() {
     echo "" >&2
-    echo -e "${RED}STEP ${STEP_ID} FAILED: $*${NC}" >&2
+    echo -e "${RED}STEP ${STEP_ID} FAILED$(_step_owner_tag): $*${NC}" >&2
     exit 1
 }
 
@@ -164,36 +177,46 @@ require_docker() {
 }
 
 #------------------------------------------------------------------------------
-# Deploy-operator IAM (step 01)
+# Separation-of-duties IAM (step 01, org-admin)
 #
-# This org logs in through IAM Identity Center (SSO): the deploy principal is an
+# This org logs in through IAM Identity Center (SSO): each deploy principal is an
 # AWSReservedSSO_* permission-set role. Such roles are NOT directly modifiable
 # (iam:AttachRolePolicy -> UnmodifiableEntity), and IAM groups only apply to IAM
-# users, so the only way to grant the deploy permissions is to attach the
-# customer-managed policy to the PERMISSION SET and re-provision it.
+# users, so the only way to grant the permissions is to attach the customer-
+# managed policy to the PERMISSION SET and re-provision it.
+#
+# org-admin (the sole IAM owner) provisions BOTH permission sets/policies and ALL
+# cluster service roles (EKS cluster, node, CAA IRSA) + the IRSA OIDC provider.
+# ops-admin's permission set grants no IAM-write — only a scoped iam:PassRole
+# + iam:Get*/List* on the cluster/node role ARNs.
 #------------------------------------------------------------------------------
 
-render_deploy_iam_policy_doc() {
-    local template="${DEPLOY_DIR}/iam/deploy-operator-policy.json"
+# Render a policy JSON template, substituting the deploy placeholders.
+render_iam_policy_doc() {
+    local template="$1"
     [[ -f "${template}" ]] || step_fail "missing IAM policy template: ${template}"
     sed \
         -e "s/__AWS_REGION__/${AWS_REGION}/g" \
         -e "s/__AWS_ACCOUNT_ID__/${AWS_ACCOUNT_ID}/g" \
         -e "s/__EKS_CLUSTER_NAME__/${EKS_CLUSTER_NAME}/g" \
         -e "s/__RESOURCE_PREFIX__/${RESOURCE_PREFIX}/g" \
-        -e "s/__DEPLOY_IAM_POLICY__/${DEPLOY_IAM_POLICY}/g" \
+        -e "s/__ORG_IAM_POLICY__/${ORG_IAM_POLICY}/g" \
+        -e "s/__OPS_IAM_POLICY__/${OPS_IAM_POLICY}/g" \
         -e "s/__TF_STATE_BUCKET__/${TF_STATE_BUCKET}/g" \
         < "${template}"
 }
 
-deploy_iam_policy_arn() {
-    echo "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${DEPLOY_IAM_POLICY}"
+iam_policy_arn() {
+    echo "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/$1"
 }
 
-ensure_deploy_iam_policy() {
+# ensure_iam_policy <policy_name> <template_file>
+# Idempotently create/update a customer-managed policy from a template.
+ensure_iam_policy() {
+    local policy_name="$1" template="$2"
     local doc policy_arn
-    doc=$(render_deploy_iam_policy_doc)
-    policy_arn=$(deploy_iam_policy_arn)
+    doc=$(render_iam_policy_doc "${template}")
+    policy_arn=$(iam_policy_arn "${policy_name}")
 
     if aws iam get-policy --policy-arn "${policy_arn}" >/dev/null 2>&1; then
         # Managed policies allow at most 5 versions; prune oldest non-default
@@ -214,16 +237,177 @@ ensure_deploy_iam_policy() {
             --policy-arn "${policy_arn}" \
             --policy-document "${doc}" \
             --set-as-default >/dev/null
-        echo -e "${GREEN}✓${NC} Updated IAM policy ${DEPLOY_IAM_POLICY}"
+        echo -e "${GREEN}✓${NC} Updated IAM policy ${policy_name}"
     else
         aws iam create-policy \
-            --policy-name "${DEPLOY_IAM_POLICY}" \
+            --policy-name "${policy_name}" \
             --policy-document "${doc}" \
             --description "Aura Swarm staged rollout permissions for ${RESOURCE_PREFIX}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
             >/dev/null
-        echo -e "${GREEN}✓${NC} Created IAM policy ${DEPLOY_IAM_POLICY}"
+        echo -e "${GREEN}✓${NC} Created IAM policy ${policy_name}"
     fi
+}
+
+#------------------------------------------------------------------------------
+# Cluster service roles + IRSA (the IAM that left terraform; org-admin owns it).
+#------------------------------------------------------------------------------
+
+# ensure_service_role <role_name> <service> <managed_policy_arn>...
+# Idempotent create-or-adopt of a service role with a static service trust and a
+# set of AWS-managed policy attachments. Static trust => safe to run pre-cluster.
+ensure_service_role() {
+    local role_name="$1" service="$2"; shift 2
+    local managed=("$@")
+    local trust
+    trust=$(printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"%s"},"Action":"sts:AssumeRole"}]}' "${service}")
+
+    if aws iam get-role --role-name "${role_name}" >/dev/null 2>&1; then
+        aws iam update-assume-role-policy --role-name "${role_name}" --policy-document "${trust}" >/dev/null
+        echo -e "${GREEN}✓${NC} IAM role ${role_name} present (trust refreshed)"
+    else
+        aws iam create-role --role-name "${role_name}" \
+            --assume-role-policy-document "${trust}" \
+            --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" >/dev/null
+        echo -e "${GREEN}✓${NC} Created IAM role ${role_name}"
+    fi
+    local arn
+    for arn in "${managed[@]}"; do
+        aws iam attach-role-policy --role-name "${role_name}" --policy-arn "${arn}" >/dev/null
+    done
+    echo -e "  ${GREEN}✓${NC} ${role_name}: ${#managed[@]} managed policy attachment(s) ensured"
+}
+
+# Create-or-adopt the EKS cluster + node service roles ops-admin's terraform
+# reads (data sources) and passes (scoped iam:PassRole). Runs pre-cluster.
+ensure_cluster_service_roles() {
+    ensure_service_role "${RESOURCE_PREFIX}-eks-cluster-role" "eks.amazonaws.com" \
+        "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy" \
+        "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
+    ensure_service_role "${RESOURCE_PREFIX}-eks-node-role" "ec2.amazonaws.com" \
+        "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy" \
+        "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy" \
+        "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly" \
+        "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# SHA1 thumbprint of the last cert in the OIDC issuer's TLS chain (closest to
+# the root CA). AWS ignores it for EKS issuers fronted by a known CA, but the
+# CreateOpenIDConnectProvider API still requires a valid-looking value.
+oidc_thumbprint() {
+    local host="${1%%/*}"
+    local chain
+    chain=$(echo | openssl s_client -servername "${host}" -showcerts -connect "${host}:443" 2>/dev/null)
+    [[ -n "${chain}" ]] || return 1
+    local last
+    last=$(printf '%s\n' "${chain}" | awk '
+        /-----BEGIN CERTIFICATE-----/ { buf=""; inblock=1 }
+        inblock { buf = buf $0 "\n" }
+        /-----END CERTIFICATE-----/ { last=buf; inblock=0 }
+        END { printf "%s", last }')
+    [[ -n "${last}" ]] || return 1
+    printf '%s' "${last}" | openssl x509 -fingerprint -sha1 -noout 2>/dev/null \
+        | sed 's/^.*=//; s/://g' | tr '[:upper:]' '[:lower:]'
+}
+
+# Cluster-aware: when the EKS cluster + OIDC issuer exist, create-or-update the
+# IAM OIDC provider and the Peer Pods / CAA IRSA role (+ inline pod-VM lifecycle
+# policy, incl. ec2:Describe*). When the cluster is not up yet, DEFER (not an
+# error): re-run ./01-iam.sh after ./02-snp-node-group.sh creates the cluster.
+# Returns 0 when provisioned, 2 when deferred.
+ensure_oidc_provider_and_caa_role() {
+    local issuer
+    issuer=$(aws eks describe-cluster --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}" \
+        --query 'cluster.identity.oidc.issuer' --output text 2>/dev/null || echo "")
+    if [[ -z "${issuer}" || "${issuer}" == "None" ]]; then
+        echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} not found yet — deferring OIDC provider + CAA IRSA role."
+        echo "  Re-run ./01-iam.sh (org-admin) AFTER ./02-snp-node-group.sh creates the cluster."
+        return 2
+    fi
+    local host="${issuer#https://}"
+    echo -e "${GREEN}✓${NC} Cluster OIDC issuer: ${issuer}"
+
+    local provider_arn
+    provider_arn=$(aws iam list-open-id-connect-providers --output json 2>/dev/null \
+        | jq -r --arg h "${host}" '[.OpenIDConnectProviderList[]?.Arn | select(test($h))][0] // empty')
+    if [[ -z "${provider_arn}" ]]; then
+        local thumbprint
+        thumbprint=$(oidc_thumbprint "${host}") && [[ -n "${thumbprint}" ]] \
+            || step_fail "could not compute the OIDC TLS thumbprint for ${host} (need openssl + network egress)"
+        provider_arn=$(aws iam create-open-id-connect-provider \
+            --url "${issuer}" \
+            --client-id-list "sts.amazonaws.com" \
+            --thumbprint-list "${thumbprint}" \
+            --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
+            --query 'OpenIDConnectProviderArn' --output text)
+        echo -e "${GREEN}✓${NC} Created IAM OIDC provider ${provider_arn}"
+    else
+        echo -e "${GREEN}✓${NC} IAM OIDC provider present (${provider_arn})"
+    fi
+
+    local role_name="${RESOURCE_PREFIX}-caa-role"
+    local trust
+    trust=$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "${provider_arn}" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${host}:aud": "sts.amazonaws.com",
+          "${host}:sub": "system:serviceaccount:confidential-containers-system:cloud-api-adaptor"
+        }
+      }
+    }
+  ]
+}
+JSON
+)
+    if aws iam get-role --role-name "${role_name}" >/dev/null 2>&1; then
+        aws iam update-assume-role-policy --role-name "${role_name}" --policy-document "${trust}" >/dev/null
+        echo -e "${GREEN}✓${NC} CAA IRSA role ${role_name} present (trust refreshed)"
+    else
+        aws iam create-role --role-name "${role_name}" \
+            --assume-role-policy-document "${trust}" \
+            --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" >/dev/null
+        echo -e "${GREEN}✓${NC} Created CAA IRSA role ${role_name}"
+    fi
+
+    # Inline pod-VM lifecycle policy. RunInstances/TerminateInstances act on
+    # ephemeral pod VMs (ids unknown ahead of time), so resource is "*"; CAA tags
+    # every pod VM and the smoke test asserts create + terminate. ec2:Describe*
+    # covers DescribeInstances/Images/InstanceTypes/Subnets/SecurityGroups/Vpcs/
+    # KeyPairs/LaunchTemplates without per-call whack-a-mole (all read-only,
+    # cannot be resource-scoped). This is the grant the daemonset was missing.
+    local caa_policy
+    caa_policy=$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PodVMLifecycle",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances", "ec2:TerminateInstances", "ec2:CreateTags", "ec2:Describe*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassPodVMInstanceRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${RESOURCE_PREFIX}-podvm-*"
+    }
+  ]
+}
+JSON
+)
+    aws iam put-role-policy --role-name "${role_name}" \
+        --policy-name "${RESOURCE_PREFIX}-caa-policy" \
+        --policy-document "${caa_policy}" >/dev/null
+    echo -e "${GREEN}✓${NC} CAA inline policy ensured (pod-VM lifecycle incl. ec2:Describe*)"
+    echo -e "  ${CYAN}CAA role ARN:${NC} arn:aws:iam::${AWS_ACCOUNT_ID}:role/${role_name}"
 }
 
 sso_instance_arn() {
@@ -258,13 +442,13 @@ find_permission_set_arn() {
 }
 
 print_sso_manual_guidance() {
-    local instance_arn="${1:-\$INSTANCE_ARN}" ps_arn="${2:-\$PS_ARN}"
-    echo -e "${YELLOW}ℹ${NC} Attach the deploy policy to the permission set with an account"
+    local policy="$1" instance_arn="${2:-\$INSTANCE_ARN}" ps_arn="${3:-\$PS_ARN}"
+    echo -e "${YELLOW}ℹ${NC} Attach ${policy} to the permission set with an account"
     echo "  that has IAM Identity Center admin (management or delegated-admin), then re-login:"
     echo ""
     echo "    aws sso-admin attach-customer-managed-policy-reference-to-permission-set \\"
     echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
-    echo "      --customer-managed-policy-reference Name=${DEPLOY_IAM_POLICY},Path=/"
+    echo "      --customer-managed-policy-reference Name=${policy},Path=/"
     echo "    aws sso-admin provision-permission-set \\"
     echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
     echo "      --target-type ALL_PROVISIONED_ACCOUNTS"
@@ -272,38 +456,40 @@ print_sso_manual_guidance() {
     echo "  Then refresh credentials (aws sso login, or paste fresh portal keys) and re-run."
 }
 
-# Attach the customer-managed deploy policy to the SSO permission set and
-# re-provision. Best-effort: prints manual guidance if sso-admin is unavailable.
-ensure_deploy_policy_on_permission_set() {
-    local instance_arn ps_arn name="${DEPLOY_SSO_PERMISSION_SET}"
+# ensure_policy_on_permission_set <policy_name> <permission_set_name>
+# Attach the customer-managed policy to the SSO permission set and re-provision.
+# Best-effort: prints manual guidance if sso-admin is unavailable.
+ensure_policy_on_permission_set() {
+    local policy="$1" name="$2"
+    local instance_arn ps_arn
 
     instance_arn=$(sso_instance_arn)
     if [[ -z "${instance_arn}" || "${instance_arn}" == "None" ]]; then
         echo -e "${YELLOW}⚠${NC} No IAM Identity Center instance visible from this account."
-        print_sso_manual_guidance
+        print_sso_manual_guidance "${policy}"
         return 0
     fi
     echo -e "${GREEN}✓${NC} Identity Center instance: ${instance_arn}"
 
     if ! ps_arn=$(find_permission_set_arn "${instance_arn}" "${name}") || [[ -z "${ps_arn}" ]]; then
         echo -e "${YELLOW}⚠${NC} Permission set '${name}' not found (need management/delegated-admin access)."
-        print_sso_manual_guidance
+        print_sso_manual_guidance "${policy}"
         return 0
     fi
     echo -e "${GREEN}✓${NC} Permission set: ${name} (${ps_arn})"
 
     if aws sso-admin list-customer-managed-policy-references-in-permission-set \
         --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" --output json 2>/dev/null \
-        | jq -e --arg n "${DEPLOY_IAM_POLICY}" \
+        | jq -e --arg n "${policy}" \
             '.CustomerManagedPolicyReferences[]? | select(.Name == $n)' >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Permission set ${name} already references ${DEPLOY_IAM_POLICY}"
+        echo -e "${GREEN}✓${NC} Permission set ${name} already references ${policy}"
     elif aws sso-admin attach-customer-managed-policy-reference-to-permission-set \
         --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" \
-        --customer-managed-policy-reference "Name=${DEPLOY_IAM_POLICY},Path=/" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Attached ${DEPLOY_IAM_POLICY} reference to permission set ${name}"
+        --customer-managed-policy-reference "Name=${policy},Path=/" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Attached ${policy} reference to permission set ${name}"
     else
         echo -e "${YELLOW}⚠${NC} Could not modify permission set (need sso-admin / delegated-admin)."
-        print_sso_manual_guidance "${instance_arn}" "${ps_arn}"
+        print_sso_manual_guidance "${policy}" "${instance_arn}" "${ps_arn}"
         return 0
     fi
 
@@ -316,29 +502,31 @@ ensure_deploy_policy_on_permission_set() {
     fi
 
     echo ""
-    echo -e "${YELLOW}ℹ${NC} Customer-managed policy '${DEPLOY_IAM_POLICY}' must exist (same name/path)"
+    echo -e "${YELLOW}ℹ${NC} Customer-managed policy '${policy}' must exist (same name/path)"
     echo "  in every account this permission set is assigned to."
-    echo "  Refresh credentials (aws sso login / fresh portal keys) before re-running terraform."
 }
 
-# Simulate the deploy permission-set ROLE (not the live session) for the action
-# that broke terraform: eks:DescribeUpdate. Non-fatal — purely informational.
-verify_deploy_iam_permissions() {
+# verify_sso_role_action <role_prefix> <action>...
+# Simulate the permission-set ROLE (not the live session) for one or more
+# actions. Non-fatal — purely informational.
+verify_sso_role_action() {
+    local prefix="$1"; shift
+    local actions=("$@")
     local role_arn result
     role_arn=$(aws iam list-roles --output json 2>/dev/null \
-        | jq -r --arg p "${DEPLOY_IAM_SSO_ROLE_PREFIX}" \
+        | jq -r --arg p "${prefix}" \
             '[.Roles[]? | select(.RoleName | startswith($p)) | .Arn][0] // empty')
 
     if [[ -z "${role_arn}" ]]; then
-        echo -e "${YELLOW}⚠${NC} Deploy role matching ${DEPLOY_IAM_SSO_ROLE_PREFIX} not provisioned in this account yet."
+        echo -e "${YELLOW}⚠${NC} Role matching ${prefix} not provisioned in this account yet."
         echo "  It appears after the permission set is provisioned + assigned; skipping simulation."
         return 0
     fi
 
-    echo "Simulating eks:DescribeUpdate / eks:ListUpdates for ${role_arn}..."
+    echo "Simulating ${actions[*]} for ${role_arn}..."
     result=$(aws iam simulate-principal-policy \
         --policy-source-arn "${role_arn}" \
-        --action-names eks:DescribeUpdate eks:ListUpdates \
+        --action-names "${actions[@]}" \
         --query 'EvaluationResults[?EvalDecision!=`allowed`].ActionName' \
         --output text 2>&1) || {
         echo -e "${YELLOW}⚠${NC} Could not simulate policy (need iam:SimulatePrincipalPolicy): ${result}"
@@ -346,10 +534,10 @@ verify_deploy_iam_permissions() {
     }
 
     if [[ -n "${result}" && "${result}" != "None" ]]; then
-        echo -e "${YELLOW}⚠${NC} Deploy role still missing: ${result}"
-        echo "  Provisioning may still be propagating, or you must re-login to pick it up."
+        echo -e "${YELLOW}⚠${NC} Role ${prefix} still missing: ${result}"
+        echo "  Provisioning may still be propagating, or the user must re-login to pick it up."
     else
-        echo -e "${GREEN}✓${NC} Deploy role can perform eks:DescribeUpdate (terraform polling fixed)"
+        echo -e "${GREEN}✓${NC} Role ${prefix} can perform: ${actions[*]}"
     fi
 }
 
@@ -453,7 +641,7 @@ apply_with_describeupdate_fallback() {
             echo -e "${GREEN}✓${NC} Node groups reached ACTIVE — the update applied despite the polling denial."
             echo -e "${YELLOW}ℹ${NC} terraform state may not have recorded this update's completion."
             echo "  A later terraform run reconciles once eks:DescribeUpdate is granted"
-            echo "  (attach ${DEPLOY_IAM_POLICY} to the ${DEPLOY_SSO_PERMISSION_SET:-deploy} permission set and"
+            echo "  (attach ${OPS_IAM_POLICY} to the ${OPS_SSO_PERMISSION_SET:-ops-admin} permission set and"
             echo "  clear any SCP denying eks:DescribeUpdate)."
             return 0
         fi
@@ -918,7 +1106,8 @@ agent_subnet_cidr   = "${AGENT_SUBNET_CIDR}"
 storage_subnet_cidr = "${STORAGE_SUBNET_CIDR}"
 
 # EKS configuration. Agents run as Peer Pods (off-cluster SEV-SNP pod VMs);
-# there is no on-node confidential pool, and the CAA IAM/SG are always created.
+# there is no on-node confidential pool. The CAA worker<->pod-VM SG rules are
+# always created; the CAA IRSA role is org-admin's (./01-iam.sh), not terraform.
 eks_version         = "${EKS_VERSION}"
 node_instance_type  = "${NODE_INSTANCE_TYPE}"
 node_desired_count  = ${NODE_DESIRED_COUNT}

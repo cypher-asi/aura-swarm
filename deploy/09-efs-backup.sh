@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "09" "EFS backup (R2 rollback point)"
+step_banner "09" "EFS backup (R2 rollback point)" "ops-admin"
 
 require_cmds aws terraform jq
 require_aws_auth

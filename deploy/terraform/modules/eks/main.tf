@@ -6,35 +6,15 @@
 #------------------------------------------------------------------------------
 
 #------------------------------------------------------------------------------
-# EKS Cluster IAM Role
+# EKS Cluster IAM Role (created out-of-band by org-admin's ./01-iam.sh)
+#
+# All IAM (role/policy creation + grants) is consolidated under the org-admin
+# step for separation of duties; ops-admin's terraform only READS the role
+# (iam:GetRole) and PASSES it (scoped iam:PassRole) when creating the cluster.
 #------------------------------------------------------------------------------
 
-data "aws_iam_policy_document" "eks_assume_role" {
-  statement {
-    effect = "Allow"
-    principals {
-      type        = "Service"
-      identifiers = ["eks.amazonaws.com"]
-    }
-    actions = ["sts:AssumeRole"]
-  }
-}
-
-resource "aws_iam_role" "cluster" {
-  name               = "${var.resource_prefix}-eks-cluster-role"
-  assume_role_policy = data.aws_iam_policy_document.eks_assume_role.json
-
-  tags = var.tags
-}
-
-resource "aws_iam_role_policy_attachment" "cluster_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  role       = aws_iam_role.cluster.name
-}
-
-resource "aws_iam_role_policy_attachment" "cluster_vpc_resource_controller" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
-  role       = aws_iam_role.cluster.name
+data "aws_iam_role" "cluster" {
+  name = "${var.resource_prefix}-eks-cluster-role"
 }
 
 #------------------------------------------------------------------------------
@@ -65,7 +45,7 @@ resource "aws_security_group" "cluster" {
 resource "aws_eks_cluster" "main" {
   name     = "${var.resource_prefix}-cluster"
   version  = var.eks_version
-  role_arn = aws_iam_role.cluster.arn
+  role_arn = data.aws_iam_role.cluster.arn
 
   vpc_config {
     subnet_ids              = concat(var.private_subnet_ids, var.agent_subnet_ids)
@@ -85,70 +65,20 @@ resource "aws_eks_cluster" "main" {
   tags = merge(var.tags, {
     Name = "${var.resource_prefix}-cluster"
   })
-
-  depends_on = [
-    aws_iam_role_policy_attachment.cluster_policy,
-    aws_iam_role_policy_attachment.cluster_vpc_resource_controller,
-  ]
 }
 
 #------------------------------------------------------------------------------
-# OIDC Provider for IRSA (IAM Roles for Service Accounts)
+# Node Group IAM Role (created out-of-band by org-admin's ./01-iam.sh)
+#
+# As with the cluster role, ops-admin's terraform only READS this role and
+# PASSES it when creating the managed node group. The OIDC provider and the
+# Peer Pods / CAA IRSA role also live in ./01-iam.sh (the CAA trust policy
+# references the cluster OIDC issuer, which only exists post-cluster, so it is
+# provisioned on a cluster-aware re-run of step 01 after this module applies).
 #------------------------------------------------------------------------------
 
-data "tls_certificate" "cluster" {
-  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
-}
-
-resource "aws_iam_openid_connect_provider" "cluster" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.cluster.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
-
-  tags = var.tags
-}
-
-#------------------------------------------------------------------------------
-# Node Group IAM Role
-#------------------------------------------------------------------------------
-
-data "aws_iam_policy_document" "node_assume_role" {
-  statement {
-    effect = "Allow"
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-    actions = ["sts:AssumeRole"]
-  }
-}
-
-resource "aws_iam_role" "node_group" {
-  name               = "${var.resource_prefix}-eks-node-role"
-  assume_role_policy = data.aws_iam_policy_document.node_assume_role.json
-
-  tags = var.tags
-}
-
-resource "aws_iam_role_policy_attachment" "node_worker_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.node_group.name
-}
-
-resource "aws_iam_role_policy_attachment" "node_cni_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.node_group.name
-}
-
-resource "aws_iam_role_policy_attachment" "node_ecr_read" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role       = aws_iam_role.node_group.name
-}
-
-# SSM for node management
-resource "aws_iam_role_policy_attachment" "node_ssm" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-  role       = aws_iam_role.node_group.name
+data "aws_iam_role" "node_group" {
+  name = "${var.resource_prefix}-eks-node-role"
 }
 
 #------------------------------------------------------------------------------
@@ -156,9 +86,6 @@ resource "aws_iam_role_policy_attachment" "node_ssm" {
 #------------------------------------------------------------------------------
 
 locals {
-  # OIDC issuer host (no scheme) for IRSA trust policies.
-  oidc_provider_url = replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
-
   # Worker <-> pod-VM ingress required by CAA: agent-protocol-forwarder (15150)
   # and vxlan (9000 tcp+udp). Ports are fixed by the CAA wire protocol and match
   # CAA_FORWARDER_PORT / CAA_VXLAN_PORT in config.env (consumed by the
@@ -275,7 +202,7 @@ resource "aws_security_group_rule" "cluster_to_nodes" {
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.resource_prefix}-node-group"
-  node_role_arn   = aws_iam_role.node_group.arn
+  node_role_arn   = data.aws_iam_role.node_group.arn
   subnet_ids      = var.agent_subnet_ids
 
   instance_types = [var.node_instance_type]
@@ -300,94 +227,6 @@ resource "aws_eks_node_group" "main" {
   tags = merge(var.tags, {
     Name = "${var.resource_prefix}-node-group"
   })
-
-  depends_on = [
-    aws_iam_role_policy_attachment.node_worker_policy,
-    aws_iam_role_policy_attachment.node_cni_policy,
-    aws_iam_role_policy_attachment.node_ecr_read,
-  ]
-}
-
-#------------------------------------------------------------------------------
-# Peer Pods / Cloud API Adaptor (CAA) IAM (IRSA)
-#
-# Dedicated IRSA role bound to the CAA service account
-# (cloud-api-adaptor / confidential-containers-system) via the cluster OIDC
-# provider. Grants CAA permission to create/terminate the per-agent AWS-managed
-# SEV-SNP "pod VM" EC2 instances. Peer Pods is the only confidential runtime,
-# so this is always created.
-#------------------------------------------------------------------------------
-
-data "aws_iam_policy_document" "caa_assume_role" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.cluster.arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "${local.oidc_provider_url}:sub"
-      values   = ["system:serviceaccount:confidential-containers-system:cloud-api-adaptor"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "${local.oidc_provider_url}:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "caa" {
-  name               = "${var.resource_prefix}-caa-role"
-  assume_role_policy = data.aws_iam_policy_document.caa_assume_role.json
-
-  tags = var.tags
-}
-
-data "aws_iam_policy_document" "caa" {
-  # Per-pod VM lifecycle + discovery. RunInstances/TerminateInstances act on
-  # ephemeral pod VMs whose ids are not known ahead of time, so resource is "*"
-  # (CAA tags every pod VM; the smoke test asserts create + terminate).
-  #
-  # The write actions are explicit. For reads, CAA calls a range of ec2:Describe*
-  # operations (DescribeInstances, DescribeImages, DescribeInstanceTypes,
-  # DescribeSubnets, DescribeSecurityGroups, DescribeVpcs, DescribeKeyPairs,
-  # DescribeLaunchTemplates, ...) — granting ec2:Describe* avoids per-call
-  # whack-a-mole. All ec2:Describe* are read-only and cannot be resource-scoped
-  # (they require "*"), so enumerating them individually buys no extra safety.
-  statement {
-    sid    = "PodVMLifecycle"
-    effect = "Allow"
-    actions = [
-      "ec2:RunInstances",
-      "ec2:TerminateInstances",
-      "ec2:CreateTags",
-      "ec2:Describe*",
-    ]
-    resources = ["*"]
-  }
-
-  # iam:PassRole is only needed if pod VMs are launched with an instance profile.
-  # Scoped as tightly as practical to the documented pod-VM instance-role name
-  # pattern (account wildcard since the account id is not available in-module).
-  # Tighten to the exact role ARN once a pod-VM instance role exists.
-  statement {
-    sid       = "PassPodVMInstanceRole"
-    effect    = "Allow"
-    actions   = ["iam:PassRole"]
-    resources = ["arn:aws:iam::*:role/${var.resource_prefix}-podvm-*"]
-  }
-}
-
-resource "aws_iam_role_policy" "caa" {
-  name   = "${var.resource_prefix}-caa-policy"
-  role   = aws_iam_role.caa.id
-  policy = data.aws_iam_policy_document.caa.json
 }
 
 #------------------------------------------------------------------------------

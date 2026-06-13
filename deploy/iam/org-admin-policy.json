@@ -1,0 +1,89 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ClusterNodeAndCaaRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PassRole",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/__RESOURCE_PREFIX__-*",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/service-role/*"
+      ]
+    },
+    {
+      "Sid": "IrsaOidcProvider",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider",
+        "iam:GetOpenIDConnectProvider",
+        "iam:AddClientIDToOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint"
+      ],
+      "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:oidc-provider/*"
+    },
+    {
+      "Sid": "ManageDeployPolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:TagPolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/__ORG_IAM_POLICY__",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/__OPS_IAM_POLICY__"
+      ]
+    },
+    {
+      "Sid": "IamReadAndSimulate",
+      "Effect": "Allow",
+      "Action": [
+        "iam:Get*",
+        "iam:List*",
+        "iam:SimulatePrincipalPolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentityCenterAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "sso-admin:*",
+        "identitystore:Describe*",
+        "identitystore:List*",
+        "organizations:ListAccounts",
+        "organizations:DescribeAccount",
+        "organizations:DescribeOrganization"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ClusterOidcDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "eks:DescribeCluster",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

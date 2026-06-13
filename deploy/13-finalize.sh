@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "13" "Finalize: fleet report + backup retention"
+step_banner "13" "Finalize: fleet report + backup retention" "ops-admin"
 
 require_cmds aws kubectl jq curl
 require_aws_auth

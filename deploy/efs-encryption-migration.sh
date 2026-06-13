@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "EFS" "EFS unencrypted -> encrypted migration (guided, conditional)"
+step_banner "EFS" "EFS unencrypted -> encrypted migration (guided, conditional)" "ops-admin"
 
 require_cmds aws terraform kubectl jq
 require_aws_auth

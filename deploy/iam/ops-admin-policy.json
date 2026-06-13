@@ -7,6 +7,8 @@
       "Action": [
         "eks:Describe*",
         "eks:List*",
+        "eks:CreateCluster",
+        "eks:DeleteCluster",
         "eks:CreateNodegroup",
         "eks:DeleteNodegroup",
         "eks:UpdateNodegroupConfig",
@@ -37,48 +39,34 @@
       "Resource": "*"
     },
     {
-      "Sid": "PeerPodsPodVMManagement",
+      "Sid": "ScopedPassClusterAndNodeRoles",
       "Effect": "Allow",
-      "Action": [
-        "ec2:RunInstances",
-        "ec2:TerminateInstances",
-        "ec2:DescribeInstances",
-        "ec2:CreateTags",
-        "ec2:DescribeImages",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DescribeVpcs"
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/__RESOURCE_PREFIX__-eks-cluster-role",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/__RESOURCE_PREFIX__-eks-node-role"
       ],
-      "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "__AWS_REGION__"
+          "iam:PassedToService": [
+            "eks.amazonaws.com",
+            "ec2.amazonaws.com"
+          ]
         }
       }
     },
     {
-      "Sid": "DeployClusterRolesAndOIDC",
+      "Sid": "ReadRolesForTerraformDataSources",
       "Effect": "Allow",
       "Action": [
-        "iam:Get*",
-        "iam:List*",
-        "iam:CreateRole",
-        "iam:DeleteRole",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy",
-        "iam:UpdateAssumeRolePolicy",
-        "iam:PassRole",
-        "iam:TagRole",
-        "iam:UntagRole",
-        "iam:CreateOpenIDConnectProvider",
-        "iam:DeleteOpenIDConnectProvider",
-        "iam:TagOpenIDConnectProvider"
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:GetOpenIDConnectProvider",
+        "iam:ListOpenIDConnectProviders"
       ],
-      "Resource": [
-        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/__RESOURCE_PREFIX__-*",
-        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/service-role/*",
-        "arn:aws:iam::__AWS_ACCOUNT_ID__:oidc-provider/*"
-      ]
+      "Resource": "*"
     },
     {
       "Sid": "TerraformState",

@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "05" "Peer Pods (kata-remote) attestation smoke test"
+step_banner "05" "Peer Pods (kata-remote) attestation smoke test" "ops-admin"
 
 require_cmds aws kubectl jq openssl
 require_aws_auth

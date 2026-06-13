@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "04" "Trustee KBS + admin keypair + service secrets"
+step_banner "04" "Trustee KBS + admin keypair + service secrets" "ops-admin"
 
 require_cmds aws kubectl jq openssl curl
 require_aws_auth

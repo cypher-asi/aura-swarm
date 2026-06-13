@@ -28,24 +28,22 @@ output "cluster_version" {
   value       = aws_eks_cluster.main.version
 }
 
-output "oidc_provider_arn" {
-  description = "ARN of the OIDC provider for IRSA"
-  value       = aws_iam_openid_connect_provider.cluster.arn
-}
-
-output "oidc_provider_url" {
-  description = "URL of the OIDC provider (without https://)"
+# The cluster OIDC issuer is still exposed so org-admin's ./01-iam.sh can build
+# the IAM OIDC provider + CAA IRSA trust on a cluster-aware re-run. The IAM
+# OIDC provider resource itself is created out-of-band (not by this module).
+output "oidc_issuer_url" {
+  description = "Cluster OIDC issuer URL (without https://) for the out-of-band IRSA provider/role"
   value       = replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
 }
 
 output "node_group_role_arn" {
-  description = "ARN of the EKS node group IAM role"
-  value       = aws_iam_role.node_group.arn
+  description = "ARN of the EKS node group IAM role (managed by org-admin's ./01-iam.sh)"
+  value       = data.aws_iam_role.node_group.arn
 }
 
 output "node_group_role_name" {
-  description = "Name of the EKS node group IAM role"
-  value       = aws_iam_role.node_group.name
+  description = "Name of the EKS node group IAM role (managed by org-admin's ./01-iam.sh)"
+  value       = data.aws_iam_role.node_group.name
 }
 
 output "node_security_group_id" {
@@ -54,11 +52,6 @@ output "node_security_group_id" {
 }
 
 output "cluster_role_arn" {
-  description = "ARN of the EKS cluster IAM role"
-  value       = aws_iam_role.cluster.arn
-}
-
-output "caa_role_arn" {
-  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role"
-  value       = aws_iam_role.caa.arn
+  description = "ARN of the EKS cluster IAM role (managed by org-admin's ./01-iam.sh)"
+  value       = data.aws_iam_role.cluster.arn
 }

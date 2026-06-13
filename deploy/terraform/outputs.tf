@@ -80,14 +80,9 @@ output "eks_cluster_security_group_id" {
   value       = var.enable_eks && var.enable_network ? module.eks[0].cluster_security_group_id : null
 }
 
-output "eks_oidc_provider_arn" {
-  description = "ARN of the OIDC provider for IRSA"
-  value       = var.enable_eks && var.enable_network ? module.eks[0].oidc_provider_arn : null
-}
-
-output "eks_oidc_provider_url" {
-  description = "URL of the OIDC provider"
-  value       = var.enable_eks && var.enable_network ? module.eks[0].oidc_provider_url : null
+output "eks_oidc_issuer_url" {
+  description = "Cluster OIDC issuer URL (consumed by org-admin's ./01-iam.sh to build the IRSA provider + CAA role)"
+  value       = var.enable_eks && var.enable_network ? module.eks[0].oidc_issuer_url : null
 }
 
 output "eks_node_group_role_arn" {
@@ -98,11 +93,6 @@ output "eks_node_group_role_arn" {
 output "node_security_group_id" {
   description = "Security group ID attached to worker nodes (Phase 4 scopes pod-VM <-> worker rules to this SG)"
   value       = var.enable_eks && var.enable_network ? module.eks[0].node_security_group_id : null
-}
-
-output "caa_role_arn" {
-  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role (empty string when the EKS/network modules are disabled)"
-  value       = var.enable_eks && var.enable_network ? module.eks[0].caa_role_arn : ""
 }
 
 output "eks_update_kubeconfig_command" {
