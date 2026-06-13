@@ -82,6 +82,37 @@ fi
 echo -e "${GREEN}✓${NC} EFS hazard check passed (plan does not replace the filesystem)"
 
 #------------------------------------------------------------------------------
+# IAM-left-terraform guard. All IAM now lives in org-admin's ./01-iam.sh, but
+# clusters provisioned before that refactor still TRACK the cluster/node/CAA
+# roles + OIDC provider in terraform state. With those resources gone from the
+# config, terraform plans to DESTROY them — which would delete live IAM the
+# cluster depends on. Abort and tell the operator to `terraform state rm` them
+# (state-only; no AWS deletion) before applying.
+#------------------------------------------------------------------------------
+if plan_destroys_external_iam "${PLAN_FILE}"; then
+    echo ""
+    echo -e "${RED}================================================================${NC}"
+    echo -e "${RED}  ABORT: this plan would DESTROY IAM now owned by ./01-iam.sh${NC}"
+    echo -e "${RED}================================================================${NC}"
+    echo ""
+    echo "IAM (cluster/node/CAA roles + the IRSA OIDC provider) moved out of"
+    echo "terraform into ./01-iam.sh (org-admin). terraform state still tracks the"
+    echo "old resources, so applying would DELETE the live roles/provider the"
+    echo "cluster (and the CAA daemonset) depend on."
+    echo ""
+    echo "Make terraform FORGET them (state-only — nothing is deleted in AWS), then"
+    echo "re-run this script:"
+    echo ""
+    echo "    cd \"${SCRIPT_DIR}/terraform\""
+    while IFS= read -r addr; do
+        [[ -n "${addr}" ]] && echo "    terraform state rm '${addr}'"
+    done < <(plan_external_iam_addresses "${PLAN_FILE}")
+    echo ""
+    step_fail "terraform plan would destroy IAM now managed by ./01-iam.sh; 'terraform state rm' those resources first (commands above)"
+fi
+echo -e "${GREEN}✓${NC} IAM hazard check passed (plan does not destroy ./01-iam.sh-owned roles/OIDC)"
+
+#------------------------------------------------------------------------------
 # eks:DescribeUpdate heads-up. terraform polls this action while waiting on a
 # node-group update; if it is denied (identity policy or SCP), the apply below
 # transparently falls back to DescribeNodegroup convergence.

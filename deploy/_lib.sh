@@ -1206,6 +1206,39 @@ tf_output() {
         | jq -r --arg key "$1" '.[$key].value // empty'
 }
 
+# Detects the "IAM left terraform" hazard: returns 0 (true) when the plan would
+# DESTROY any IAM role / role-policy / attachment / OIDC provider. Those moved to
+# org-admin's ./01-iam.sh, so a destroy here means terraform STATE still tracks
+# them and must be `terraform state rm`'d first — applying would delete live IAM
+# (the cluster/node service roles, the CAA role, the IRSA OIDC provider) that the
+# running cluster depends on.
+plan_destroys_external_iam() {
+    local plan_file="$1" n
+    n=$(terraform show -json "${plan_file}" 2>/dev/null | jq '
+        [.resource_changes[]?
+         | select(.type == "aws_iam_role"
+               or .type == "aws_iam_role_policy"
+               or .type == "aws_iam_role_policy_attachment"
+               or .type == "aws_iam_openid_connect_provider")
+         | select((.change.actions | index("delete")))
+        ] | length')
+    [[ "${n:-0}" -gt 0 ]]
+}
+
+# Echo the `terraform state rm` addresses for every IAM resource the plan would
+# destroy (one per line) — used to print exact remediation in the step 02 guard.
+plan_external_iam_addresses() {
+    local plan_file="$1"
+    terraform show -json "${plan_file}" 2>/dev/null | jq -r '
+        .resource_changes[]?
+        | select(.type == "aws_iam_role"
+              or .type == "aws_iam_role_policy"
+              or .type == "aws_iam_role_policy_attachment"
+              or .type == "aws_iam_openid_connect_provider")
+        | select((.change.actions | index("delete")))
+        | .address'
+}
+
 #------------------------------------------------------------------------------
 # Image build + push at a git ref (mechanics from legacy 07-build-images.sh,
 # re-targeted at an arbitrary ref via a throwaway git worktree)
