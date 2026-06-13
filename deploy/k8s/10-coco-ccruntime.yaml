@@ -1,7 +1,7 @@
 # Confidential Containers (CoCo) runtime install for SNP nodes
 #
 # Prerequisite: the CoCo operator must be installed first (done by
-# ./02-coco-operator.sh):
+# ./03-coco-operator.sh):
 #
 #   kubectl apply -k "github.com/confidential-containers/operator/config/default?ref=v0.17.0"
 #
@@ -38,9 +38,12 @@ spec:
       effect: NoSchedule
   config:
     installType: bundle
-    # "stable" matches the operator v0.17.0 default sample. TODO: pin to the
-    # exact kata-containers release validated on the SNP pool before R2.
-    payloadImage: quay.io/kata-containers/kata-deploy:stable
+    # Pinned to the exact image the CoCo operator v0.17.0 release was built and
+    # validated with (operator commit e1765cf). The mutable "stable"/"latest"
+    # tags on quay are mistagged (kata-containers#10261) and ship mismatched
+    # artifacts, which fails the install with:
+    #   cp: can't create '/opt/kata/VERSION': No such file or directory
+    payloadImage: quay.io/kata-containers/kata-deploy:3.23.0
     installDoneLabel:
       katacontainers.io/kata-runtime: "true"
     uninstallDoneLabel:
@@ -77,7 +80,8 @@ spec:
     # RuntimeClass objects are managed in 09-runtime-class.yaml
     runtimeClasses: []
     preInstall:
-      image: quay.io/confidential-containers/reqs-payload
+      # Pinned to the operator v0.17.0 release reference (matches kata-deploy:3.23.0).
+      image: quay.io/confidential-containers/reqs-payload:6fa876bea238c4ba08af0f9b1a696f28c834e84f
       volumeMounts:
         - mountPath: /opt/confidential-containers/
           name: confidential-containers-artifacts
@@ -111,7 +115,7 @@ spec:
             type: ""
           name: containerd-nydus
     postUninstall:
-      image: quay.io/confidential-containers/reqs-payload
+      image: quay.io/confidential-containers/reqs-payload:6fa876bea238c4ba08af0f9b1a696f28c834e84f
       volumeMounts:
         - mountPath: /opt/confidential-containers/
           name: confidential-containers-artifacts
@@ -156,8 +160,13 @@ spec:
         value: "false"
       - name: "INSTALL_COCO_CONTAINERD"
         value: "false"
+      # EKS nodes already run a modern, CoCo-compatible containerd (1.7.x).
+      # Setting this to "true" SWAPS the containerd binary and restarts it,
+      # which drops the running pre-install pod's shim and strands it as
+      # STATUS=Unknown — the operator then loops recreating it forever.
+      # Keep the node's existing containerd; kata-deploy only adds its config.
       - name: "INSTALL_OFFICIAL_CONTAINERD"
-        value: "true"
+        value: "false"
       - name: "INSTALL_VFIO_GPU_CONTAINERD"
         value: "false"
       - name: "INSTALL_NYDUS_SNAPSHOTTER"

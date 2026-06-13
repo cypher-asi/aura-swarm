@@ -15,6 +15,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
+use crate::types::ConfidentialRuntime;
 use crate::SchedulerConfig;
 
 /// The container port for the Aura runtime HTTP server.
@@ -145,18 +146,27 @@ fn build_pod_spec(
 ) -> PodSpec {
     // Use agent's isolation level if specified, otherwise use scheduler default
     let isolation = spec.isolation.unwrap_or(config.default_isolation);
-    // runtime_class() returns None for standard containers (uses default runtime)
-    let runtime_class_name = isolation.runtime_class().map(String::from);
-
-    // SNP scheduling constraints apply only to confidential agents;
-    // container (dev-mode) pods get no selector/toleration.
     let confidential = isolation == IsolationLevel::ConfidentialVM;
-    let node_selector = confidential.then(|| {
+    // Confidential pods get the configured confidential runtime class
+    // (`kata-qemu-snp` for snp_local, `kata-remote` for peer_pods, or an
+    // explicit override). Container (dev-mode) pods get the default runtime.
+    let runtime_class_name =
+        confidential.then(|| config.confidential_runtime_class.clone());
+
+    // SNP scheduling constraints (node selector + toleration) only apply to
+    // on-node `snp_local` confidential pods, which must land on the tainted
+    // SEV-SNP metal pool. In `peer_pods` mode the workload runs off-cluster
+    // in an AWS pod VM and the shim runs on an ordinary worker, so the pod
+    // must carry neither (there is no metal pool to land on). Container
+    // (dev-mode) pods never get them.
+    let attach_snp_scheduling =
+        confidential && config.confidential_runtime == ConfidentialRuntime::SnpLocal;
+    let node_selector = attach_snp_scheduling.then(|| {
         let mut selector = BTreeMap::new();
         selector.insert(CONFIDENTIAL_NODE_KEY.to_string(), "true".to_string());
         selector
     });
-    let tolerations = confidential.then(|| {
+    let tolerations = attach_snp_scheduling.then(|| {
         vec![Toleration {
             key: Some(CONFIDENTIAL_NODE_KEY.to_string()),
             operator: Some("Equal".to_string()),
@@ -784,6 +794,70 @@ mod tests {
         // Base env vars are still all present
         assert!(env.iter().any(|e| e.name == "AGENT_ID"));
         assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
+    }
+
+    /// A scheduler config in `peer_pods` mode (CAA `kata-remote`).
+    fn peer_pods_config() -> SchedulerConfig {
+        SchedulerConfig {
+            confidential_runtime: ConfidentialRuntime::PeerPods,
+            confidential_runtime_class: "kata-remote".to_string(),
+            ..SchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn peer_pods_confidential_pod_uses_kata_remote_without_snp_scheduling() {
+        let agent_id = test_agent_id();
+        let key_id = format!("swarm/agents/{agent_id}/state-key");
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            storage_encryption: StorageEncryption::Sealed {
+                key_id: key_id.clone(),
+            },
+            ..test_spec(&agent_id)
+        };
+        let config = peer_pods_config();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        // Runtime class is the CAA remote class, not on-node SNP.
+        assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("kata-remote"));
+
+        // The SNP node selector + toleration must be dropped: a peer pod
+        // runs off-cluster, the shim lands on an ordinary worker.
+        assert!(
+            pod_spec.node_selector.is_none(),
+            "peer-pod confidential pods must not carry the SNP node selector"
+        );
+        assert!(
+            pod_spec.tolerations.is_none(),
+            "peer-pod confidential pods must not carry the SNP toleration"
+        );
+
+        // Root-in-guest security context is preserved (the guest is still
+        // the boundary, only the VM's location moves).
+        let pod_sec = pod_spec.security_context.as_ref().unwrap();
+        assert_eq!(pod_sec.run_as_non_root, Some(false));
+        assert_eq!(pod_sec.run_as_user, Some(0));
+        let container_sec = pod_spec.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(container_sec.run_as_user, Some(0));
+        assert_eq!(container_sec.allow_privilege_escalation, Some(true));
+
+        // KBS/CDH env wiring is unchanged: attestation still runs via the
+        // CDH inside the pod VM.
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.as_deref())
+        };
+        assert_eq!(
+            get("AURA_KBS_URL"),
+            Some("http://kbs.swarm-system.svc.cluster.local:8080")
+        );
+        assert_eq!(get("AURA_STATE_ENCRYPTION"), Some("sealed"));
+        assert_eq!(get("AURA_STATE_KEY_ID"), Some(key_id.as_str()));
     }
 
     #[test]

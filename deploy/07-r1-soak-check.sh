@@ -1,5 +1,5 @@
 #!/bin/bash
-# 06-r1-soak-check.sh - Repeatable R1 soak verification. Run this as often as
+# 07-r1-soak-check.sh - Repeatable R1 soak verification. Run this as often as
 # you like during the R1 prod soak window; it is READ-ONLY against production
 # agents and mutates only the throwaway test agent it creates (and destroys).
 #
@@ -15,9 +15,9 @@
 #   logs-api          live log tail returns entries
 #
 # Usage:
-#   ./06-r1-soak-check.sh                  # full run (creates + destroys test agent)
-#   ./06-r1-soak-check.sh --agent-id ID    # reuse an existing designated test agent
-#   ./06-r1-soak-check.sh --keep-agent     # leave the test agent running for the
+#   ./07-r1-soak-check.sh                  # full run (creates + destroys test agent)
+#   ./07-r1-soak-check.sh --agent-id ID    # reuse an existing designated test agent
+#   ./07-r1-soak-check.sh --keep-agent     # leave the test agent running for the
 #                                          # soak window (reuse with --agent-id)
 #
 # Requires an owner JWT in SMOKE_TEST_TOKEN (env) or .secrets/SMOKE_TEST_TOKEN.
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "06" "R1 soak check (repeatable)"
+step_banner "07" "R1 soak check (repeatable)"
 
 require_cmds aws kubectl jq curl
 require_aws_auth
@@ -343,11 +343,11 @@ echo ""
 
 if [[ "${KEEP_AGENT}" == "true" && -n "${TEST_AGENT_ID}" ]]; then
     echo "Test agent kept for the soak window: ${TEST_AGENT_ID}"
-    echo "Re-run with: ./06-r1-soak-check.sh --agent-id ${TEST_AGENT_ID}"
+    echo "Re-run with: ./07-r1-soak-check.sh --agent-id ${TEST_AGENT_ID}"
     echo ""
 fi
 
 if [[ ${FAILS} -gt 0 ]]; then
     step_fail "${FAILS} soak check(s) failed"
 fi
-step_ok "07 (./07-efs-backup.sh) once the soak window is over — or re-run 06 during the soak"
+step_ok "08 (./08-efs-backup.sh) once the soak window is over — or re-run 07 during the soak"

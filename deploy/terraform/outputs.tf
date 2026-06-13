@@ -95,6 +95,16 @@ output "eks_node_group_role_arn" {
   value       = var.enable_eks && var.enable_network ? module.eks[0].node_group_role_arn : null
 }
 
+output "node_security_group_id" {
+  description = "Security group ID attached to worker nodes (Phase 4 scopes pod-VM <-> worker rules to this SG)"
+  value       = var.enable_eks && var.enable_network ? module.eks[0].node_security_group_id : null
+}
+
+output "caa_role_arn" {
+  description = "ARN of the Peer Pods / Cloud API Adaptor IRSA role (empty string when enable_caa=false)"
+  value       = var.enable_eks && var.enable_network ? module.eks[0].caa_role_arn : ""
+}
+
 output "eks_update_kubeconfig_command" {
   description = "Command to update kubeconfig"
   value       = var.enable_eks && var.enable_network ? "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks[0].cluster_name}" : null
@@ -121,12 +131,12 @@ output "ecr_repository_arns" {
 output "deployment_summary" {
   description = "Summary of deployed resources"
   value = {
-    project         = var.project_name
-    environment     = var.environment
-    region          = var.aws_region
-    vpc_id          = var.enable_network ? module.network[0].vpc_id : null
-    eks_cluster     = var.enable_eks && var.enable_network ? module.eks[0].cluster_name : null
-    efs_id          = var.enable_storage && var.enable_network ? module.storage[0].filesystem_id : null
-    ecr_repos       = var.enable_ecr ? keys(module.ecr[0].repository_urls) : []
+    project     = var.project_name
+    environment = var.environment
+    region      = var.aws_region
+    vpc_id      = var.enable_network ? module.network[0].vpc_id : null
+    eks_cluster = var.enable_eks && var.enable_network ? module.eks[0].cluster_name : null
+    efs_id      = var.enable_storage && var.enable_network ? module.storage[0].filesystem_id : null
+    ecr_repos   = var.enable_ecr ? keys(module.ecr[0].repository_urls) : []
   }
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
-# 08-deploy-r2-migrate.sh - Deploy the R2 (migration) ref and run the fleet
+# 09-deploy-r2-migrate.sh - Deploy the R2 (migration) ref and run the fleet
 # migration:
-#   1. refuse to run without the step-07 EFS rollback point
+#   1. refuse to run without the step-08 EFS rollback point
 #   2. build + deploy gateway/control/scheduler at the R2 ref; the gateway
 #      runs the v1 -> v2 store migration + KBS DEK backfill at startup
 #   3. verify schema_version=2 via /internal/health
@@ -10,12 +10,12 @@
 #      pod remains on kata-fc
 #
 # Hibernating/stopped agents migrate on their next wake/start — final
-# convergence is gated by ./09-r2-convergence.sh.
+# convergence is gated by ./10-r2-convergence.sh.
 #
 # Usage:
-#   ./08-deploy-r2-migrate.sh                  # deploys SWARM_R2_REF (default af9e034)
-#   ./08-deploy-r2-migrate.sh --ref <git-ref>
-#   ./08-deploy-r2-migrate.sh --skip-backup-check   # NOT recommended
+#   ./09-deploy-r2-migrate.sh                  # deploys SWARM_R2_REF (default af9e034)
+#   ./09-deploy-r2-migrate.sh --ref <git-ref>
+#   ./09-deploy-r2-migrate.sh --skip-backup-check   # NOT recommended
 
 set -euo pipefail
 
@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "08" "Deploy R2 (migration) at ref ${REF}"
+step_banner "09" "Deploy R2 (migration) at ref ${REF}"
 
 require_cmds aws kubectl jq curl docker git openssl
 require_aws_auth
@@ -46,7 +46,7 @@ trap gw_stop_port_forward EXIT
 
 if [[ "${SKIP_BACKUP_CHECK}" != "true" ]]; then
     [[ -f "${EFS_BACKUP_STATE_FILE}" ]] \
-        || step_fail "no EFS rollback point found (${EFS_BACKUP_STATE_FILE}) — run ./07-efs-backup.sh first"
+        || step_fail "no EFS rollback point found (${EFS_BACKUP_STATE_FILE}) — run ./08-efs-backup.sh first"
     # shellcheck disable=SC1090
     source <(tr -d '\r' < "${EFS_BACKUP_STATE_FILE}")
     RP_STATUS=$(aws backup describe-recovery-point \
@@ -54,7 +54,7 @@ if [[ "${SKIP_BACKUP_CHECK}" != "true" ]]; then
         --recovery-point-arn "${EFS_BACKUP_RECOVERY_POINT_ARN}" \
         --query 'Status' --output text 2>/dev/null || echo "MISSING")
     [[ "${RP_STATUS}" == "COMPLETED" ]] \
-        || step_fail "EFS rollback recovery point is ${RP_STATUS}, expected COMPLETED — re-run ./07-efs-backup.sh"
+        || step_fail "EFS rollback recovery point is ${RP_STATUS}, expected COMPLETED — re-run ./08-efs-backup.sh"
     echo -e "${GREEN}✓${NC} Rollback point verified: ${EFS_BACKUP_RECOVERY_POINT_ARN} (taken ${EFS_BACKUP_TAKEN_AT})"
     echo ""
 fi
@@ -141,6 +141,6 @@ fi
 echo -e "${GREEN}✓${NC} No running pod remains on kata-fc"
 echo ""
 echo "Note: hibernating/stopped agents migrate on their next wake/start; the"
-echo "convergence gate (step 09) checks records, not just running pods."
+echo "convergence gate (step 10) checks records, not just running pods."
 
-step_ok "09 (./09-r2-convergence.sh)"
+step_ok "10 (./10-r2-convergence.sh)"

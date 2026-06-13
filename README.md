@@ -129,7 +129,7 @@ aura-swarm/
 
 Container images are built with multi-stage Dockerfiles under `docker/`. Production targets AWS EKS with two node pools: an untainted system pool (gateway, scheduler, Trustee KBS) and a tainted **SEV-SNP bare-metal pool** (default `m6a.metal`, labeled `swarm.io/confidential-node=true`) where the Confidential Containers operator installs the `kata-qemu-snp` runtime for agent pods. EFS encryption is mandatory.
 
-The `deploy/` directory contains Terraform modules plus a numbered shell-script sequence (00–11) implementing the staged TEE rollout — preflight, SNP node group, CoCo operator, Trustee KBS (with admin keypair generation), attestation smoke test, R1 deploy + soak, EFS backup, R2 migration + convergence gate, R3 cleanup, and finalize — each step verifying itself before handing off. See [deploy/README.md](deploy/README.md) for the step table and soak guidance; the pre-TEE-rollout scripts are kept in `deploy/legacy/`.
+The `deploy/` directory contains Terraform modules plus a numbered shell-script sequence (00–12) implementing the staged TEE rollout — preflight, deploy-operator IAM, SNP node group, CoCo operator, Trustee KBS (with admin keypair generation), attestation smoke test, R1 deploy + soak, EFS backup, R2 migration + convergence gate, R3 cleanup, and finalize — each step verifying itself before handing off. See [deploy/README.md](deploy/README.md) for the step table and soak guidance; the pre-TEE-rollout scripts are kept in `deploy/legacy/`.
 
 ## License
 

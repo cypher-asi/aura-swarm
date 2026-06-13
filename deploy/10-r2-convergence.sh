@@ -1,5 +1,5 @@
 #!/bin/bash
-# 09-r2-convergence.sh - R2 convergence GATE. Refuses to pass unless the
+# 10-r2-convergence.sh - R2 convergence GATE. Refuses to pass unless the
 # fleet has fully converged on the new architecture:
 #   - gateway reports store schema_version=2
 #   - every agent record carries a tier + sealed storage (billing sku source)
@@ -10,8 +10,8 @@
 # Safe to run repeatedly while stragglers (hibernating agents) wake/migrate.
 #
 # Usage:
-#   ./09-r2-convergence.sh
-#   R2_SPOT_CHECK_COUNT=5 ./09-r2-convergence.sh
+#   ./10-r2-convergence.sh
+#   R2_SPOT_CHECK_COUNT=5 ./10-r2-convergence.sh
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "09" "R2 convergence gate"
+step_banner "10" "R2 convergence gate"
 
 require_cmds aws kubectl jq curl
 require_aws_auth
@@ -78,16 +78,18 @@ gate "${RES}" \
 
 PODS_JSON=$(mktemp)
 snapshot_agent_pods "${PODS_JSON}"
-POD_TOTAL=$(jq 'length' "${PODS_JSON}")
-KATA_FC=$(jq '[.[] | select(.runtime_class == "kata-fc")] | length' "${PODS_JSON}")
-NON_SNP=$(jq '[.[] | select(.runtime_class != "kata-qemu-snp")] | length' "${PODS_JSON}")
+# Running pods only: a terminal/Pending kata-fc pod is not a workload running
+# under the wrong isolation, and must not falsely fail (or pass) the gate.
+POD_TOTAL=$(jq '[.[] | select(.phase == "Running")] | length' "${PODS_JSON}")
+KATA_FC=$(jq '[.[] | select(.runtime_class == "kata-fc" and .phase == "Running")] | length' "${PODS_JSON}")
+NON_SNP=$(jq '[.[] | select(.phase == "Running" and .runtime_class != "kata-qemu-snp")] | length' "${PODS_JSON}")
 
 [[ "${KATA_FC}" == "0" ]] && RES=0 || RES=1
 gate "${RES}" \
     "Zero pods on kata-fc" \
     "${KATA_FC} pod(s) still on kata-fc:"
 if [[ "${KATA_FC}" != "0" ]]; then
-    jq -r '.[] | select(.runtime_class == "kata-fc") | "    \(.agent_id)  \(.pod_name)"' "${PODS_JSON}"
+    jq -r '.[] | select(.runtime_class == "kata-fc" and .phase == "Running") | "    \(.agent_id)  \(.pod_name)"' "${PODS_JSON}"
 fi
 
 [[ "${NON_SNP}" == "0" ]] && RES=0 || RES=1
@@ -133,4 +135,4 @@ fi
 if [[ ${FAILURES} -gt 0 ]]; then
     step_fail "${FAILURES} convergence check(s) failed — wake/migrate the stragglers and re-run this gate"
 fi
-step_ok "10 (./10-deploy-r3-cleanup.sh)"
+step_ok "11 (./11-deploy-r3-cleanup.sh)"

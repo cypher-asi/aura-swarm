@@ -1,6 +1,6 @@
 #!/bin/bash
-# 01b-efs-encryption-migration.sh - Guided migration from an UNENCRYPTED EFS
-# filesystem to a new ENCRYPTED one. Only needed when ./01-snp-node-group.sh
+# 02b-efs-encryption-migration.sh - Guided migration from an UNENCRYPTED EFS
+# filesystem to a new ENCRYPTED one. Only needed when ./02-snp-node-group.sh
 # aborted with the EFS replacement hazard.
 #
 # Encryption cannot be enabled on an existing EFS filesystem, so this script
@@ -14,12 +14,12 @@
 #   G. repoint terraform state (state rm old + import new), verify the plan
 #      no longer replaces anything
 #
-# Afterwards: re-run ./01-snp-node-group.sh (applies access-point/backup-policy
+# Afterwards: re-run ./02-snp-node-group.sh (applies access-point/backup-policy
 # stragglers and the SNP node group), then continue the sequence. Platform
-# deployments are scaled back up by the next deploy step (05) — or manually
+# deployments are scaled back up by the next deploy step (06) — or manually
 # with the commands printed at the end.
 #
-# Usage: ./01b-efs-encryption-migration.sh
+# Usage: ./02b-efs-encryption-migration.sh
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
-step_banner "01b" "EFS unencrypted -> encrypted migration (guided)"
+step_banner "02b" "EFS unencrypted -> encrypted migration (guided)"
 
 require_cmds aws terraform kubectl jq
 require_aws_auth
@@ -64,7 +64,7 @@ OLD_THROUGHPUT=$(echo "${OLD_FS_JSON}" | jq -r '.ThroughputMode')
 echo "  Current filesystem: ${OLD_FS_ID} (encrypted=${OLD_ENCRYPTED})"
 if [[ "${OLD_ENCRYPTED}" == "true" ]]; then
     echo -e "${GREEN}✓${NC} The live filesystem is already encrypted — no migration needed."
-    step_ok "01 (re-run ./01-snp-node-group.sh)"
+    step_ok "02 (re-run ./02-snp-node-group.sh)"
     exit 0
 fi
 
@@ -103,6 +103,7 @@ echo -e "${GREEN}✓${NC} New encrypted filesystem: ${NEW_FS_ID}"
 # Mirror the old filesystem's mount targets (subnet + security groups).
 echo "  Ensuring mount targets..."
 NEW_MT_IDS=()
+declare -A NEW_MT_BY_SUBNET=()
 while IFS=$'\t' read -r subnet_id mt_id; do
     sgs=$(aws efs describe-mount-target-security-groups --mount-target-id "${mt_id}" \
         --query 'SecurityGroups' --output text | tr '\t' ' ')
@@ -118,6 +119,7 @@ while IFS=$'\t' read -r subnet_id mt_id; do
         echo "    Mount target already exists in ${subnet_id}: ${existing}"
     fi
     NEW_MT_IDS+=("${existing}")
+    NEW_MT_BY_SUBNET["${subnet_id}"]="${existing}"
 done < <(echo "${OLD_MTS}" | jq -r '.[] | [.SubnetId, .MountTargetId] | @tsv')
 
 echo "  Waiting for mount targets to become available..."
@@ -330,18 +332,34 @@ while IFS= read -r mt_resource; do
 done < <(terraform state list 2>/dev/null | grep '^module.storage\[0\].aws_efs_mount_target.main' || true)
 
 terraform import 'module.storage[0].aws_efs_file_system.main' "${NEW_FS_ID}"
+
+# Import each mount target into the state index that matches its position in
+# the storage module's subnet_ids (= the network module's storage_subnet_ids
+# output). The AWS API's mount-target order is NOT guaranteed to match that
+# ordering, so importing positionally by API order could bind a mount target
+# to the wrong count.index and make the next apply REPLACE mount targets.
 idx=0
-for mt in "${NEW_MT_IDS[@]}"; do
+while IFS= read -r subnet_id; do
+    [[ -z "${subnet_id}" ]] && continue
+    mt="${NEW_MT_BY_SUBNET[${subnet_id}]:-}"
+    if [[ -z "${mt}" ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No new mount target for subnet ${subnet_id} (state index ${idx}); terraform will create it on the ./02 re-run"
+        idx=$((idx + 1))
+        continue
+    fi
     terraform import "module.storage[0].aws_efs_mount_target.main[${idx}]" "${mt}" || true
     idx=$((idx + 1))
-done
+done < <(terraform output -json 2>/dev/null | jq -r '.storage_subnet_ids.value[]?')
 
-echo "  Verifying the plan no longer replaces the filesystem..."
+echo "  Verifying the plan no longer REPLACES the filesystem..."
 terraform plan -out=efs-migration-check.tfplan >/dev/null
 if plan_replaces_efs "efs-migration-check.tfplan"; then
     step_fail "terraform STILL plans an EFS replacement after the import — inspect 'terraform plan' manually"
 fi
-echo -e "${GREEN}✓${NC} Terraform state repointed; plan is replacement-free"
+echo -e "${GREEN}✓${NC} Terraform state repointed; the filesystem is no longer replaced."
+echo "  Note: the next 'terraform plan' will still CREATE the /state access point and"
+echo "  the backup policy on the new filesystem (deliberately left out of state here)."
+echo "  That is expected and is applied when you re-run ./02-snp-node-group.sh."
 
 #------------------------------------------------------------------------------
 # Cleanup + handoff
@@ -355,7 +373,7 @@ echo "Delete it manually once the migration has soaked:"
 echo "    aws efs delete-file-system --file-system-id ${OLD_FS_ID}   # after deleting its mount targets"
 echo ""
 echo "Platform deployments are still scaled to 0. The next deploy step"
-echo "(./05-deploy-r1.sh) re-applies manifests and scales everything back up;"
+echo "(./06-deploy-r1.sh) re-applies manifests and scales everything back up;"
 echo "to restore service sooner: kubectl scale deployment/aura-swarm-{gateway,control,scheduler} -n ${K8S_NAMESPACE_SYSTEM} --replicas=1"
 
-step_ok "01 (re-run ./01-snp-node-group.sh — the plan should now be clean)"
+step_ok "02 (re-run ./02-snp-node-group.sh — the plan should now be clean)"

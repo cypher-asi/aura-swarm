@@ -1,0 +1,121 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EKSClusterAndNodegroups",
+      "Effect": "Allow",
+      "Action": [
+        "eks:Describe*",
+        "eks:List*",
+        "eks:CreateNodegroup",
+        "eks:DeleteNodegroup",
+        "eks:UpdateNodegroupConfig",
+        "eks:UpdateNodegroupVersion",
+        "eks:CreateAddon",
+        "eks:UpdateAddon",
+        "eks:DeleteAddon",
+        "eks:TagResource",
+        "eks:UntagResource",
+        "eks:AssociateEncryptionConfig",
+        "eks:UpdateClusterConfig",
+        "eks:UpdateClusterVersion",
+        "eks:AccessKubernetesApi"
+      ],
+      "Resource": [
+        "arn:aws:eks:__AWS_REGION__:__AWS_ACCOUNT_ID__:cluster/__EKS_CLUSTER_NAME__",
+        "arn:aws:eks:__AWS_REGION__:__AWS_ACCOUNT_ID__:nodegroup/__EKS_CLUSTER_NAME__/*",
+        "arn:aws:eks:__AWS_REGION__:__AWS_ACCOUNT_ID__:addon/__EKS_CLUSTER_NAME__/*"
+      ]
+    },
+    {
+      "Sid": "EKSUpdatePolling",
+      "Effect": "Allow",
+      "Action": [
+        "eks:DescribeUpdate",
+        "eks:ListUpdates"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PeerPodsPodVMManagement",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:DescribeInstances",
+        "ec2:CreateTags",
+        "ec2:DescribeImages",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "__AWS_REGION__"
+        }
+      }
+    },
+    {
+      "Sid": "DeployClusterRolesAndOIDC",
+      "Effect": "Allow",
+      "Action": [
+        "iam:Get*",
+        "iam:List*",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PassRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider"
+      ],
+      "Resource": [
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/__RESOURCE_PREFIX__-*",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/service-role/*",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:oidc-provider/*"
+      ]
+    },
+    {
+      "Sid": "TerraformState",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::__TF_STATE_BUCKET__",
+        "arn:aws:s3:::__TF_STATE_BUCKET__/*"
+      ]
+    },
+    {
+      "Sid": "TerraformInfra",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:*",
+        "elasticfilesystem:*",
+        "ecr:*",
+        "backup:*",
+        "logs:*",
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey",
+        "kms:CreateGrant",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "__AWS_REGION__"
+        }
+      }
+    }
+  ]
+}

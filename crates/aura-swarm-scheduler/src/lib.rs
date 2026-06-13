@@ -3,7 +3,9 @@
 //! This crate provides the [`Scheduler`] trait and [`K8sScheduler`] implementation
 //! for managing agent pods in a Kubernetes cluster. It handles:
 //!
-//! - Pod creation with the `kata-qemu-snp` runtime for confidential VM isolation
+//! - Pod creation with a configurable confidential runtime class
+//!   (`kata-qemu-snp` on-node SNP by default, or `kata-remote` Peer Pods)
+//!   for confidential VM isolation
 //! - Pod lifecycle management (start, stop, health checks)
 //! - Endpoint caching for fast routing
 //! - Status reconciliation with the control plane
@@ -113,7 +115,7 @@ pub mod types;
 pub use billing::{ComputeUsageReporter, PodUsageInfo, SchedulerBillingConfig};
 pub use error::{Result, SchedulerError};
 pub use k8s::{verify_gateway_auth, GatewayAuthError, K8sScheduler, Scheduler};
-pub use types::{PodInfo, PodPhase, PodStatus, SchedulerConfig};
+pub use types::{ConfidentialRuntime, PodInfo, PodPhase, PodStatus, SchedulerConfig};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use mock_scheduler::MockScheduler;

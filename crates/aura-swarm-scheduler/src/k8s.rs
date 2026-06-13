@@ -18,7 +18,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, AgentState, BoxTier, LogLine};
+use aura_swarm_store::{AgentSpec, AgentState, BoxTier, IsolationLevel, LogLine};
 
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
@@ -740,11 +740,21 @@ impl K8sScheduler {
     }
 
     /// The runtime class a pod built from `spec` would get under `config`
-    /// (`None` = default container runtime). Mirrors `pod::build_pod`.
-    fn desired_runtime_class(config: &SchedulerConfig, spec: &AgentSpec) -> Option<&'static str> {
-        spec.isolation
-            .unwrap_or(config.default_isolation)
-            .runtime_class()
+    /// (`None` = default container runtime). Mirrors `pod::build_pod`:
+    /// confidential pods get `config.confidential_runtime_class` (which the
+    /// `CONFIDENTIAL_RUNTIME` switch sets to `kata-qemu-snp` or
+    /// `kata-remote`), container pods get the default runtime. The returned
+    /// borrow is tied to `config` so the configured class flows through.
+    fn desired_runtime_class<'a>(
+        config: &'a SchedulerConfig,
+        spec: &AgentSpec,
+    ) -> Option<&'a str> {
+        let isolation = spec.isolation.unwrap_or(config.default_isolation);
+        if isolation == IsolationLevel::ConfidentialVM {
+            Some(config.confidential_runtime_class.as_str())
+        } else {
+            None
+        }
     }
 
     /// Should the reconciler recreate `pod` because its `runtimeClassName`
@@ -2214,6 +2224,48 @@ mod tests {
         assert_eq!(
             K8sScheduler::desired_runtime_class(&config, &spec),
             Some("kata-qemu-snp")
+        );
+    }
+
+    /// A scheduler config in `peer_pods` mode (CAA `kata-remote`).
+    fn peer_pods_config() -> SchedulerConfig {
+        SchedulerConfig {
+            confidential_runtime: crate::types::ConfidentialRuntime::PeerPods,
+            confidential_runtime_class: "kata-remote".to_string(),
+            ..SchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn desired_runtime_class_is_kata_remote_under_peer_pods() {
+        let config = peer_pods_config();
+        assert_eq!(
+            K8sScheduler::desired_runtime_class(&config, &confidential_spec()),
+            Some("kata-remote")
+        );
+    }
+
+    #[test]
+    fn snp_pod_is_stale_under_peer_pods_config() {
+        // Flipping to peer_pods makes every running on-node SNP pod stale,
+        // which is what drives the intended one-pod-per-pass fleet churn
+        // onto kata-remote.
+        let config = peer_pods_config();
+        let snp_pod = pod_with_runtime_class(Some("kata-qemu-snp"));
+        assert!(
+            K8sScheduler::pod_runtime_class_is_stale(&config, &snp_pod, &confidential_spec()),
+            "a running kata-qemu-snp pod must be stale once the desired class is kata-remote"
+        );
+
+        // A pod already on the desired remote class is not stale.
+        let remote_pod = pod_with_runtime_class(Some("kata-remote"));
+        assert!(
+            !K8sScheduler::pod_runtime_class_is_stale(
+                &config,
+                &remote_pod,
+                &confidential_spec()
+            ),
+            "a kata-remote pod must not be stale under a peer_pods config"
         );
     }
 

@@ -81,6 +81,7 @@ module "eks" {
   resource_prefix    = local.resource_prefix
   eks_version        = var.eks_version
   vpc_id             = module.network[0].vpc_id
+  vpc_cidr           = module.network[0].vpc_cidr
   private_subnet_ids = module.network[0].private_subnet_ids
   agent_subnet_ids   = module.network[0].agent_subnet_ids
   node_instance_type = var.node_instance_type
@@ -95,6 +96,9 @@ module "eks" {
   confidential_node_min_count     = var.confidential_node_min_count
   confidential_node_max_count     = var.confidential_node_max_count
   confidential_node_disk_size     = var.confidential_node_disk_size
+
+  # Peer Pods / Cloud API Adaptor (no-op until enable_caa=true)
+  enable_caa = var.enable_caa
 
   tags = local.common_tags
 }

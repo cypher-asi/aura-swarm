@@ -210,3 +210,9 @@ variable "enable_ecr" {
   type        = bool
   default     = true
 }
+
+variable "enable_caa" {
+  description = "Enable Peer Pods / Cloud API Adaptor IAM + security-group resources in the EKS module (CAA IRSA role, pod-VM EC2 permissions, worker <-> pod-VM ingress). Default false keeps the metal SNP path the no-op fallback; the plan is byte-identical to today until enabled."
+  type        = bool
+  default     = false
+}

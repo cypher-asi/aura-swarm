@@ -1,5 +1,5 @@
 #!/bin/bash
-# _lib.sh - Shared helpers for the staged TEE rollout scripts (00-11).
+# _lib.sh - Shared helpers for the staged TEE rollout scripts (00-12).
 #
 # Source AFTER config.env:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +32,7 @@ SECRETS_DIR="${PROJECT_ROOT}/.secrets"
 HARNESS_STATE_FILE="${DEPLOY_DIR}/.last-harness-image.env"
 EFS_BACKUP_STATE_FILE="${DEPLOY_DIR}/.last-efs-backup.env"
 
-# Owner JWT used by the test-agent checks (steps 05/06); empty when unused.
+# Owner JWT used by the test-agent checks (steps 06/07); empty when unused.
 SMOKE_TEST_TOKEN="${SMOKE_TEST_TOKEN:-}"
 
 # Staged rollout refs (overridable from the environment / CLI):
@@ -132,23 +132,439 @@ ensure_kubectl_context() {
     step_fail "kubectl cannot authenticate to ${EKS_CLUSTER_NAME} even after kubeconfig refresh"
 }
 
+# `docker info` blocks indefinitely when the daemon is stopped or unreachable;
+# wrap it so preflight/build scripts fail fast instead of hanging.
+docker_daemon_ok() {
+    local timeout_secs="${1:-15}"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${timeout_secs}" docker info >/dev/null 2>&1
+        return $?
+    fi
+    docker info >/dev/null 2>&1 &
+    local pid=$!
+    local elapsed=0
+    while kill -0 "${pid}" 2>/dev/null; do
+        if [[ ${elapsed} -ge ${timeout_secs} ]]; then
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "${pid}"
+}
+
 require_docker() {
     local timeout_secs=15
-    local ok=false
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "${timeout_secs}" docker info >/dev/null 2>&1 && ok=true
-    else
-        docker info >/dev/null 2>&1 && ok=true
-    fi
-    if [[ "${ok}" != "true" ]]; then
+    if ! docker_daemon_ok "${timeout_secs}"; then
         step_fail "Docker is not running (or not responding within ${timeout_secs}s)"
     fi
     echo -e "${GREEN}✓${NC} Docker daemon is responding"
 }
 
 #------------------------------------------------------------------------------
-# Secrets (.secrets/ folder conventions from legacy 08-deploy-k8s.sh)
+# Deploy-operator IAM (step 01)
+#
+# This org logs in through IAM Identity Center (SSO): the deploy principal is an
+# AWSReservedSSO_* permission-set role. Such roles are NOT directly modifiable
+# (iam:AttachRolePolicy -> UnmodifiableEntity), and IAM groups only apply to IAM
+# users, so the only way to grant the deploy permissions is to attach the
+# customer-managed policy to the PERMISSION SET and re-provision it.
 #------------------------------------------------------------------------------
+
+render_deploy_iam_policy_doc() {
+    local template="${DEPLOY_DIR}/iam/deploy-operator-policy.json"
+    [[ -f "${template}" ]] || step_fail "missing IAM policy template: ${template}"
+    sed \
+        -e "s/__AWS_REGION__/${AWS_REGION}/g" \
+        -e "s/__AWS_ACCOUNT_ID__/${AWS_ACCOUNT_ID}/g" \
+        -e "s/__EKS_CLUSTER_NAME__/${EKS_CLUSTER_NAME}/g" \
+        -e "s/__RESOURCE_PREFIX__/${RESOURCE_PREFIX}/g" \
+        -e "s/__DEPLOY_IAM_POLICY__/${DEPLOY_IAM_POLICY}/g" \
+        -e "s/__TF_STATE_BUCKET__/${TF_STATE_BUCKET}/g" \
+        < "${template}"
+}
+
+deploy_iam_policy_arn() {
+    echo "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${DEPLOY_IAM_POLICY}"
+}
+
+ensure_deploy_iam_policy() {
+    local doc policy_arn
+    doc=$(render_deploy_iam_policy_doc)
+    policy_arn=$(deploy_iam_policy_arn)
+
+    if aws iam get-policy --policy-arn "${policy_arn}" >/dev/null 2>&1; then
+        # Managed policies allow at most 5 versions; prune oldest non-default
+        # ones so repeated updates don't hit LimitExceeded.
+        local versions vid
+        versions=$(aws iam list-policy-versions --policy-arn "${policy_arn}" --output json 2>/dev/null \
+            | jq -r '[.Versions[] | select(.IsDefaultVersion | not)]
+                     | sort_by(.CreateDate) | .[].VersionId')
+        while [[ $(aws iam list-policy-versions --policy-arn "${policy_arn}" \
+                    --query 'length(Versions)' --output text 2>/dev/null) -ge 5 ]]; do
+            vid=$(echo "${versions}" | head -1)
+            versions=$(echo "${versions}" | tail -n +2)
+            [[ -z "${vid}" ]] && break
+            aws iam delete-policy-version --policy-arn "${policy_arn}" --version-id "${vid}" >/dev/null 2>&1 \
+                && echo -e "  ${YELLOW}↺${NC} Pruned old policy version ${vid}"
+        done
+        aws iam create-policy-version \
+            --policy-arn "${policy_arn}" \
+            --policy-document "${doc}" \
+            --set-as-default >/dev/null
+        echo -e "${GREEN}✓${NC} Updated IAM policy ${DEPLOY_IAM_POLICY}"
+    else
+        aws iam create-policy \
+            --policy-name "${DEPLOY_IAM_POLICY}" \
+            --policy-document "${doc}" \
+            --description "Aura Swarm staged rollout permissions for ${RESOURCE_PREFIX}" \
+            --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
+            >/dev/null
+        echo -e "${GREEN}✓${NC} Created IAM policy ${DEPLOY_IAM_POLICY}"
+    fi
+}
+
+sso_instance_arn() {
+    aws sso-admin list-instances \
+        --query 'Instances[0].InstanceArn' --output text 2>/dev/null
+}
+
+# Echo the permission-set ARN whose Name matches $2, paginating list-permission-sets.
+find_permission_set_arn() {
+    local instance_arn="$1" target="$2" next="" out ps name
+    while :; do
+        if [[ -n "${next}" ]]; then
+            out=$(aws sso-admin list-permission-sets --instance-arn "${instance_arn}" \
+                --max-results 100 --next-token "${next}" --output json 2>/dev/null) || return 1
+        else
+            out=$(aws sso-admin list-permission-sets --instance-arn "${instance_arn}" \
+                --max-results 100 --output json 2>/dev/null) || return 1
+        fi
+        while IFS= read -r ps; do
+            [[ -z "${ps}" ]] && continue
+            name=$(aws sso-admin describe-permission-set --instance-arn "${instance_arn}" \
+                --permission-set-arn "${ps}" --query 'PermissionSet.Name' --output text 2>/dev/null)
+            if [[ "${name}" == "${target}" ]]; then
+                echo "${ps}"
+                return 0
+            fi
+        done < <(echo "${out}" | jq -r '.PermissionSets[]?')
+        next=$(echo "${out}" | jq -r '.NextToken // empty')
+        [[ -z "${next}" ]] && break
+    done
+    return 1
+}
+
+print_sso_manual_guidance() {
+    local instance_arn="${1:-\$INSTANCE_ARN}" ps_arn="${2:-\$PS_ARN}"
+    echo -e "${YELLOW}ℹ${NC} Attach the deploy policy to the permission set with an account"
+    echo "  that has IAM Identity Center admin (management or delegated-admin), then re-login:"
+    echo ""
+    echo "    aws sso-admin attach-customer-managed-policy-reference-to-permission-set \\"
+    echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
+    echo "      --customer-managed-policy-reference Name=${DEPLOY_IAM_POLICY},Path=/"
+    echo "    aws sso-admin provision-permission-set \\"
+    echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
+    echo "      --target-type ALL_PROVISIONED_ACCOUNTS"
+    echo ""
+    echo "  Then refresh credentials (aws sso login, or paste fresh portal keys) and re-run."
+}
+
+# Attach the customer-managed deploy policy to the SSO permission set and
+# re-provision. Best-effort: prints manual guidance if sso-admin is unavailable.
+ensure_deploy_policy_on_permission_set() {
+    local instance_arn ps_arn name="${DEPLOY_SSO_PERMISSION_SET}"
+
+    instance_arn=$(sso_instance_arn)
+    if [[ -z "${instance_arn}" || "${instance_arn}" == "None" ]]; then
+        echo -e "${YELLOW}⚠${NC} No IAM Identity Center instance visible from this account."
+        print_sso_manual_guidance
+        return 0
+    fi
+    echo -e "${GREEN}✓${NC} Identity Center instance: ${instance_arn}"
+
+    if ! ps_arn=$(find_permission_set_arn "${instance_arn}" "${name}") || [[ -z "${ps_arn}" ]]; then
+        echo -e "${YELLOW}⚠${NC} Permission set '${name}' not found (need management/delegated-admin access)."
+        print_sso_manual_guidance
+        return 0
+    fi
+    echo -e "${GREEN}✓${NC} Permission set: ${name} (${ps_arn})"
+
+    if aws sso-admin list-customer-managed-policy-references-in-permission-set \
+        --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" --output json 2>/dev/null \
+        | jq -e --arg n "${DEPLOY_IAM_POLICY}" \
+            '.CustomerManagedPolicyReferences[]? | select(.Name == $n)' >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Permission set ${name} already references ${DEPLOY_IAM_POLICY}"
+    elif aws sso-admin attach-customer-managed-policy-reference-to-permission-set \
+        --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" \
+        --customer-managed-policy-reference "Name=${DEPLOY_IAM_POLICY},Path=/" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Attached ${DEPLOY_IAM_POLICY} reference to permission set ${name}"
+    else
+        echo -e "${YELLOW}⚠${NC} Could not modify permission set (need sso-admin / delegated-admin)."
+        print_sso_manual_guidance "${instance_arn}" "${ps_arn}"
+        return 0
+    fi
+
+    if aws sso-admin provision-permission-set \
+        --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" \
+        --target-type ALL_PROVISIONED_ACCOUNTS >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Re-provisioned permission set ${name} (propagating to assigned accounts)"
+    else
+        echo -e "${YELLOW}⚠${NC} Attach recorded but provisioning failed; run provision-permission-set manually."
+    fi
+
+    echo ""
+    echo -e "${YELLOW}ℹ${NC} Customer-managed policy '${DEPLOY_IAM_POLICY}' must exist (same name/path)"
+    echo "  in every account this permission set is assigned to."
+    echo "  Refresh credentials (aws sso login / fresh portal keys) before re-running terraform."
+}
+
+# Simulate the deploy permission-set ROLE (not the live session) for the action
+# that broke terraform: eks:DescribeUpdate. Non-fatal — purely informational.
+verify_deploy_iam_permissions() {
+    local role_arn result
+    role_arn=$(aws iam list-roles --output json 2>/dev/null \
+        | jq -r --arg p "${DEPLOY_IAM_SSO_ROLE_PREFIX}" \
+            '[.Roles[]? | select(.RoleName | startswith($p)) | .Arn][0] // empty')
+
+    if [[ -z "${role_arn}" ]]; then
+        echo -e "${YELLOW}⚠${NC} Deploy role matching ${DEPLOY_IAM_SSO_ROLE_PREFIX} not provisioned in this account yet."
+        echo "  It appears after the permission set is provisioned + assigned; skipping simulation."
+        return 0
+    fi
+
+    echo "Simulating eks:DescribeUpdate / eks:ListUpdates for ${role_arn}..."
+    result=$(aws iam simulate-principal-policy \
+        --policy-source-arn "${role_arn}" \
+        --action-names eks:DescribeUpdate eks:ListUpdates \
+        --query 'EvaluationResults[?EvalDecision!=`allowed`].ActionName' \
+        --output text 2>&1) || {
+        echo -e "${YELLOW}⚠${NC} Could not simulate policy (need iam:SimulatePrincipalPolicy): ${result}"
+        return 0
+    }
+
+    if [[ -n "${result}" && "${result}" != "None" ]]; then
+        echo -e "${YELLOW}⚠${NC} Deploy role still missing: ${result}"
+        echo "  Provisioning may still be propagating, or you must re-login to pick it up."
+    else
+        echo -e "${GREEN}✓${NC} Deploy role can perform eks:DescribeUpdate (terraform polling fixed)"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# EKS node-group convergence (definitive, SCP-proof recovery for step 02)
+#
+# terraform's post-update WAIT calls eks:DescribeUpdate; if that one action is
+# denied (by an identity policy OR an SCP), terraform errors out even though the
+# node-group update itself was accepted and applies fine. simulate-principal-
+# policy can't see SCPs, so it is not authoritative. These helpers do REAL API
+# calls and let step 02 converge via eks:DescribeNodegroup instead.
+#------------------------------------------------------------------------------
+
+# Real authorization probe for eks:DescribeUpdate. Uses a dummy update-id so it
+# works even when no update exists: AccessDenied => denied, ResourceNotFound/
+# validation => allowed. Echoes one of: allowed | denied | unknown.
+eks_describe_update_access() {
+    local out rc
+    out=$(aws eks describe-update \
+        --name "${EKS_CLUSTER_NAME}" \
+        --nodegroup-name "${RESOURCE_PREFIX}-node-group" \
+        --update-id "00000000-0000-0000-0000-000000000000" \
+        --region "${AWS_REGION}" 2>&1)
+    rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+        echo "allowed"; return 0
+    fi
+    if echo "${out}" | grep -qiE 'AccessDenied|not authorized|UnauthorizedException'; then
+        echo "denied"; return 0
+    fi
+    if echo "${out}" | grep -qiE 'ResourceNotFound|No update found|ValidationException|InvalidParameter'; then
+        echo "allowed"; return 0
+    fi
+    echo "unknown"
+}
+
+nodegroup_status() {
+    aws eks describe-nodegroup \
+        --cluster-name "${EKS_CLUSTER_NAME}" \
+        --nodegroup-name "$1" \
+        --region "${AWS_REGION}" \
+        --query 'nodegroup.status' --output text 2>/dev/null || echo "MISSING"
+}
+
+# Wait until both managed node groups report ACTIVE (uses DescribeNodegroup,
+# NOT DescribeUpdate). Returns 0 on convergence, 1 on timeout.
+wait_nodegroups_active() {
+    local timeout="${1:-1800}" poll=30 elapsed=0
+    local groups=("${RESOURCE_PREFIX}-node-group" "${RESOURCE_PREFIX}-confidential-node-group")
+    while [[ ${elapsed} -le ${timeout} ]]; do
+        local all_ok=true g status
+        for g in "${groups[@]}"; do
+            status=$(nodegroup_status "${g}")
+            [[ "${status}" == "ACTIVE" ]] || all_ok=false
+            echo "  [${elapsed}s] ${g}: ${status}"
+        done
+        [[ "${all_ok}" == "true" ]] && return 0
+        sleep "${poll}"
+        elapsed=$((elapsed + poll))
+    done
+    return 1
+}
+
+# Count of confidential/SNP nodes whose Ready condition is True.
+snp_ready_node_count() {
+    kubectl get nodes -l swarm.io/confidential-node=true -o json 2>/dev/null \
+        | jq '[.items[] | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length' 2>/dev/null || echo 0
+}
+
+# Ensures at least one confidential (SNP) node is Ready, recovering common
+# managed-node-group snags automatically:
+#   - desired count below target -> raises it
+#   - DEGRADED + AsgInstanceLaunchFailures (stale failed launch after capacity
+#     freed) -> bounces desired 0 -> target to force a clean relaunch
+# Prints live EC2 / node-group / node status while waiting. Fails definitively
+# only on a real capacity/quota wall or timeout.
+ensure_snp_node_ready() {
+    local ng="${RESOURCE_PREFIX}-confidential-node-group"
+    local want="${CONFIDENTIAL_NODE_DESIRED_COUNT:-1}"
+    local min="${CONFIDENTIAL_NODE_MIN_COUNT:-0}"
+    local max="${CONFIDENTIAL_NODE_MAX_COUNT:-3}"
+    local timeout="${SNP_NODE_JOIN_TIMEOUT_SECS:-1800}" poll=30 elapsed=0 bounced=0
+
+    if [[ "$(snp_ready_node_count)" -ge 1 ]]; then
+        echo -e "${GREEN}✓${NC} Confidential (SNP) node already Ready"
+        return 0
+    fi
+
+    echo "No SNP node Ready yet — ensuring the confidential node group provisions one..."
+
+    local ng_status cur_desired
+    ng_status=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+        --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
+    cur_desired=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+        --region "${AWS_REGION}" --query 'nodegroup.scalingConfig.desiredSize' --output text 2>/dev/null || echo "?")
+
+    # Raise desired if it's below target and we're ACTIVE.
+    if [[ "${ng_status}" == "ACTIVE" && "${cur_desired}" =~ ^[0-9]+$ && "${cur_desired}" -lt "${want}" ]]; then
+        echo "  desired=${cur_desired} < ${want}; requesting desiredSize=${want}..."
+        aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+            --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=${want}" >/dev/null 2>&1 || true
+    fi
+
+    while (( elapsed <= timeout )); do
+        if [[ "$(snp_ready_node_count)" -ge 1 ]]; then
+            echo -e "${GREEN}✓${NC} Confidential (SNP) node is Ready"
+            return 0
+        fi
+
+        local health status
+        status=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+            --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
+        health=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+            --region "${AWS_REGION}" --query 'nodegroup.health.issues' --output json 2>/dev/null || echo '[]')
+
+        echo "  [${elapsed}s] node group: ${status}"
+        echo "    EC2 instances:"
+        aws ec2 describe-instances --region "${AWS_REGION}" \
+            --filters "Name=tag:eks:nodegroup-name,Values=${ng}" \
+                      "Name=instance-state-name,Values=pending,running,shutting-down,stopping" \
+            --query 'Reservations[].Instances[].{id:InstanceId,type:InstanceType,state:State.Name}' \
+            --output text 2>/dev/null | sed 's/^/      /' || echo "      (none)"
+        local snp_nodes
+        snp_nodes=$(kubectl get nodes -l swarm.io/confidential-node=true \
+            -o custom-columns='NAME:.metadata.name,READY:.status.conditions[-1].type' --no-headers 2>/dev/null)
+        echo "    SNP nodes: ${snp_nodes:-<none registered>}"
+
+        # Auto-clear a stale launch failure once (capacity has usually freed by
+        # the time we get here; the bounce forces the ASG to retry).
+        if echo "${health}" | jq -e '.[]? | select(.code=="AsgInstanceLaunchFailures")' >/dev/null 2>&1; then
+            local msg
+            msg=$(echo "${health}" | jq -r '[.[]? | select(.code=="AsgInstanceLaunchFailures") | .message][0]')
+            echo -e "    ${YELLOW}⚠${NC} AsgInstanceLaunchFailures: ${msg}"
+            if [[ "${status}" == "ACTIVE" ]]; then
+                if (( bounced == 0 )); then
+                    echo "    Auto-bouncing desired 0 -> ${want} to clear the stale failed launch..."
+                    aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+                        --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=0" >/dev/null 2>&1 || true
+                    local e2=0 s2
+                    while (( e2 < 300 )); do
+                        s2=$(aws eks describe-nodegroup --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+                            --region "${AWS_REGION}" --query 'nodegroup.status' --output text 2>/dev/null || echo "?")
+                        [[ "${s2}" == "ACTIVE" ]] && break
+                        sleep 15; e2=$((e2 + 15))
+                    done
+                    aws eks update-nodegroup-config --cluster-name "${EKS_CLUSTER_NAME}" --nodegroup-name "${ng}" \
+                        --region "${AWS_REGION}" --scaling-config "minSize=${min},maxSize=${max},desiredSize=${want}" >/dev/null 2>&1 || true
+                    bounced=1
+                    echo "    Re-requested desiredSize=${want}."
+                else
+                    echo -e "    ${RED}✗${NC} Launch still failing after a desired bounce — capacity/quota wall."
+                    echo "      Free standard On-Demand vCPUs or raise EC2 quota L-1216C47A"
+                    echo "      (one ${CONFIDENTIAL_NODE_INSTANCE_TYPE} needs 192 vCPU of headroom)."
+                    step_fail "confidential node cannot launch due to EC2 vCPU quota/capacity"
+                fi
+            fi
+        fi
+
+        sleep "${poll}"
+        elapsed=$((elapsed + poll))
+    done
+
+    step_fail "no confidential (SNP) node became Ready within ${timeout}s — check the node group health and EC2 quota"
+}
+
+# True when the saved plan creates or updates an aws_eks_node_group (i.e.
+# terraform will enter a DescribeUpdate wait after apply).
+plan_changes_nodegroup() {
+    local plan_file="$1" n
+    n=$(terraform show -json "${plan_file}" 2>/dev/null | jq '
+        [.resource_changes[]?
+         | select(.type == "aws_eks_node_group")
+         | select((.change.actions | index("create")) or (.change.actions | index("update")))
+        ] | length')
+    [[ "${n:-0}" -gt 0 ]]
+}
+
+# Definitive apply for the node-group step: run terraform, and if it fails ONLY
+# because eks:DescribeUpdate is denied, converge via DescribeNodegroup instead.
+apply_with_describeupdate_fallback() {
+    local plan_file="$1" timeout="${2:-1800}"
+    local log rc
+    log=$(mktemp)
+
+    if terraform apply "${plan_file}" 2>&1 | tee "${log}"; then
+        rc=0
+    else
+        rc=${PIPESTATUS[0]}
+    fi
+
+    if [[ ${rc} -eq 0 ]]; then
+        rm -f "${log}"
+        return 0
+    fi
+
+    if grep -qiE 'DescribeUpdate|AccessDeniedException|not authorized to perform' "${log}"; then
+        echo ""
+        echo -e "${YELLOW}⚠${NC} terraform could not poll the node-group update"
+        echo "  (eks:DescribeUpdate denied — identity policy or an org SCP)."
+        echo "  Falling back to direct convergence via eks:DescribeNodegroup..."
+        rm -f "${log}"
+        if wait_nodegroups_active "${timeout}"; then
+            echo -e "${GREEN}✓${NC} Node groups reached ACTIVE — the update applied despite the polling denial."
+            echo -e "${YELLOW}ℹ${NC} terraform state may not have recorded this update's completion."
+            echo "  A later terraform run reconciles once eks:DescribeUpdate is granted"
+            echo "  (attach ${DEPLOY_IAM_POLICY} to the ${DEPLOY_SSO_PERMISSION_SET:-deploy} permission set and"
+            echo "  clear any SCP denying eks:DescribeUpdate)."
+            return 0
+        fi
+        step_fail "node groups did not reach ACTIVE — eks:DescribeUpdate is denied AND convergence failed; fix the identity policy/SCP (see ./01-iam.sh) before retrying"
+    fi
+
+    rm -f "${log}"
+    step_fail "terraform apply failed (see output above)"
+}
 
 load_secret() {
     local file="${SECRETS_DIR}/$1"
@@ -283,37 +699,60 @@ gw_schema_version() {
 #------------------------------------------------------------------------------
 
 # JSON array: {agent_id, pod_name, phase, ready, runtime_class, digest, spec_hash}
+#
+# spec_hash is a full SHA-256 of the pod's canonical (.spec) JSON, so it
+# detects ANY spec change (image, env, resources, runtime class). jq has no
+# hash builtin, so we emit (pod_name, base64(canonical spec)) pairs, sha256
+# each in the shell, and feed the resulting map back into the final assembly.
 snapshot_agent_pods() {
     local output_path="$1"
-    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json \
-        | jq '
-            [
-                .items[] | {
-                    agent_id: (.metadata.labels["swarm.io/agent-id"] // ""),
-                    pod_name: (.metadata.name // ""),
-                    phase: (.status.phase // "Unknown"),
-                    ready: (
-                        [(.status.conditions // [])[]? | select(.type == "Ready" and .status == "True")]
-                        | length > 0
-                    ),
-                    runtime_class: (.spec.runtimeClassName // "<none>"),
-                    digest: (
-                        (.status.containerStatuses[0].imageID // "") as $image_id
-                        | if ($image_id | test("sha256:[a-f0-9]{64}")) then
-                            ($image_id | capture("(?<d>sha256:[a-f0-9]{64})").d)
-                          else "" end
-                    ),
-                    spec_hash: (.spec | tostring | @base64 | .[0:24])
-                }
-            ] | sort_by(.agent_id, .pod_name)
-        ' > "${output_path}"
+    local raw
+    raw=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json)
+
+    local spec_hashes
+    spec_hashes=$(
+        printf '%s' "${raw}" \
+            | jq -r '.items[] | [(.metadata.name // ""), (.spec | @json | @base64)] | @tsv' \
+            | while IFS=$'\t' read -r pod_name spec_b64; do
+                [[ -z "${pod_name}" ]] && continue
+                hash=$(printf '%s' "${spec_b64}" | base64 --decode | sha256sum | awk '{print $1}')
+                printf '%s\t%s\n' "${pod_name}" "${hash}"
+              done \
+            | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}'
+    )
+
+    printf '%s' "${raw}" | jq --argjson spec_hashes "${spec_hashes:-{}}" '
+        [
+            .items[] | {
+                agent_id: (.metadata.labels["swarm.io/agent-id"] // ""),
+                pod_name: (.metadata.name // ""),
+                phase: (.status.phase // "Unknown"),
+                ready: (
+                    [(.status.conditions // [])[]? | select(.type == "Ready" and .status == "True")]
+                    | length > 0
+                ),
+                runtime_class: (.spec.runtimeClassName // "<none>"),
+                digest: (
+                    (.status.containerStatuses[0].imageID // "") as $image_id
+                    | if ($image_id | test("sha256:[a-f0-9]{64}")) then
+                        ($image_id | capture("(?<d>sha256:[a-f0-9]{64})").d)
+                      else "" end
+                ),
+                spec_hash: ($spec_hashes[(.metadata.name // "")] // "")
+            }
+        ] | sort_by(.agent_id, .pod_name)
+    ' > "${output_path}"
 }
 
+# Counts only RUNNING pods on the given runtime class. Terminal pods
+# (Failed/Succeeded) and ones still Pending/Terminating do not count — the
+# R2 migration monitor and convergence gates reason about running workloads,
+# and must not be wedged by a stuck non-running kata-fc pod.
 count_pods_on_runtime_class() {
     local runtime_class="$1"
     kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json 2>/dev/null \
         | jq --arg rc "${runtime_class}" \
-            '[.items[] | select(.spec.runtimeClassName == $rc)] | length'
+            '[.items[] | select(.spec.runtimeClassName == $rc and .status.phase == "Running")] | length'
 }
 
 print_fleet_report() {
@@ -403,6 +842,9 @@ confidential_node_instance_type = "${CONFIDENTIAL_NODE_INSTANCE_TYPE}"
 confidential_node_desired_count = ${CONFIDENTIAL_NODE_DESIRED_COUNT}
 confidential_node_min_count     = ${CONFIDENTIAL_NODE_MIN_COUNT}
 confidential_node_max_count     = ${CONFIDENTIAL_NODE_MAX_COUNT}
+
+# Peer Pods / Cloud API Adaptor (no-op until true; metal SNP stays the default)
+enable_caa = ${ENABLE_CAA:-false}
 
 # Feature flags — preserved from previous state
 enable_network = ${existing_network}
@@ -602,7 +1044,7 @@ render_k8s_manifests() {
     zbilling=$(load_secret "Z_BILLING_API_KEY")
     token=$(load_secret "INTERNAL_TOKEN")
     [[ -n "${anthropic}" ]] || step_fail "missing .secrets/ANTHROPIC_API_KEY"
-    [[ -n "${token}" ]] || step_fail "missing .secrets/INTERNAL_TOKEN (run ./03-trustee-kbs.sh first)"
+    [[ -n "${token}" ]] || step_fail "missing .secrets/INTERNAL_TOKEN (run ./04-trustee-kbs.sh first)"
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
@@ -657,7 +1099,7 @@ apply_platform_manifests() {
     for manifest in "${manifests[@]}"; do
         if [[ "${manifest}" == "10-coco-ccruntime.yaml" ]] && \
            ! kubectl get crd ccruntimes.confidentialcontainers.org >/dev/null 2>&1; then
-            echo -e "${YELLOW}⚠${NC} Skipping ${manifest} (CoCo operator not installed — run ./02-coco-operator.sh)"
+            echo -e "${YELLOW}⚠${NC} Skipping ${manifest} (CoCo operator not installed — run ./03-coco-operator.sh)"
             continue
         fi
         echo "Applying ${manifest}..."

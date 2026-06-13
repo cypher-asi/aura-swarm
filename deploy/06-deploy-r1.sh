@@ -1,5 +1,5 @@
 #!/bin/bash
-# 05-deploy-r1.sh - Build, push and deploy gateway/control/scheduler at the
+# 06-deploy-r1.sh - Build, push and deploy gateway/control/scheduler at the
 # R1 (dual-mode) ref. Every NEW agent becomes a confidential SNP VM with
 # sealed storage; legacy agents must remain byte-for-byte untouched.
 #
@@ -8,9 +8,9 @@
 # test agent lands on kata-qemu-snp with a sealed env and a billing sku.
 #
 # Usage:
-#   ./05-deploy-r1.sh                 # deploys SWARM_R1_REF (default fa93895)
-#   ./05-deploy-r1.sh --ref <git-ref>
-#   ./05-deploy-r1.sh --skip-test-agent
+#   ./06-deploy-r1.sh                 # deploys SWARM_R1_REF (default fa93895)
+#   ./06-deploy-r1.sh --ref <git-ref>
+#   ./06-deploy-r1.sh --skip-test-agent
 #
 # The test-agent check needs an owner JWT in SMOKE_TEST_TOKEN (env) or
 # .secrets/SMOKE_TEST_TOKEN.
@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-step_banner "05" "Deploy R1 (dual-mode) at ref ${REF}"
+step_banner "06" "Deploy R1 (dual-mode) at ref ${REF}"
 
 require_cmds aws kubectl jq curl docker git openssl
 require_aws_auth
@@ -172,4 +172,4 @@ else
     echo -e "${GREEN}✓${NC} Test agent cleaned up"
 fi
 
-step_ok "06 (./06-r1-soak-check.sh — run repeatedly during the soak window)"
+step_ok "07 (./07-r1-soak-check.sh — run repeatedly during the soak window)"

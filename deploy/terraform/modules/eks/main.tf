@@ -152,6 +152,40 @@ resource "aws_iam_role_policy_attachment" "node_ssm" {
 }
 
 #------------------------------------------------------------------------------
+# Peer Pods / Cloud API Adaptor (CAA) locals
+#------------------------------------------------------------------------------
+
+locals {
+  # OIDC issuer host (no scheme) for IRSA trust policies.
+  oidc_provider_url = replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
+
+  # Worker <-> pod-VM ingress required by CAA: agent-protocol-forwarder (15150)
+  # and vxlan (9000 tcp+udp). Ports are fixed by the CAA wire protocol and match
+  # CAA_FORWARDER_PORT / CAA_VXLAN_PORT in config.env (consumed by the Phase 4
+  # Helm install). Only materialized when enable_caa=true.
+  caa_ingress_rules = [
+    {
+      description = "Peer Pods agent-protocol-forwarder (worker <-> pod VM)"
+      from_port   = 15150
+      to_port     = 15150
+      protocol    = "tcp"
+    },
+    {
+      description = "Peer Pods vxlan tcp (worker <-> pod VM)"
+      from_port   = 9000
+      to_port     = 9000
+      protocol    = "tcp"
+    },
+    {
+      description = "Peer Pods vxlan udp (worker <-> pod VM)"
+      from_port   = 9000
+      to_port     = 9000
+      protocol    = "udp"
+    },
+  ]
+}
+
+#------------------------------------------------------------------------------
 # Node Security Group
 #------------------------------------------------------------------------------
 
@@ -185,6 +219,21 @@ resource "aws_security_group" "node" {
     to_port         = 10250
     protocol        = "tcp"
     security_groups = [aws_security_group.cluster.id]
+  }
+
+  # Peer Pods / CAA: worker <-> pod-VM traffic (agent-protocol-forwarder + vxlan),
+  # scoped to the VPC CIDR (pod VMs launch into the agent subnets). The iterator
+  # is empty when enable_caa=false, so this SG stays byte-identical to the
+  # metal-SNP baseline until Peer Pods is opted into.
+  dynamic "ingress" {
+    for_each = var.enable_caa ? local.caa_ingress_rules : []
+    content {
+      description = ingress.value.description
+      from_port   = ingress.value.from_port
+      to_port     = ingress.value.to_port
+      protocol    = ingress.value.protocol
+      cidr_blocks = [var.vpc_cidr]
+    }
   }
 
   egress {
@@ -268,6 +317,12 @@ resource "aws_eks_node_group" "main" {
 # selector and the kata-qemu-snp RuntimeClass) and tainted NO_SCHEDULE so
 # only confidential agent pods (which carry the matching toleration) and
 # the CoCo operator daemonsets land here.
+#
+# This is the metal SNP fallback path and stays the default. In peer_pods mode
+# the operator scales it to zero (CONFIDENTIAL_NODE_DESIRED_COUNT=0 /
+# CONFIDENTIAL_NODE_MIN_COUNT=0): confidential_node_min_count already permits 0,
+# so the group is cleanly zeroable without deleting the resource (kept so we can
+# revert to on-node kata-qemu-snp by flipping the counts back).
 #------------------------------------------------------------------------------
 
 resource "aws_eks_node_group" "confidential" {
@@ -314,6 +369,93 @@ resource "aws_eks_node_group" "confidential" {
     aws_iam_role_policy_attachment.node_cni_policy,
     aws_iam_role_policy_attachment.node_ecr_read,
   ]
+}
+
+#------------------------------------------------------------------------------
+# Peer Pods / Cloud API Adaptor (CAA) IAM (IRSA)
+#
+# Dedicated IRSA role bound to the CAA service account
+# (cloud-api-adaptor / confidential-containers-system) via the cluster OIDC
+# provider. Grants CAA permission to create/terminate the per-agent AWS-managed
+# SEV-SNP "pod VM" EC2 instances. Gated by enable_caa (default false) so this is
+# a pure no-op until Peer Pods is opted into; the metal SNP path is unaffected.
+#------------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "caa_assume_role" {
+  count = var.enable_caa ? 1 : 0
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.cluster.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:sub"
+      values   = ["system:serviceaccount:confidential-containers-system:cloud-api-adaptor"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_url}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "caa" {
+  count = var.enable_caa ? 1 : 0
+
+  name               = "${var.resource_prefix}-caa-role"
+  assume_role_policy = data.aws_iam_policy_document.caa_assume_role[0].json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "caa" {
+  count = var.enable_caa ? 1 : 0
+
+  # Per-pod VM lifecycle + discovery. RunInstances/TerminateInstances act on
+  # ephemeral pod VMs whose ids are not known ahead of time, so resource is "*"
+  # (CAA tags every pod VM; the smoke test asserts create + terminate).
+  statement {
+    sid    = "PodVMLifecycle"
+    effect = "Allow"
+    actions = [
+      "ec2:RunInstances",
+      "ec2:TerminateInstances",
+      "ec2:DescribeInstances",
+      "ec2:CreateTags",
+      "ec2:DescribeImages",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeVpcs",
+    ]
+    resources = ["*"]
+  }
+
+  # iam:PassRole is only needed if pod VMs are launched with an instance profile.
+  # Scoped as tightly as practical to the documented pod-VM instance-role name
+  # pattern (account wildcard since the account id is not available in-module).
+  # Tighten to the exact role ARN once a pod-VM instance role exists.
+  statement {
+    sid       = "PassPodVMInstanceRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = ["arn:aws:iam::*:role/${var.resource_prefix}-podvm-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "caa" {
+  count = var.enable_caa ? 1 : 0
+
+  name   = "${var.resource_prefix}-caa-policy"
+  role   = aws_iam_role.caa[0].id
+  policy = data.aws_iam_policy_document.caa[0].json
 }
 
 #------------------------------------------------------------------------------

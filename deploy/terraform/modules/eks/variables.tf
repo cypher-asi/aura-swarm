@@ -13,6 +13,11 @@ variable "vpc_id" {
   type        = string
 }
 
+variable "vpc_cidr" {
+  description = "CIDR block of the VPC (used to scope Peer Pods / CAA worker <-> pod-VM ingress rules)"
+  type        = string
+}
+
 variable "private_subnet_ids" {
   description = "List of private subnet IDs for EKS"
   type        = list(string)
@@ -81,6 +86,16 @@ variable "confidential_node_disk_size" {
   description = "Disk size in GB for confidential worker nodes (guest images + kata artifacts)"
   type        = number
   default     = 200
+}
+
+#------------------------------------------------------------------------------
+# Peer Pods / Cloud API Adaptor (CAA)
+#------------------------------------------------------------------------------
+
+variable "enable_caa" {
+  description = "Enable Peer Pods / Cloud API Adaptor IAM + security-group resources (CAA IRSA role, pod-VM EC2 permissions, worker <-> pod-VM ingress). Default false keeps the metal SNP path the no-op fallback."
+  type        = bool
+  default     = false
 }
 
 variable "tags" {
