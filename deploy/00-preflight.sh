@@ -123,6 +123,14 @@ for secret in ANTHROPIC_API_KEY INTERNAL_TOKEN; do
 done
 
 #------------------------------------------------------------------------------
+# Confidential runtime config (read-only consistency check)
+#------------------------------------------------------------------------------
+
+echo ""
+echo -e "${CYAN}Confidential runtime${NC}"
+validate_confidential_runtime_config || true
+
+#------------------------------------------------------------------------------
 # Verdict
 #------------------------------------------------------------------------------
 

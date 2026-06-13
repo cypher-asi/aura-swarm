@@ -700,25 +700,35 @@ gw_schema_version() {
 
 # JSON array: {agent_id, pod_name, phase, ready, runtime_class, digest, spec_hash}
 #
-# spec_hash is a full SHA-256 of the pod's canonical (.spec) JSON, so it
-# detects ANY spec change (image, env, resources, runtime class). jq has no
-# hash builtin, so we emit (pod_name, base64(canonical spec)) pairs, sha256
-# each in the shell, and feed the resulting map back into the final assembly.
+# spec_hash detects ANY spec change (image, env, resources, runtime class). jq
+# has no hash builtin, so we emit (pod_name, base64(canonical spec)) pairs and
+# sha256 each in the shell. We hash the base64 text directly rather than the
+# decoded JSON: base64 is a deterministic, bijective encoding, so the hash is
+# an equally valid change detector, and it is only ever compared against other
+# hashes from this same function (pre/post snapshots). Hashing the base64 also
+# avoids a `base64 --decode` round-trip that is both needless and fragile
+# across platforms (a failed decode silently yields the empty-string hash for
+# every pod, which would make distinct specs look identical).
 snapshot_agent_pods() {
     local output_path="$1"
     local raw
     raw=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json)
 
+    # Windows-native jq.exe writes CRLF on stdout; strip CR so the per-line
+    # `read` does not capture a trailing \r and so the final --argjson payload
+    # below is valid JSON (a trailing \r makes jq reject it).
     local spec_hashes
     spec_hashes=$(
         printf '%s' "${raw}" \
             | jq -r '.items[] | [(.metadata.name // ""), (.spec | @json | @base64)] | @tsv' \
+            | tr -d '\r' \
             | while IFS=$'\t' read -r pod_name spec_b64; do
                 [[ -z "${pod_name}" ]] && continue
-                hash=$(printf '%s' "${spec_b64}" | base64 --decode | sha256sum | awk '{print $1}')
+                hash=$(printf '%s' "${spec_b64}" | sha256sum | awk '{print $1}')
                 printf '%s\t%s\n' "${pod_name}" "${hash}"
               done \
-            | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}'
+            | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}' \
+            | tr -d '\r'
     )
 
     printf '%s' "${raw}" | jq --argjson spec_hashes "${spec_hashes:-{}}" '
@@ -780,6 +790,126 @@ print_fleet_report() {
     else
         echo "  Gateway service not deployed yet"
     fi
+}
+
+#------------------------------------------------------------------------------
+# Scripted config.env updates
+#
+# Persist deploy knobs into config.env while keeping the `${VAR:-default}`
+# override pattern intact, so an inline `export VAR=...` in the environment
+# still wins at runtime. ./configure.sh and the rollout steps use these so
+# operators never hand-edit config.env between steps.
+#------------------------------------------------------------------------------
+
+CONFIG_FILE="${DEPLOY_DIR}/config.env"
+
+# Idempotently set the default for KEY in config.env by rewriting its
+# `export KEY="${KEY:-VALUE}"` line (the line must already exist). The match is
+# anchored on `=` so KEY does not collide with KEY_SUFFIX. Per-line CRLF is
+# preserved. Also exports KEY into the current shell so a step that sets a value
+# mid-run sees it immediately. Fails if the key has no export line.
+set_config_value() {
+    local key="$1" value="$2"
+    [[ -f "${CONFIG_FILE}" ]] || step_fail "config.env not found at ${CONFIG_FILE}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || step_fail "invalid config key: '${key}'"
+
+    local tmp found=0 line bare cr
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        bare="${line%$'\r'}"
+        cr=""
+        [[ "${line}" != "${bare}" ]] && cr=$'\r'
+        if [[ "${bare}" =~ ^[[:space:]]*export[[:space:]]+${key}= ]]; then
+            printf 'export %s="${%s:-%s}"%s\n' "${key}" "${key}" "${value}" "${cr}" >> "${tmp}"
+            found=1
+        else
+            printf '%s\n' "${line}" >> "${tmp}"
+        fi
+    done < "${CONFIG_FILE}"
+
+    if [[ "${found}" -eq 0 ]]; then
+        rm -f "${tmp}"
+        step_fail "config key ${key} has no 'export ${key}=...' line in config.env"
+    fi
+    mv "${tmp}" "${CONFIG_FILE}"
+    export "${key}=${value}"
+    echo -e "${GREEN}✓${NC} config.env: ${key}=${value}"
+}
+
+# Echo the newest available x86_64 AMI matching (owners, name) in AWS_REGION, or
+# empty. owners may be empty (search all visible images, incl. public community
+# AMIs) or a space-separated list ("self", account ids).
+_describe_newest_ami() {
+    local owners="$1" name="$2"
+    local args=(--region "${AWS_REGION}")
+    # shellcheck disable=SC2206 # intentional word-split: owners may be a list
+    [[ -n "${owners}" ]] && args+=(--owners ${owners})
+    local ami
+    ami=$(aws ec2 describe-images "${args[@]}" \
+        --filters "Name=name,Values=${name}" \
+                  "Name=architecture,Values=x86_64" \
+                  "Name=state,Values=available" \
+        --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+        --output text 2>/dev/null || echo "")
+    [[ "${ami}" == "None" ]] && ami=""
+    printf '%s' "${ami}"
+}
+
+# Pod-VM AMI discovery for Peer Pods. Echoes an AMI id (and nothing else):
+#   1. $PODVM_AMI_ID if already set — an explicit pin always wins.
+#   2. an explicit $PODVM_AMI_NAME_FILTER (with $PODVM_AMI_OWNERS) if set.
+#   3. else the CoCo community published image for this CAA version
+#      (podvm-fedora-amd64-<CAA_CHART_VERSION with dots as dashes>),
+#   4. else any podvm-fedora-amd64-* (newest), 5. else a self-built podvm-*.
+# Echoes empty when none is found. The lookup needs AWS auth; callers that may
+# reach the network path should require_aws_auth first.
+resolve_podvm_ami() {
+    if [[ -n "${PODVM_AMI_ID:-}" ]]; then
+        printf '%s' "${PODVM_AMI_ID}"
+        return 0
+    fi
+    if [[ -n "${PODVM_AMI_NAME_FILTER:-}" ]]; then
+        _describe_newest_ami "${PODVM_AMI_OWNERS:-}" "${PODVM_AMI_NAME_FILTER}"
+        return 0
+    fi
+    local owners="${PODVM_AMI_OWNERS:-}" ver="${CAA_CHART_VERSION:-}" ami=""
+    if [[ -n "${ver}" ]]; then
+        ami=$(_describe_newest_ami "${owners}" "podvm-fedora-amd64-${ver//./-}")
+    fi
+    [[ -z "${ami}" ]] && ami=$(_describe_newest_ami "${owners}" "podvm-fedora-amd64-*")
+    [[ -z "${ami}" ]] && ami=$(_describe_newest_ami "self" "podvm-*")
+    printf '%s' "${ami}"
+}
+
+# Read-only consistency check for the confidential-runtime knobs (uses the
+# already-sourced live values). Prints warnings; never mutates. Echoes nothing
+# fatal — returns the number of problems found so callers can decide.
+validate_confidential_runtime_config() {
+    local runtime="${CONFIDENTIAL_RUNTIME:-snp_local}" problems=0
+    case "${runtime}" in
+        snp_local)
+            echo -e "${GREEN}✓${NC} CONFIDENTIAL_RUNTIME=snp_local (on-node kata-qemu-snp; SEV-SNP metal pool)"
+            ;;
+        peer_pods)
+            echo -e "${GREEN}✓${NC} CONFIDENTIAL_RUNTIME=peer_pods (CAA kata-remote; per-agent pod VM)"
+            if [[ "${ENABLE_CAA:-false}" != "true" ]]; then
+                echo -e "${YELLOW}⚠${NC} ENABLE_CAA is not true — terraform will not create the CAA IAM/SG (run: ./configure.sh --peer-pods)"
+                problems=$((problems + 1))
+            fi
+            if [[ -z "${PODVM_AMI_ID:-}" ]]; then
+                echo -e "${YELLOW}⚠${NC} PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
+                problems=$((problems + 1))
+            fi
+            if [[ "${CONFIDENTIAL_NODE_DESIRED_COUNT:-0}" != "0" ]]; then
+                echo -e "${YELLOW}⚠${NC} CONFIDENTIAL_NODE_DESIRED_COUNT=${CONFIDENTIAL_NODE_DESIRED_COUNT:-?} — metal pool still on; retire it after convergence (./configure.sh --retire-metal)"
+            fi
+            ;;
+        *)
+            echo -e "${YELLOW}⚠${NC} CONFIDENTIAL_RUNTIME='${runtime}' is unrecognized; the scheduler treats it as snp_local"
+            problems=$((problems + 1))
+            ;;
+    esac
+    return "${problems}"
 }
 
 #------------------------------------------------------------------------------

@@ -165,19 +165,19 @@ locals {
   # Helm install). Only materialized when enable_caa=true.
   caa_ingress_rules = [
     {
-      description = "Peer Pods agent-protocol-forwarder (worker <-> pod VM)"
+      description = "Peer Pods agent-protocol-forwarder (worker to/from pod VM)"
       from_port   = 15150
       to_port     = 15150
       protocol    = "tcp"
     },
     {
-      description = "Peer Pods vxlan tcp (worker <-> pod VM)"
+      description = "Peer Pods vxlan tcp (worker to/from pod VM)"
       from_port   = 9000
       to_port     = 9000
       protocol    = "tcp"
     },
     {
-      description = "Peer Pods vxlan udp (worker <-> pod VM)"
+      description = "Peer Pods vxlan udp (worker to/from pod VM)"
       from_port   = 9000
       to_port     = 9000
       protocol    = "udp"
