@@ -210,14 +210,15 @@ fi
 # DISABLECVM or PODVM_AMI_ID) takes the "kubectl-patch" field-manager. The chart
 # applies that ConfigMap via server-side apply, so on re-run helm conflicts:
 #   conflict with "kubectl-patch" using v1: .data.DISABLECVM
-# Clear the stale field-manager ownership (managedFields) so helm's apply re-owns
-# those fields. Lossless: helm rewrites the cm from the --set values below, and
-# running CAA pods read it only at start (helm recreates it in this same upgrade).
+# Just stripping managedFields does NOT work: `kubectl patch` itself runs as the
+# "kubectl-patch" manager and immediately re-stamps ownership of the data it
+# touches. Delete the ConfigMap instead (as we do for the RuntimeClass above) so
+# no manager survives and helm re-creates + owns it. Lossless: helm rebuilds the
+# cm from the --set values below, and running CAA pods read it only at start
+# (helm recreates it in this same upgrade).
 if kubectl get configmap peer-pods-cm -n "${CAA_NAMESPACE}" >/dev/null 2>&1; then
-    if kubectl patch configmap peer-pods-cm -n "${CAA_NAMESPACE}" --type=json \
-        -p='[{"op":"remove","path":"/metadata/managedFields"}]' >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Reset peer-pods-cm field ownership before upgrade (cleared stale kubectl-patch manager)"
-    fi
+    kubectl delete configmap peer-pods-cm -n "${CAA_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+    echo -e "${GREEN}✓${NC} Reset peer-pods-cm field ownership before upgrade (deleted; helm recreates it from chart values)"
 fi
 
 # NOTE: no `--wait` here on purpose — helm --wait would block the full timeout
