@@ -269,6 +269,11 @@ PHASE=""
 # never schedule on this node pool. Don't burn the whole timeout on it.
 UNSCHED_GRACE="${PEER_PODS_UNSCHED_GRACE_SECS:-60}"
 UNSCHED_ELAPSED=0
+# Also fail fast on a stuck container-create error (e.g. the workload image being
+# unpacked on the host instead of guest-pulled -> "content digest not found").
+# Allow a grace for the pod-VM boot + first CreateContainer attempt.
+CWAIT_GRACE="${PEER_PODS_CONTAINER_ERROR_GRACE_SECS:-90}"
+CWAIT_ELAPSED=0
 while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     PHASE=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
@@ -324,6 +329,40 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     else
         UNSCHED_ELAPSED=0
     fi
+
+    # Fast-fail on a stuck container-create error: a kata-remote workload image
+    # being unpacked on the worker (instead of guest-pulled), an in-guest image
+    # pull failure, etc. These do not self-resolve, so don't burn the timeout.
+    case "${CWAIT}" in
+        CreateContainerError|RunContainerError|CreateContainerConfigError|ImagePullBackOff|ErrImagePull)
+            CWAIT_ELAPSED=$((CWAIT_ELAPSED + POLL))
+            if [[ ${CWAIT_ELAPSED} -ge ${CWAIT_GRACE} ]]; then
+                CMSG=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
+                    -o jsonpath='{.status.containerStatuses[0].state.waiting.message}' 2>/dev/null || true)
+                echo -e "${YELLOW}--- container-create diagnostics (${CWAIT}) ---${NC}"
+                echo "  container message: ${CMSG:-<none>}"
+                echo "  pod events:"
+                kubectl describe pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
+                    | sed -n '/Events:/,$p' | sed 's/^/    /' || true
+                echo "  CAA daemonset log (tail):"
+                kubectl logs -n "${CAA_NAMESPACE:-confidential-containers-system}" \
+                    ds/"${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" --tail=80 2>/dev/null \
+                    | sed 's/^/    /' || true
+                echo -e "${YELLOW}--- end diagnostics ---${NC}"
+                step_fail "kata-remote smoke pod stuck in ${CWAIT} for ${CWAIT_ELAPSED}s:
+  '${CMSG:0:200}'
+  An 'error unpacking image ... content digest not found' here means the WORKLOAD image is being
+  unpacked on the worker instead of pulled inside the guest pod VM — the containerd guest-pull flags
+  (disable_snapshot_annotations / discard_unpacked_layers) are not effective on this node. Ensure
+  ./03-coco-operator.sh applied the guest-pull DaemonSet and it is Ready:
+    kubectl -n ${CAA_NAMESPACE:-confidential-containers-system} get ds kata-remote-containerd-guestpull
+    kubectl -n ${CAA_NAMESPACE:-confidential-containers-system} logs ds/kata-remote-containerd-guestpull"
+            fi
+            ;;
+        *)
+            CWAIT_ELAPSED=0
+            ;;
+    esac
 
     sleep "${POLL}"
     ELAPSED=$((ELAPSED + POLL))

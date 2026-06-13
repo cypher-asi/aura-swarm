@@ -1,0 +1,153 @@
+# kata-remote host prerequisite: containerd guest-pull (nydus) snapshotter flags
+#
+# kata-remote (Peer Pods) pulls the WORKLOAD image inside the guest pod VM
+# (CoCo "image_guest_pull") and presents it to containerd on the worker via the
+# nydus snapshotter. For containerd to route a workload container's image to the
+# nydus snapshotter (instead of unpacking it on the host) two CRI settings must
+# be off:
+#   disable_snapshot_annotations = false  # pass image annotations to nydus
+#   discard_unpacked_layers      = false  # keep layer blobs for on-demand pull
+#
+# Stock EKS containerd defaults BOTH to true, and kata-deploy does not reliably
+# set them in the right place: on containerd 2.x / config-version-3 the setting
+# lives under the SPLIT images plugin (io.containerd.cri.v1.images), not the
+# runtime plugin (kata-containers PR #12577). When they are wrong, the pod
+# sandbox (pause) still guest-pulls but the workload container is unpacked on the
+# host and fails to create with:
+#   error unpacking image ...: failed to get reader from content store:
+#   content digest sha256:...: not found
+# -> the kata-remote pod is stuck CreateContainerError.
+#
+# This privileged DaemonSet idempotently ensures both flags are false in a
+# containerd drop-in (correct table for the detected config version), restarts
+# containerd ONLY when it changed, and is a no-op once correct. As a DaemonSet it
+# also covers nodes added by future scale-ups. It targets the same workers as the
+# CAA daemonset (node.kubernetes.io/worker=""). Applied by ./03-coco-operator.sh
+# (namespace templated as __CAA_NAMESPACE__).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kata-remote-containerd-guestpull
+  namespace: __CAA_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: kata-remote-containerd-guestpull
+    app.kubernetes.io/part-of: cloud-api-adaptor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kata-remote-containerd-guestpull
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kata-remote-containerd-guestpull
+    spec:
+      # Same workers the CAA daemonset targets (03 labels nodes with this).
+      nodeSelector:
+        node.kubernetes.io/worker: ""
+      # PID1 + privileged so we can edit host containerd config and restart it.
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: configurer
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          securityContext:
+            privileged: true
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              # The amazonlinux base image does NOT ship nsenter; install it
+              # (util-linux-core) so we can enter the host namespaces.
+              if ! command -v nsenter >/dev/null 2>&1; then
+                echo "installing util-linux-core (for nsenter) in the configurer container..."
+                (dnf -y install util-linux-core || dnf -y install util-linux \
+                  || yum -y install util-linux) || true
+              fi
+              command -v nsenter >/dev/null 2>&1 \
+                || { echo "ERROR: could not obtain nsenter in the configurer container"; exit 1; }
+              # Run on the host via PID1's namespaces (host fs + systemd).
+              host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+
+              CONF=/etc/containerd/config.toml
+              DROPIN_DIR=/etc/containerd/config.d
+              DROPIN="${DROPIN_DIR}/zz-coco-guestpull.toml"
+
+              # Source of truth for the *effective* (merged) config + version.
+              DUMP="$(host containerd config dump 2>/dev/null || true)"
+
+              # Are both flags already effective? Then nothing to do.
+              if printf '%s' "$DUMP" | grep -qE 'disable_snapshot_annotations[[:space:]]*=[[:space:]]*false' \
+                 && printf '%s' "$DUMP" | grep -qE 'discard_unpacked_layers[[:space:]]*=[[:space:]]*false'; then
+                echo "containerd guest-pull flags already effective (disable_snapshot_annotations=false, discard_unpacked_layers=false) - nothing to do"
+                touch /tmp/guestpull-ready
+                exec sleep infinity
+              fi
+
+              # Pick the right CRI table for the containerd config version. The
+              # split images plugin (io.containerd.cri.v1.images) only exists on
+              # containerd 2.x / config v3; older builds use the v2 grpc cri table.
+              if printf '%s' "$DUMP" | grep -q 'io.containerd.cri.v1.images'; then
+                VERSION=3
+                TABLE="[plugins.'io.containerd.cri.v1.images']"
+              else
+                VERSION=2
+                TABLE='[plugins."io.containerd.grpc.v1.cri".containerd]'
+              fi
+              echo "containerd config version detected: ${VERSION}; writing drop-in under ${TABLE}"
+
+              # Write the drop-in (containerd merges imports, so a separate file
+              # with just these keys is safe even though the table also appears
+              # in the base config).
+              host mkdir -p "$DROPIN_DIR"
+              printf 'version = %s\n%s\n  disable_snapshot_annotations = false\n  discard_unpacked_layers = false\n' \
+                "$VERSION" "$TABLE" | host tee "$DROPIN" >/dev/null
+              echo "wrote ${DROPIN}:"
+              host cat "$DROPIN" | sed 's/^/  /'
+
+              # Ensure the main config imports our drop-in (back it up first).
+              if ! host grep -qF "$DROPIN" "$CONF"; then
+                host cp -n "$CONF" "${CONF}.coco-guestpull.bak" || true
+                if host grep -qE '^[[:space:]]*imports[[:space:]]*=[[:space:]]*\[' "$CONF"; then
+                  host sed -i "s#^\([[:space:]]*imports[[:space:]]*=[[:space:]]*\[\)#\1\n  \"${DROPIN}\",#" "$CONF"
+                else
+                  host sed -i "1i imports = [\"${DROPIN}\"]" "$CONF"
+                fi
+                echo "added ${DROPIN} to imports in ${CONF}"
+              fi
+
+              echo "restarting containerd to apply guest-pull flags..."
+              host systemctl restart containerd
+              sleep 5
+
+              # Verify the merged config now has both flags false.
+              VERIFY="$(host containerd config dump 2>/dev/null || true)"
+              if printf '%s' "$VERIFY" | grep -qE 'disable_snapshot_annotations[[:space:]]*=[[:space:]]*false' \
+                 && printf '%s' "$VERIFY" | grep -qE 'discard_unpacked_layers[[:space:]]*=[[:space:]]*false'; then
+                echo "containerd guest-pull flags now effective"
+              else
+                echo "ERROR: guest-pull flags still not effective after restart; dumping cri image config:"
+                printf '%s' "$VERIFY" | grep -E 'disable_snapshot_annotations|discard_unpacked_layers|cri.v1.images|grpc.v1.cri' | sed 's/^/  /' || true
+                exit 1
+              fi
+
+              # Stay Ready; the readiness probe re-checks the marker.
+              touch /tmp/guestpull-ready
+              exec sleep infinity
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/guestpull-ready"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

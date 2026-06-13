@@ -315,4 +315,27 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-fuse-installer" "${CAA
 fi
 echo -e "${GREEN}✓${NC} Worker fuse prerequisite ensured (mount.fuse present for nydus-overlayfs)"
 
+#------------------------------------------------------------------------------
+# Worker host prerequisite: containerd guest-pull (nydus) snapshotter flags.
+#
+# Even with the nydus snapshotter wired by kata-deploy, containerd must pass
+# image annotations to it and keep layer blobs, or the WORKLOAD container is
+# unpacked on the host and fails with "content digest ...: not found"
+# (CreateContainerError) while the pause sandbox still guest-pulls. EKS defaults
+# both flags to true and kata-deploy does not reliably fix them (wrong table on
+# containerd 2.x / config v3 — kata PR #12577). This DaemonSet sets
+# disable_snapshot_annotations=false + discard_unpacked_layers=false in a
+# containerd drop-in and restarts containerd only when it changed (idempotent).
+#------------------------------------------------------------------------------
+echo ""
+echo "Ensuring the kata-remote host prerequisite (containerd guest-pull flags) on workers..."
+GUESTPULL_DS_MANIFEST="${DEPLOY_DIR}/k8s/coco-node-containerd-guestpull.yaml"
+[[ -f "${GUESTPULL_DS_MANIFEST}" ]] || step_fail "missing guest-pull installer manifest: ${GUESTPULL_DS_MANIFEST}"
+sed "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" "${GUESTPULL_DS_MANIFEST}" | kubectl apply -f - >/dev/null
+if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" "${CAA_INSTALL_TIMEOUT}"; then
+    step_fail "the containerd guest-pull daemonset did not become Ready — kata-remote workload containers will be unpacked on the host and fail with 'content digest not found' (CreateContainerError).
+  Inspect: kubectl -n ${CAA_NAMESPACE} logs ds/kata-remote-containerd-guestpull"
+fi
+echo -e "${GREEN}✓${NC} Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
+
 step_ok "04 (./04-trustee-kbs.sh)"
