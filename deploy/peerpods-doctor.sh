@@ -35,16 +35,25 @@ source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
 ONLY_NODE=""
+LIVE=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node) ONLY_NODE="$2"; shift 2 ;;
+        --live) LIVE=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--node NODE]"
-            echo "  Read-only layered diagnostic for the kata-remote / Peer Pods chain."
+            echo "Usage: $0 [--node NODE] [--live]"
+            echo "  Layered diagnostic for the kata-remote / Peer Pods chain."
             echo "  --node NODE   probe only this worker node (default: all workers)"
+            echo "  --live        ALSO launch a throwaway kata-remote pod and assert it"
+            echo "                creates + reaches Running (validates guest-pull end to"
+            echo "                end). COSTS a billable EC2 pod VM per run; self-cleaning."
+            echo "                Override the test image with DOCTOR_LIVE_IMAGE."
+            echo ""
+            echo "  Read-only by default (cluster + pod + per-node host layers). Only"
+            echo "  --live mutates (creates/deletes a throwaway pod + reaps its pod VM)."
             exit 0
             ;;
-        *) echo "Unknown option: $1"; echo "Usage: $0 [--node NODE]"; exit 1 ;;
+        *) echo "Unknown option: $1"; echo "Usage: $0 [--node NODE] [--live]"; exit 1 ;;
     esac
 done
 
@@ -57,6 +66,10 @@ ensure_kubectl_context
 CAA_NS="${CAA_NAMESPACE:-confidential-containers-system}"
 CAA_DS="${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}"
 GP_LABEL="app.kubernetes.io/name=kata-remote-containerd-guestpull"
+# The containerd runtime-handler that kata-remote pods must request via the
+# io.containerd.cri.runtime-handler annotation == the RuntimeClass .handler.
+RC_HANDLER="$(kubectl get runtimeclass kata-remote -o jsonpath='{.handler}' 2>/dev/null | tr -d '\r' || true)"
+RC_HANDLER="${RC_HANDLER:-kata-remote}"
 
 #------------------------------------------------------------------------------
 # Checklist plumbing (same pattern as 08-r1-soak-check.sh).
@@ -165,7 +178,55 @@ else
 fi
 
 #------------------------------------------------------------------------------
-# Resolve the pinned harness ref (for the host-image-cache probe).
+# Application layers (pod-level, cluster-wide)
+#------------------------------------------------------------------------------
+log_section "Application layers"
+
+# One snapshot of every kata-remote pod (used by the next two checks).
+ALL_PODS_JSON="$(kubectl get pods -A -o json 2>/dev/null || echo '{}')"
+
+# runtime-handler-annotation: every kata-remote pod MUST carry
+# io.containerd.cri.runtime-handler=<RC handler>. On containerd 1.7 this is what
+# routes the workload image pull to the kata-remote nydus (guest-pull)
+# snapshotter; without it the image unpacks to overlayfs and create fails with
+# "content digest ...: not found". A pod missing it was built by a scheduler
+# without the fix (stale) -> redeploy the scheduler.
+KR_TOTAL="$(printf '%s' "${ALL_PODS_JSON}" | jq --arg h "${RC_HANDLER}" \
+    '[.items[] | select(.spec.runtimeClassName=="kata-remote")] | length' 2>/dev/null || echo 0)"
+KR_MISSING_LIST="$(printf '%s' "${ALL_PODS_JSON}" | jq -r --arg h "${RC_HANDLER}" \
+    '[.items[] | select(.spec.runtimeClassName=="kata-remote")
+       | select((.metadata.annotations["io.containerd.cri.runtime-handler"] // "") != $h)
+       | "\(.metadata.namespace)/\(.metadata.name)"] | .[]' 2>/dev/null || true)"
+KR_MISSING_N="$(printf '%s' "${KR_MISSING_LIST}" | grep -c . || true)"
+if [[ "${KR_TOTAL:-0}" -eq 0 ]]; then
+    record "runtime-handler-annotation" SKIP "no kata-remote pods present to inspect"
+elif [[ "${KR_MISSING_N:-0}" -eq 0 ]]; then
+    record "runtime-handler-annotation" PASS "${KR_TOTAL} kata-remote pod(s) carry io.containerd.cri.runtime-handler=${RC_HANDLER}"
+else
+    record "runtime-handler-annotation" FAIL "${KR_MISSING_N}/${KR_TOTAL} kata-remote pod(s) lack io.containerd.cri.runtime-handler=${RC_HANDLER} -> image unpacks to overlayfs, 'content digest not found'. Redeploy the scheduler (./07-deploy-r1.sh) so new pods carry it."
+    printf '%s\n' "${KR_MISSING_LIST}" | head -10 | sed 's/^/    /'
+fi
+
+# fleet-failures: kata-remote pods stuck in a create/pull error, grouped by
+# message, so the blast radius is visible at a glance.
+FLEET_FAILS="$(printf '%s' "${ALL_PODS_JSON}" | jq -r '
+    [.items[] | select(.spec.runtimeClassName=="kata-remote")
+      | (.status.containerStatuses // [])[]?
+      | .state.waiting // empty
+      | select(.reason | test("CreateContainerError|RunContainerError|CreateContainerConfigError|ImagePullBackOff|ErrImagePull"))
+      | (.reason + " :: " + ((.message // "") | gsub("[0-9a-f]{64}";"<sha>") | .[0:140]))]
+    | group_by(.) | map({m: .[0], n: length}) | sort_by(-.n) | .[]
+    | "\(.n)x  \(.m)"' 2>/dev/null || true)"
+if [[ -z "${FLEET_FAILS}" ]]; then
+    record "fleet-failures" PASS "no kata-remote pods in CreateContainer/ImagePull error"
+else
+    FLEET_N="$(printf '%s\n' "${FLEET_FAILS}" | awk -F'x ' '{s+=$1} END{print s+0}')"
+    record "fleet-failures" FAIL "${FLEET_N} kata-remote pod(s) in create/pull error (grouped below)"
+    printf '%s\n' "${FLEET_FAILS}" | sed 's/^/    /'
+fi
+
+#------------------------------------------------------------------------------
+# Resolve the pinned harness ref (for the host-image content probe).
 #------------------------------------------------------------------------------
 HARNESS_REF="${AURA_HARNESS_IMAGE:-}"
 if [[ -z "${HARNESS_REF}" && -f "${HARNESS_STATE_FILE}" ]]; then
@@ -291,6 +352,28 @@ for node in "${NODES[@]}"; do
         record "${short}/nydus-bound" SKIP "guest-pull pod not Ready and no marker in logs"
     fi
 
+    # runtime-config: the runtimes.kata-remote block must be complete — a
+    # runtime_type AND a (non-overlayfs) snapshotter — and the RuntimeClass
+    # .handler must match what pods request. A bound snapshotter plugin is not
+    # enough if kata-deploy wrote a half runtime block.
+    if [[ -n "${DUMP}" ]]; then
+        RTYPE="$(printf '%s' "${DUMP}" | awk -F= '
+            /runtimes\.kata-remote\]/{r=1;next}
+            r && /^[[:space:]]*\[/{r=0}
+            r && /runtime_type[[:space:]]*=/{v=$2; gsub(/[" \t]/,"",v); print v; exit}')"
+        if [[ -z "${RTYPE}" ]]; then
+            record "${short}/runtime-config" FAIL "runtimes.kata-remote has no runtime_type in the effective containerd config; kata-deploy wiring is incomplete"
+        elif [[ -z "${SNAP}" || "${SNAP}" == "overlayfs" ]]; then
+            record "${short}/runtime-config" FAIL "runtimes.kata-remote snapshotter is '${SNAP:-<unset>}' (expected a nydus guest-pull snapshotter), runtime_type=${RTYPE}"
+        elif [[ "${RC_HANDLER}" != "kata-remote" ]]; then
+            record "${short}/runtime-config" FAIL "RuntimeClass kata-remote .handler='${RC_HANDLER}' does not match the runtime name 'kata-remote'; pods' runtime-handler annotation will not route to this runtime"
+        else
+            record "${short}/runtime-config" PASS "runtime_type=${RTYPE}, snapshotter=${SNAP}, RC handler=${RC_HANDLER}"
+        fi
+    else
+        record "${short}/runtime-config" SKIP "guest-pull pod not Ready; cannot read containerd config"
+    fi
+
     # nydus-daemon: proxy socket present + process running.
     if [[ "${CAN_EXEC}" == "true" && -n "${SNAP}" && "${SNAP}" != "overlayfs" ]]; then
         SOCK="$(printf '%s' "${DUMP}" | sock_from_dump "${SNAP}")"
@@ -317,21 +400,124 @@ for node in "${NODES[@]}"; do
     # content is the bug. Flipping the flag cannot restore already-discarded
     # layers, and containerd auto-refetch (PR #10703) is not in 1.7.x.
     if [[ "${CAN_EXEC}" != "true" ]]; then
-        record "${short}/host-image-content" SKIP "guest-pull pod not Ready; cannot inspect host content store"
-    elif [[ -z "${HARNESS_REF}" ]]; then
-        record "${short}/host-image-content" SKIP "no pinned harness image resolved (AURA_HARNESS_IMAGE / .last-harness-image.env)"
+        record "${short}/incomplete-images" SKIP "guest-pull pod not Ready; cannot inspect host content store"
     else
         CHECK="$(host_exec "${GP_POD}" ctr -n k8s.io -a /run/containerd/containerd.sock images check || true)"
-        ROW="$(printf '%s\n' "${CHECK}" | grep -F "${HARNESS_REPO:-aura-swarm-dev-harness}" | head -1)"
-        if [[ -z "${ROW}" ]]; then
-            record "${short}/host-image-content" PASS "harness image not on host (kubelet pulls it complete when needed)"
-        elif printf '%s' "${ROW}" | grep -qi 'incomplete'; then
-            record "${short}/host-image-content" FAIL "harness image present but content INCOMPLETE on ${short} (discarded layers -> nydus unpack fails 'content digest not found'). Purge so the kubelet re-pulls it complete: ctr -n k8s.io images ls -q | grep ${HARNESS_REPO:-aura-swarm-dev-harness} | xargs -r ctr -n k8s.io images rm"
+        # Every image whose content is incomplete: a kata-remote pod using it (or
+        # the sandbox/pause image) fails CreateContainer with "content digest not
+        # found". Includes the harness image but also the pause image and any
+        # other workload pulled while discard_unpacked_layers was still true.
+        INCOMPLETE_IMGS="$(printf '%s\n' "${CHECK}" | awk 'tolower($0) ~ /incomplete/{print $1}')"
+        INCN="$(printf '%s' "${INCOMPLETE_IMGS}" | grep -c . || true)"
+        if [[ "${INCN:-0}" -eq 0 ]]; then
+            record "${short}/incomplete-images" PASS "no host images with incomplete (discarded-layer) content"
         else
-            record "${short}/host-image-content" PASS "harness image content complete on host"
+            HARNESS_HIT=""
+            [[ -n "${HARNESS_REPO}" ]] && HARNESS_HIT="$(printf '%s\n' "${INCOMPLETE_IMGS}" | grep -F "${HARNESS_REPO}" | head -1 || true)"
+            record "${short}/incomplete-images" FAIL "${INCN} host image(s) have INCOMPLETE content (discarded layers -> 'content digest not found')${HARNESS_HIT:+ incl. the harness image}. Purge so the kubelet re-pulls them complete (flag is false now): for r in <refs>; do ctr -n k8s.io images rm \$r; done"
+            printf '%s\n' "${INCOMPLETE_IMGS}" | head -10 | sed 's/^/    /'
+        fi
+    fi
+
+    # caa-log: scan the CAA pod on this node (+ kata-deploy) for known fatal
+    # error signatures, so a problem that only shows in logs is surfaced here.
+    CAA_POD="$(kubectl -n "${CAA_NS}" get pods --field-selector "spec.nodeName=${node}" -o json 2>/dev/null \
+        | jq -r '[.items[] | select((.metadata.ownerReferences // [])[]?.name | test("cloud-api-adaptor")) | .metadata.name][0] // ""' 2>/dev/null | tr -d '\r' || true)"
+    if [[ -z "${CAA_POD}" ]]; then
+        record "${short}/caa-log" SKIP "no CAA pod found on node"
+    else
+        CAA_LOG="$(kubectl -n "${CAA_NS}" logs "${CAA_POD}" --tail=200 2>/dev/null || true)"
+        SIGS="$(printf '%s\n' "${CAA_LOG}" | grep -iE 'RunInstances|UnauthorizedOperation|AccessDenied|InsufficientInstanceCapacity|attestation .*fail|failed to create|bind: address already in use|no such file or directory' | grep -ivE 'level=(debug|info)' | tail -5 || true)"
+        if [[ -z "${SIGS}" ]]; then
+            record "${short}/caa-log" PASS "no known fatal signatures in the CAA log (last 200 lines)"
+        else
+            record "${short}/caa-log" FAIL "CAA log on ${short} shows error signature(s) (last lines below)"
+            printf '%s\n' "${SIGS}" | sed 's/^/    /'
         fi
     fi
 done
+
+#------------------------------------------------------------------------------
+# Live end-to-end (opt-in --live): launch a throwaway kata-remote pod and assert
+# it CREATES + reaches Running. This validates webhook -> capacity -> pod-VM boot
+# -> guest-pull -> container create end to end (the only thing the read-only
+# layers cannot prove). It boots a BILLABLE pod VM; the pod (and a best-effort
+# pod-VM reap) are cleaned up on exit. Attestation/CDH is out of scope here
+# (05-peer-pods-smoke-test.sh covers that); this uses a plain public image.
+#------------------------------------------------------------------------------
+if [[ "${LIVE}" == "true" ]]; then
+    log_section "Live end-to-end (--live)"
+    LIVE_IMAGE="${DOCTOR_LIVE_IMAGE:-busybox:1.36}"
+    LIVE_POD="peerpods-doctor-live-$(date +%s)"
+    LIVE_NS="${K8S_NAMESPACE_SYSTEM}"
+    LIVE_TIMEOUT="${DOCTOR_LIVE_TIMEOUT_SECS:-600}"
+    PODVM_FILTER="podvm-${LIVE_POD}*"
+
+    live_cleanup() {
+        kubectl delete pod "${LIVE_POD}" -n "${LIVE_NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        # Best-effort: terminate any pod VM this run created (no leaked instance).
+        local ids
+        ids="$(aws ec2 describe-instances --region "${AWS_REGION}" \
+            --filters "Name=tag:Name,Values=${PODVM_FILTER}" "Name=instance-state-name,Values=pending,running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null | tr '[:space:]' ' ' || true)"
+        if [[ -n "${ids// /}" ]]; then
+            log_detail "terminating throwaway pod VM(s): ${ids}"
+            aws ec2 terminate-instances --region "${AWS_REGION}" --instance-ids ${ids} >/dev/null 2>&1 || true
+        fi
+    }
+    trap live_cleanup EXIT
+
+    LIVE_NODE_SELECTOR=""
+    [[ -n "${ONLY_NODE}" ]] && LIVE_NODE_SELECTOR=$'\n  nodeSelector:\n    kubernetes.io/hostname: '"${ONLY_NODE}"
+
+    log_info "Launching throwaway kata-remote pod ${LIVE_POD} (image ${LIVE_IMAGE}; boots a pod VM)..."
+    kubectl apply -f - >/dev/null <<EOF || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${LIVE_POD}
+  namespace: ${LIVE_NS}
+  annotations:
+    io.containerd.cri.runtime-handler: ${RC_HANDLER}
+spec:
+  restartPolicy: Never
+  runtimeClassName: kata-remote${LIVE_NODE_SELECTOR}
+  containers:
+    - name: probe
+      image: ${LIVE_IMAGE}
+      command: ["sh", "-c", "echo doctor-live-ok; sleep 3600"]
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { cpu: 250m, memory: 256Mi }
+EOF
+
+    LIVE_ELAPSED=0; LIVE_POLL=10; LIVE_RESULT=""; LIVE_NOTE=""
+    while [[ ${LIVE_ELAPSED} -le ${LIVE_TIMEOUT} ]]; do
+        LJSON="$(kubectl get pod "${LIVE_POD}" -n "${LIVE_NS}" -o json 2>/dev/null || echo '{}')"
+        LPHASE="$(printf '%s' "${LJSON}" | jq -r '.status.phase // "Unknown"')"
+        LWAIT="$(printf '%s' "${LJSON}" | jq -r '.status.containerStatuses[0].state.waiting.reason // ""')"
+        LWMSG="$(printf '%s' "${LJSON}" | jq -r '.status.containerStatuses[0].state.waiting.message // ""')"
+        LSCHED="$(printf '%s' "${LJSON}" | jq -r '([.status.conditions[]? | select(.type=="PodScheduled")][0]) as $c | (($c.reason // "")+": "+($c.message // ""))')"
+        if [[ "${LPHASE}" == "Running" || "${LPHASE}" == "Succeeded" ]]; then
+            LIVE_RESULT=PASS; LIVE_NOTE="pod reached ${LPHASE} (create -> guest-pull -> pod-VM boot all work)"; break
+        fi
+        case "${LWAIT}" in
+            CreateContainerError|RunContainerError|CreateContainerConfigError|ImagePullBackOff|ErrImagePull)
+                LIVE_RESULT=FAIL; LIVE_NOTE="${LWAIT}: ${LWMSG:0:160}"; break ;;
+        esac
+        [[ "${LSCHED}" == *Unschedulable* ]] && { LIVE_RESULT=FAIL; LIVE_NOTE="Unschedulable: ${LSCHED:0:140}"; break; }
+        log_progress "[${LIVE_ELAPSED}s] live pod phase=${LPHASE}${LWAIT:+ waiting=${LWAIT}}"
+        sleep "${LIVE_POLL}"; LIVE_ELAPSED=$((LIVE_ELAPSED + LIVE_POLL))
+    done
+    [[ -z "${LIVE_RESULT}" ]] && { LIVE_RESULT=FAIL; LIVE_NOTE="did not reach Running within ${LIVE_TIMEOUT}s (still ${LPHASE:-?})"; }
+    record "live-create" "${LIVE_RESULT}" "${LIVE_NOTE}"
+    if [[ "${LIVE_RESULT}" != "PASS" ]]; then
+        log_detail "live pod events:"
+        kubectl describe pod "${LIVE_POD}" -n "${LIVE_NS}" 2>/dev/null | sed -n '/Events:/,$p' | indent || true
+    fi
+    live_cleanup
+    trap - EXIT
+fi
 
 #------------------------------------------------------------------------------
 # Checklist + verdict
