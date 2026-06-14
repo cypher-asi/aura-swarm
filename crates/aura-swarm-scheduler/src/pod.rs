@@ -46,8 +46,21 @@ pub fn build_pod(
     // spec. Only injected into confidential pods.
     let state_key_id = spec.storage_encryption.key_id().to_string();
 
+    // The RuntimeClass (Some("kata-remote") for confidential pods, None for
+    // container pods) also drives the containerd runtime-handler annotation in
+    // the metadata, so resolve it here and thread it through.
+    let isolation = spec.isolation.unwrap_or(config.default_isolation);
+    let runtime_class = isolation.runtime_class();
+
     Pod {
-        metadata: build_metadata(&pod_name, &agent_id_hex, agent_name, &pod_id, config),
+        metadata: build_metadata(
+            &pod_name,
+            &agent_id_hex,
+            agent_name,
+            &pod_id,
+            config,
+            runtime_class,
+        ),
         spec: Some(build_pod_spec(
             &agent_id_hex,
             user_id_hex,
@@ -110,6 +123,7 @@ fn build_metadata(
     agent_name: &str,
     pod_id: &uuid::Uuid,
     config: &SchedulerConfig,
+    runtime_class: Option<&str>,
 ) -> ObjectMeta {
     let mut labels = BTreeMap::new();
     labels.insert("app".to_string(), "swarm-agent".to_string());
@@ -122,6 +136,25 @@ fn build_metadata(
         "swarm.io/created-at".to_string(),
         chrono::Utc::now().to_rfc3339(),
     );
+
+    // Confidential pods use a per-runtime (nydus guest-pull) snapshotter via the
+    // `kata-remote` RuntimeClass. On containerd 1.7.x, runtime-level snapshotter
+    // support is experimental and is ONLY engaged when the pod carries the
+    // `io.containerd.cri.runtime-handler` annotation (value = the RuntimeClass
+    // handler, which is the runtime class name here). Without it, containerd
+    // unpacks the workload image into the DEFAULT (overlayfs) snapshotter at
+    // pull time; the kata-remote runtime's nydus snapshotter then cannot find
+    // the layer content at container create and the pod fails with
+    // "error unpacking image ... content digest ...: not found"
+    // (CreateContainerError) on every node, regardless of the guest-pull flags.
+    // Container (dev) pods use the default runtime/snapshotter and need no hint.
+    // Refs: containerd #8674, kata-containers #8407, nydus-snapshotter docs.
+    if let Some(handler) = runtime_class {
+        annotations.insert(
+            "io.containerd.cri.runtime-handler".to_string(),
+            handler.to_string(),
+        );
+    }
 
     ObjectMeta {
         name: Some(pod_name.to_string()),
@@ -632,6 +665,43 @@ mod tests {
         let pod_spec = pod.spec.as_ref().unwrap();
 
         assert_eq!(pod_spec.runtime_class_name, None);
+    }
+
+    #[test]
+    fn confidential_pod_sets_containerd_runtime_handler_annotation() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            ..test_spec(&agent_id)
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
+        let annotations = pod.metadata.annotations.as_ref().unwrap();
+
+        // Required for containerd 1.7 runtime-level (nydus guest-pull) snapshotter
+        // selection; without it the workload image unpacks to overlayfs and the
+        // kata-remote runtime fails with "content digest ...: not found".
+        assert_eq!(
+            annotations.get("io.containerd.cri.runtime-handler"),
+            Some(&"kata-remote".to_string())
+        );
+    }
+
+    #[test]
+    fn container_pod_omits_containerd_runtime_handler_annotation() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::Container),
+            ..test_spec(&agent_id)
+        };
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "test-agent", &spec, &config);
+        let annotations = pod.metadata.annotations.as_ref().unwrap();
+
+        // Container pods use the default runtime/snapshotter; no per-runtime hint.
+        assert!(!annotations.contains_key("io.containerd.cri.runtime-handler"));
     }
 
     #[test]

@@ -478,6 +478,11 @@ metadata:
     app: peer-pods-smoke-test
   annotations:
     io.katacontainers.config.hypervisor.cc_init_data: "${SMOKE_INITDATA_B64}"
+    # containerd 1.7 only routes the image pull to the kata-remote runtime's
+    # nydus (guest-pull) snapshotter when this annotation is present; without it
+    # the image unpacks to the default overlayfs snapshotter and create fails
+    # with "content digest ...: not found" (containerd #8674 / kata #8407).
+    io.containerd.cri.runtime-handler: kata-remote
 spec:
   restartPolicy: Never
   runtimeClassName: kata-remote
