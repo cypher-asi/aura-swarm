@@ -32,8 +32,15 @@ SECRETS_DIR="${PROJECT_ROOT}/.secrets"
 HARNESS_STATE_FILE="${DEPLOY_DIR}/.last-harness-image.env"
 EFS_BACKUP_STATE_FILE="${DEPLOY_DIR}/.last-efs-backup.env"
 
-# Owner JWT used by the test-agent checks (steps 06/07); empty when unused.
+# Owner JWT used by the test-agent checks (steps 07/08). Normally obtained by a
+# persistent zOS email/password login (ensure_smoke_test_token) and cached,
+# gitignored, in SMOKE_SESSION_FILE so repeated soak runs reuse one session.
 SMOKE_TEST_TOKEN="${SMOKE_TEST_TOKEN:-}"
+# zOS auth API the gateway introspects tokens against — MUST match the gateway's
+# AUTH_BASE_URL. The login endpoint is ${AUTH_BASE_URL}/api/v2/accounts/login.
+AUTH_BASE_URL="${AUTH_BASE_URL:-https://zosapi.zero.tech}"
+# Cached owner session (gitignored). One zOS login is reused until it expires.
+SMOKE_SESSION_FILE="${SMOKE_SESSION_FILE:-${DEPLOY_DIR}/.smoke-session.jwt}"
 
 # Staged rollout refs (overridable from the environment / CLI):
 #   R1 (dual-mode)  default fa93895
@@ -703,6 +710,135 @@ internal_token() {
         -o jsonpath='{.data.INTERNAL_TOKEN}' 2>/dev/null || true)
     [[ -z "${encoded}" ]] && return 1
     printf '%s' "${encoded}" | base64 --decode
+}
+
+#------------------------------------------------------------------------------
+# Persistent owner login for the step 07/08 test-agent checks
+#
+# Mirrors aura-os's evals bootstrap-auth.sh: log in to zOS with an email +
+# password, then cache the returned JWT (gitignored) and reuse it across runs
+# until it expires. The gateway validates this token by introspecting it against
+# AUTH_BASE_URL, so we log in against the very same zOS API.
+#------------------------------------------------------------------------------
+
+# Echo the `exp` (unix seconds) from a JWT's payload, or empty when the token is
+# not a 3-segment JWT / has no exp. base64url -> base64 with padding, then jq.
+smoke_token_exp() {
+    local token="$1" payload
+    payload="${token#*.}"; payload="${payload%%.*}"
+    [[ "${payload}" == "${token}" || -z "${payload}" ]] && return 1
+    payload="${payload//-/+}"; payload="${payload//_//}"
+    case $(( ${#payload} % 4 )) in 2) payload+="==" ;; 3) payload+="=" ;; esac
+    printf '%s' "${payload}" | base64 --decode 2>/dev/null \
+        | jq -r '.exp // empty' 2>/dev/null
+}
+
+# True when a cached token is still usable: a dev-mode `test-token:<uuid>` (no
+# expiry), an opaque token we cannot introspect (assume usable — the API call
+# will surface a real rejection), or a JWT with >60s of validity left.
+smoke_token_valid() {
+    local token="$1" exp now
+    [[ -z "${token}" ]] && return 1
+    case "${token}" in test-token:*) return 0 ;; esac
+    exp="$(smoke_token_exp "${token}")" || return 0
+    [[ -z "${exp}" ]] && return 0
+    now="$(date +%s)"
+    (( exp > now + 60 ))
+}
+
+# Interactive/env zOS email+password login. Writes the JWT to SMOKE_SESSION_FILE
+# (0600, gitignored) and exports SMOKE_TEST_TOKEN. Credentials come from
+# SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD when set, else a /dev/tty prompt.
+smoke_login() {
+    local email="${SMOKE_TEST_EMAIL:-}" password="${SMOKE_TEST_PASSWORD:-}"
+    local login_url="${AUTH_BASE_URL%/}/api/v2/accounts/login"
+
+    if [[ -z "${email}" || -z "${password}" ]]; then
+        if [[ ! -e /dev/tty ]]; then
+            log_err "No cached owner session and no credentials to log in."
+            log_detail "Set SMOKE_TEST_EMAIL + SMOKE_TEST_PASSWORD (a zOS owner account),"
+            log_detail "run interactively, or provide SMOKE_TEST_TOKEN / .secrets/SMOKE_TEST_TOKEN."
+            return 1
+        fi
+        printf '\n%s%s zOS login required for test-agent verification%s\n' \
+            "${BOLD}${CYAN}" "${ICON_STEP}" "${NC}" > /dev/tty
+        printf '%s    %s%s\n' "${DIM}" "${login_url}" "${NC}" > /dev/tty
+        if [[ -z "${email}" ]]; then
+            printf '  Email: ' > /dev/tty
+            IFS= read -r email < /dev/tty
+        fi
+        if [[ -z "${password}" ]]; then
+            printf '  Password: ' > /dev/tty
+            IFS= read -rs password < /dev/tty
+            printf '\n' > /dev/tty
+        fi
+    fi
+    [[ -n "${email}" && -n "${password}" ]] \
+        || { log_err "email and password are both required to log in"; return 1; }
+
+    log_info "Authenticating ${email} with zOS (${login_url})..."
+    local payload body http token msg
+    payload="$(jq -nc --arg e "${email}" --arg p "${password}" '{email:$e, password:$p}')"
+    body="$(mktemp)"
+    http="$(curl -sS -o "${body}" -w '%{http_code}' \
+        -X POST -H 'Content-Type: application/json' \
+        -d "${payload}" "${login_url}" 2>/dev/null || echo "000")"
+    if [[ "${http}" != 2[0-9][0-9] ]]; then
+        msg="$(jq -r '.message // .error // empty' "${body}" 2>/dev/null)"
+        rm -f "${body}"
+        log_err "zOS login failed (HTTP ${http}${msg:+: ${msg}})."
+        log_detail "Check the credentials and AUTH_BASE_URL=${AUTH_BASE_URL}."
+        return 1
+    fi
+    token="$(jq -r '.accessToken // .access_token // empty' "${body}" 2>/dev/null)"
+    rm -f "${body}"
+    [[ -n "${token}" ]] || { log_err "zOS login response contained no access token"; return 1; }
+
+    ( umask 077; printf '%s' "${token}" > "${SMOKE_SESSION_FILE}" )
+    chmod 600 "${SMOKE_SESSION_FILE}" 2>/dev/null || true
+    SMOKE_TEST_TOKEN="${token}"
+    export SMOKE_TEST_TOKEN
+    log_ok "Logged in; cached owner session to ${SMOKE_SESSION_FILE##*/} (gitignored)"
+}
+
+# Resolve the owner JWT for steps 07/08, exporting SMOKE_TEST_TOKEN. Order:
+#   SMOKE_FORCE_LOGIN=1 -> always re-login (clears the cache first)
+#   1. SMOKE_TEST_TOKEN already in the environment (explicit override wins)
+#   2. .secrets/SMOKE_TEST_TOKEN (legacy static file)
+#   3. cached session in SMOKE_SESSION_FILE, if still valid (persistent login)
+#   4. a fresh zOS email/password login (smoke_login)
+# Returns non-zero only when no token can be obtained.
+ensure_smoke_test_token() {
+    if [[ "${SMOKE_FORCE_LOGIN:-0}" == "1" ]]; then
+        rm -f "${SMOKE_SESSION_FILE}" 2>/dev/null || true
+        smoke_login
+        return
+    fi
+    if [[ -n "${SMOKE_TEST_TOKEN:-}" ]]; then
+        export SMOKE_TEST_TOKEN
+        log_ok "Using SMOKE_TEST_TOKEN from the environment"
+        return 0
+    fi
+    local legacy
+    legacy="$(load_secret SMOKE_TEST_TOKEN)"
+    if [[ -n "${legacy}" ]]; then
+        SMOKE_TEST_TOKEN="${legacy}"
+        export SMOKE_TEST_TOKEN
+        log_ok "Using owner JWT from .secrets/SMOKE_TEST_TOKEN"
+        return 0
+    fi
+    if [[ -f "${SMOKE_SESSION_FILE}" ]]; then
+        local cached
+        cached="$(tr -d '\n\r' < "${SMOKE_SESSION_FILE}")"
+        if smoke_token_valid "${cached}"; then
+            SMOKE_TEST_TOKEN="${cached}"
+            export SMOKE_TEST_TOKEN
+            log_ok "Reusing cached owner session (${SMOKE_SESSION_FILE##*/})"
+            return 0
+        fi
+        log_info "Cached owner session expired/invalid — logging in again."
+    fi
+    smoke_login
 }
 
 # Trustee KBS admin keypair: private half stays in .secrets/kbs-admin.key,

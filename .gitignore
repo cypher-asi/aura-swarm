@@ -14,6 +14,9 @@ deploy/terraform/.terraform.tfstate.lock.info
 deploy/terraform/terraform.tfvars
 deploy/.last-harness-image.env
 
+# Cached owner login session for steps 07/08 (zOS JWT — NEVER commit)
+deploy/.smoke-session.jwt
+
 # IDE
 .idea/
 .vscode/

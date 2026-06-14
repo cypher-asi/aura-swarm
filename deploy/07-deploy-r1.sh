@@ -11,9 +11,13 @@
 #   ./07-deploy-r1.sh                 # deploys SWARM_R1_REF (default fa93895)
 #   ./07-deploy-r1.sh --ref <git-ref>
 #   ./07-deploy-r1.sh --skip-test-agent
+#   ./07-deploy-r1.sh --relogin       # force a fresh zOS login (ignore cache)
 #
-# The test-agent check needs an owner JWT in SMOKE_TEST_TOKEN (env) or
-# .secrets/SMOKE_TEST_TOKEN.
+# The test-agent check needs an owner session. Unless --skip-test-agent is
+# given, the script logs in to zOS with an email/password (prompted, or from
+# SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD) and caches the JWT, gitignored, in
+# deploy/.smoke-session.jwt for reuse. A pre-minted SMOKE_TEST_TOKEN (env) or
+# .secrets/SMOKE_TEST_TOKEN still takes precedence and skips the login.
 
 set -euo pipefail
 
@@ -27,7 +31,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --ref) REF="$2"; shift 2 ;;
         --skip-test-agent) SKIP_TEST_AGENT=true; shift ;;
-        *) echo "Unknown option: $1"; echo "Usage: $0 [--ref GIT_REF] [--skip-test-agent]"; exit 1 ;;
+        --relogin) export SMOKE_FORCE_LOGIN=1; shift ;;
+        *) echo "Unknown option: $1"; echo "Usage: $0 [--ref GIT_REF] [--skip-test-agent] [--relogin]"; exit 1 ;;
     esac
 done
 
@@ -37,9 +42,9 @@ require_cmds aws kubectl jq curl docker git openssl
 require_aws_auth
 ensure_kubectl_context
 
-SMOKE_TEST_TOKEN="${SMOKE_TEST_TOKEN:-$(load_secret SMOKE_TEST_TOKEN)}"
-if [[ "${SKIP_TEST_AGENT}" != "true" && -z "${SMOKE_TEST_TOKEN}" ]]; then
-    step_fail "test-agent verification needs an owner JWT: set SMOKE_TEST_TOKEN or create .secrets/SMOKE_TEST_TOKEN (or pass --skip-test-agent)"
+if [[ "${SKIP_TEST_AGENT}" != "true" ]]; then
+    ensure_smoke_test_token \
+        || step_fail "test-agent verification needs an owner session: log in when prompted, set SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD, provide SMOKE_TEST_TOKEN, or pass --skip-test-agent"
 fi
 
 TMP_DIR=$(mktemp -d)

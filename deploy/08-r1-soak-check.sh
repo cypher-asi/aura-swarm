@@ -19,8 +19,13 @@
 #   ./08-r1-soak-check.sh --agent-id ID    # reuse an existing designated test agent
 #   ./08-r1-soak-check.sh --keep-agent     # leave the test agent running for the
 #                                          # soak window (reuse with --agent-id)
+#   ./08-r1-soak-check.sh --relogin        # force a fresh zOS login (ignore cache)
 #
-# Requires an owner JWT in SMOKE_TEST_TOKEN (env) or .secrets/SMOKE_TEST_TOKEN.
+# Requires an owner session. The script logs in to zOS with an email/password
+# (prompted, or from SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD) and caches the JWT,
+# gitignored, in deploy/.smoke-session.jwt — so repeated soak runs reuse one
+# login until it expires. A pre-minted SMOKE_TEST_TOKEN (env) or
+# .secrets/SMOKE_TEST_TOKEN still takes precedence and skips the login.
 
 set -euo pipefail
 
@@ -34,7 +39,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent-id) TEST_AGENT_ID="$2"; KEEP_AGENT=true; shift 2 ;;
         --keep-agent) KEEP_AGENT=true; shift ;;
-        *) echo "Unknown option: $1"; echo "Usage: $0 [--agent-id ID] [--keep-agent]"; exit 1 ;;
+        --relogin) export SMOKE_FORCE_LOGIN=1; shift ;;
+        *) echo "Unknown option: $1"; echo "Usage: $0 [--agent-id ID] [--keep-agent] [--relogin]"; exit 1 ;;
     esac
 done
 
@@ -44,9 +50,8 @@ require_cmds aws kubectl jq curl
 require_aws_auth
 ensure_kubectl_context
 
-SMOKE_TEST_TOKEN="${SMOKE_TEST_TOKEN:-$(load_secret SMOKE_TEST_TOKEN)}"
-[[ -n "${SMOKE_TEST_TOKEN}" ]] \
-    || step_fail "set SMOKE_TEST_TOKEN or create .secrets/SMOKE_TEST_TOKEN (owner JWT for the test agent)"
+ensure_smoke_test_token \
+    || step_fail "owner session required: log in when prompted, set SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD, or provide SMOKE_TEST_TOKEN / .secrets/SMOKE_TEST_TOKEN"
 
 CREATED_AGENT=false
 declare -a CHECK_NAMES=()
