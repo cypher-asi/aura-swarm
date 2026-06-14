@@ -1031,14 +1031,21 @@ dump_daemonset_diagnostics() {
 # Dumps diagnostics on failure. Returns 0 Ready, 1 on crashloop/timeout.
 # Args: ns ds [timeout=300] [poll=10] [restart_threshold=3]
 wait_daemonset_ready() {
-    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" restarts="${5:-3}"
-    local elapsed=0 desired ready bad
+    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" restarts="${5:-3}" min_ready="${6:-0}"
+    local elapsed=0 desired ready bad target
     echo "Waiting for daemonset ${ds} in ${ns} (fail-fast on CrashLoopBackOff, timeout ${timeout}s)..."
     while (( elapsed <= timeout )); do
         desired=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
         ready=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-        if [[ "${desired:-0}" -ge 1 && "${ready:-0}" -ge "${desired:-0}" ]]; then
-            echo -e "${GREEN}✓${NC} daemonset ${ds} Ready (${ready}/${desired})"
+        # Target readiness: min_ready>0 accepts a partial fleet (e.g. only ONE
+        # node needed); otherwise require all desired pods Ready.
+        target="${desired:-0}"
+        if [[ "${min_ready:-0}" -ge 1 ]]; then
+            target="${min_ready}"
+            (( target > ${desired:-0} )) && target="${desired:-0}"
+        fi
+        if [[ "${desired:-0}" -ge 1 && "${ready:-0}" -ge "${target}" ]]; then
+            echo -e "${GREEN}✓${NC} daemonset ${ds} Ready (${ready}/${desired}; needed ${target})"
             return 0
         fi
         # Fail fast: any owned pod with a CrashLoopBackOff container or restartCount >= threshold.
@@ -1163,11 +1170,33 @@ peerpods_node_capacity_summary() {
         | jq -r '.items[] | "    \(.metadata.name): capacity=\(.status.capacity["kata.peerpods.io/vm"] // "<none>") allocatable=\(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
 }
 
+# Echo the kata-remote RuntimeClass pod overhead (.overhead.podFixed), e.g.
+# '{"cpu":"250m","memory":"160Mi"}', or empty when the RuntimeClass / overhead
+# is unset. kata-deploy stamps a DEFAULT (non-zero) overhead onto this
+# RuntimeClass on every install, and the scheduler ADDS it to every kata-remote
+# pod's effective requests — so a webhook-mutated pod that requests 0 cpu still
+# gets this cpu added and can go Unschedulable "Insufficient cpu" on a busy node.
+kata_remote_overhead() {
+    kubectl get runtimeclass kata-remote -o jsonpath='{.overhead.podFixed}' 2>/dev/null || true
+}
+
+# Return 0 when the kata-remote RuntimeClass overhead is effectively zero (unset
+# or cpu/memory both "0"), non-zero otherwise. Uses the exact comparison
+# 03-coco-operator.sh applies when it zeros the overhead (jsonpath emits the
+# JSON form; the map[...] form covers the Go-template/`-o template` rendering).
+kata_remote_overhead_is_zero() {
+    local oh
+    oh="$(kata_remote_overhead)"
+    [[ -z "${oh}" \
+        || "${oh}" == '{"cpu":"0","memory":"0"}' \
+        || "${oh}" == "map[cpu:0 memory:0]" ]]
+}
+
 # Wait until every CAA worker advertises at least one kata.peerpods.io/vm unit.
 # The mutating webhook can work perfectly and pods can still stay Pending if
 # this nodes/status patch never lands.
 wait_peerpods_node_capacity() {
-    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}"
+    local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" quiet="${5:-}"
     local elapsed=0 total advertised cm_limit can_patch
     echo "Waiting for worker nodes to advertise kata.peerpods.io/vm capacity (timeout ${timeout}s)..."
     while (( elapsed <= timeout )); do
@@ -1184,6 +1213,9 @@ wait_peerpods_node_capacity() {
         sleep "${poll}"; elapsed=$((elapsed + poll))
     done
 
+    # Intermediate attempts (called by ensure_peerpods_node_capacity) suppress the
+    # heavy diagnostic dump so it only prints once, on the final failure.
+    [[ "${quiet}" == "quiet" ]] && return 1
     echo -e "${RED}✗${NC} worker nodes did not advertise kata.peerpods.io/vm capacity after ${timeout}s"
     cm_limit=$(kubectl -n "${ns}" get configmap peer-pods-cm \
         -o jsonpath='{.data.PEERPODS_LIMIT_PER_NODE}' 2>/dev/null || true)
@@ -1195,6 +1227,192 @@ wait_peerpods_node_capacity() {
     peerpods_node_capacity_summary
     echo "  CAA daemonset log (tail):"
     kubectl logs -n "${ns}" ds/"${ds}" --tail=80 2>/dev/null | sed 's/^/    /' || true
+    return 1
+}
+
+# Ensure every worker advertises kata.peerpods.io/vm, self-healing if not.
+#
+# The CAA daemon advertises the extended resource ("[util/k8sops] set up extended
+# resources" -> "Successfully set extended resource for node ...") exactly ONCE
+# per pod, at startup; it never reconciles. So a node can end up with no capacity
+# whenever the pod that set it restarted badly — most notably the chart's default
+# hostNetwork DaemonSet rollout (maxSurge=1) makes the surge pod collide on host
+# :8000 ("bind: address already in use") and the kata.peerpods.io/vm patch can be
+# lost. A merely-Ready daemonset is therefore NOT sufficient.
+#
+# Remediation ladder (each step re-checks before escalating):
+#   1. wait the normal grace for CAA's startup advertisement
+#   2. rollout restart the daemonset so every pod re-runs its one-time set
+#   3. (unless CAA_SELF_ADVERTISE_VM_CAPACITY=false) advertise it ourselves by
+#      patching nodes/status — the field has no SSA owner (CAA uses a raw JSON
+#      patch), so this is conflict-free; covers current workers
+ensure_peerpods_node_capacity() {
+    local ns="$1" ds="$2" timeout="${3:-600}"
+    local grace=$(( timeout / 3 )); (( grace < 90 )) && grace=90
+
+    if wait_peerpods_node_capacity "${ns}" "${ds}" "${grace}" 10 quiet; then return 0; fi
+
+    echo -e "${YELLOW}⚠${NC} kata.peerpods.io/vm not advertised yet. CAA sets it ONCE per pod at"
+    echo "  startup and does not reconcile, so a flaky restart can leave a node bare."
+    echo "  Restarting ${ds} so each pod re-runs its one-time advertisement..."
+    kubectl -n "${ns}" rollout restart daemonset/"${ds}" >/dev/null 2>&1 || true
+    wait_daemonset_ready "${ns}" "${ds}" "${grace}" >/dev/null 2>&1 || true
+    if wait_peerpods_node_capacity "${ns}" "${ds}" "${grace}" 10 quiet; then return 0; fi
+
+    if [[ "${CAA_SELF_ADVERTISE_VM_CAPACITY:-true}" == "true" ]]; then
+        local limit="${CAA_PEERPODS_LIMIT_PER_NODE:-10}" node
+        echo -e "${YELLOW}⚠${NC} CAA still has not advertised it — self-advertising ${limit}/worker"
+        echo "  (set CAA_SELF_ADVERTISE_VM_CAPACITY=false to disable and fail instead)..."
+        for node in $(kubectl get nodes -l node.kubernetes.io/worker \
+                -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            if kubectl patch node "${node}" --subresource=status --type=json \
+                -p="[{\"op\":\"add\",\"path\":\"/status/capacity/kata.peerpods.io~1vm\",\"value\":\"${limit}\"}]" \
+                >/dev/null 2>&1; then
+                echo -e "  ${GREEN}✓${NC} patched ${node} kata.peerpods.io/vm=${limit}"
+            else
+                echo -e "  ${YELLOW}⚠${NC} could not patch ${node} (check kubectl >=1.24 and nodes/status RBAC)"
+            fi
+        done
+    fi
+    # Final check (non-quiet: dumps full diagnostics if it still fails).
+    wait_peerpods_node_capacity "${ns}" "${ds}" 60 10
+}
+
+# Echo (one CAA daemonset pod name per line) the pods that are NOT serving the
+# remote-hypervisor socket the kata-remote shim dials. Empty output => every CAA
+# pod has it. Read-only.
+#
+# This is the socket CAA's adaptor server binds (ServerConfig.SocketPath, default
+# /run/peerpod/hypervisor.sock). The kata-remote runtime on each worker connects
+# to it to ask CAA to boot a pod VM; if it is missing, pod sandbox creation fails
+# instantly with "dial unix /run/peerpod/hypervisor.sock: connect: no such file
+# or directory" and the pod is stuck ContainerCreating. A Ready daemonset that
+# advertises kata.peerpods.io/vm can STILL be missing this (e.g. the adaptor came
+# up half-initialized after a surging hostNetwork rollout — it logs "server
+# started" yet never bound the socket), so this must be checked explicitly.
+caa_pods_missing_hypervisor_socket() {
+    local ns="$1" ds="$2" sock="${3:-/run/peerpod/hypervisor.sock}"
+    local pods pod
+    # Only consider Running, non-terminating pods. A pod that is still
+    # ContainerCreating (or being deleted) has no socket *yet* and must not be
+    # mistaken for a stuck one — callers gate on the Running count == desired.
+    pods=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
+        | jq -r --arg ds "${ds}" '.items[]
+            | select((.metadata.ownerReferences // [])[]?.name == $ds)
+            | select(.metadata.deletionTimestamp == null)
+            | select(.status.phase == "Running")
+            | .metadata.name' 2>/dev/null) || return 0
+    while IFS= read -r pod; do
+        [[ -z "${pod}" ]] && continue
+        # MSYS_NO_PATHCONV stops Git Bash (MINGW) rewriting the in-container path
+        # into a Windows path (e.g. C:/Program Files/Git/run/...) before it
+        # reaches kubectl exec; harmless on Linux/macOS. `ls <path>` exits non-zero
+        # when the socket is absent. The CAA image ships `ls` (it is not fully
+        # distroless), so no shell is required.
+        if ! MSYS_NO_PATHCONV=1 kubectl -n "${ns}" exec "${pod}" -- ls "${sock}" >/dev/null 2>&1; then
+            echo "${pod}"
+        fi
+    done <<< "${pods}"
+}
+
+# Echo ONE node name whose Running CAA pod currently serves the hypervisor
+# socket (empty if none). Used when only a single healthy node is needed (e.g.
+# pinning the smoke test there) instead of requiring every node to be healthy.
+caa_node_with_hypervisor_socket() {
+    local ns="$1" ds="$2" sock="${3:-/run/peerpod/hypervisor.sock}"
+    local rows pod node
+    rows=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
+        | jq -r --arg ds "${ds}" '.items[]
+            | select((.metadata.ownerReferences // [])[]?.name == $ds)
+            | select(.metadata.deletionTimestamp == null)
+            | select(.status.phase == "Running")
+            | [.metadata.name, .spec.nodeName] | @tsv' 2>/dev/null) || return 0
+    while IFS=$'\t' read -r pod node; do
+        [[ -z "${pod}" ]] && continue
+        if MSYS_NO_PATHCONV=1 kubectl -n "${ns}" exec "${pod}" -- ls "${sock}" >/dev/null 2>&1; then
+            echo "${node}"
+            return 0
+        fi
+    done <<< "${rows}"
+    return 0
+}
+
+# Count CAA daemonset pods that are Running and not terminating.
+_caa_running_pod_count() {
+    local ns="$1" ds="$2"
+    kubectl -n "${ns}" get pods -o json 2>/dev/null \
+        | jq --arg ds "${ds}" '[.items[]
+            | select((.metadata.ownerReferences // [])[]?.name == $ds)
+            | select(.metadata.deletionTimestamp == null)
+            | select(.status.phase == "Running")] | length' 2>/dev/null || echo 0
+}
+
+# Ensure every CAA daemonset pod created its remote-hypervisor socket, clean-
+# restarting (delete pod; with daemonset maxSurge=0 there is no host-port
+# collision) only the nodes that stay missing it. Returns 0 when all pods serve
+# it, 1 otherwise. See caa_pods_missing_hypervisor_socket for why a Ready
+# daemonset is not enough.
+#
+# A (re)started adaptor binds the socket a few seconds AFTER its container goes
+# Running (observed ~10-45s), so each round POLLS up to a grace period for the
+# socket to appear before deleting anything — deleting on the first miss just
+# churns the daemonset. Genuinely stuck pods (e.g. left bare by an earlier
+# surging rollout) never bind it within the grace and are then clean-restarted;
+# their fresh replacements bind it in the next round.
+# Args: ns ds
+ensure_caa_hypervisor_socket() {
+    local ns="$1" ds="$2"
+    local sock="/run/peerpod/hypervisor.sock"
+    local grace="${CAA_HYPERVISOR_SOCKET_GRACE_SECS:-90}"
+    local rounds="${CAA_HYPERVISOR_SOCKET_RESTART_ROUNDS:-2}"
+    # require=one => stop as soon as ONE node serves the socket (fast; enough to
+    # run/pin a single kata-remote pod). require=all => every node must serve it.
+    local require="${CAA_HYPERVISOR_SOCKET_REQUIRE:-all}"
+    local poll=10
+    echo "Verifying ${require} ${ds} pod(s) serve the remote-hypervisor socket (${sock})..."
+    local round desired running missing missing_n served elapsed n pod
+    for (( round=0; round<=rounds; round++ )); do
+        # Poll up to ${grace}s (gives a freshly (re)started adaptor time to bind).
+        missing=""
+        elapsed=0
+        while (( elapsed <= grace )); do
+            running=$(_caa_running_pod_count "${ns}" "${ds}")
+            missing="$(caa_pods_missing_hypervisor_socket "${ns}" "${ds}" "${sock}")"
+            missing_n=$(printf '%s' "${missing}" | grep -c . || true)
+            served=$(( ${running:-0} - missing_n ))
+            if [[ "${require}" == "one" ]]; then
+                if (( served >= 1 )); then
+                    echo -e "${GREEN}✓${NC} a ${ds} pod serves ${sock} (kata-remote sandbox creation can reach the hypervisor)"
+                    return 0
+                fi
+            else
+                desired=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+                if [[ "${desired:-0}" -ge 1 && "${running:-0}" -ge "${desired:-0}" && -z "${missing}" ]]; then
+                    echo -e "${GREEN}✓${NC} all ${ds} pods serve ${sock} (kata-remote sandbox creation can reach the hypervisor)"
+                    return 0
+                fi
+            fi
+            sleep "${poll}"; elapsed=$((elapsed + poll))
+        done
+        # Grace exhausted. If pods are merely not Running yet (no confirmed
+        # miss), loop and keep waiting rather than restart blindly.
+        [[ -z "${missing}" ]] && continue
+        (( round == rounds )) && break
+        # In require=one mode, only restart if NOTHING serves it yet (one bad
+        # node does not matter when another is healthy — that early-returns above).
+        n=$(printf '%s\n' "${missing}" | grep -c .)
+        echo -e "  ${YELLOW}⚠${NC} ${n} pod(s) still missing ${sock} after ${grace}s; clean-restarting them (delete, no surge):"
+        while IFS= read -r pod; do
+            [[ -z "${pod}" ]] && continue
+            echo "    deleting ${pod}"
+            kubectl -n "${ns}" delete pod "${pod}" --wait=false >/dev/null 2>&1 || true
+        done <<< "${missing}"
+        sleep "${poll}"
+    done
+    echo -e "${RED}✗${NC} no ${ds} pod serves ${sock} (require=${require}); still missing:"
+    printf '%s\n' "${missing}" | sed 's/^/    /'
+    echo "  Inspect the CAA log on a failing node for a listener/bind error:"
+    echo "    kubectl -n ${ns} logs <pod> | grep -iE 'hypervisor|socket|listen|bind|server started'"
     return 1
 }
 
