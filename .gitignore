@@ -8,14 +8,18 @@
 deploy/terraform/.terraform/
 deploy/terraform/.terraform.lock.hcl
 deploy/terraform/*.tfplan
-deploy/terraform/terraform.tfstate
-deploy/terraform/terraform.tfstate.backup
+# Terraform state (and ALL backups, incl. timestamped ones) can embed secrets
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
 deploy/terraform/.terraform.tfstate.lock.info
 deploy/terraform/terraform.tfvars
 deploy/.last-harness-image.env
+deploy/.last-efs-backup.env
 
 # Cached owner login session for steps 07/08 (zOS JWT — NEVER commit)
 deploy/.smoke-session.jwt
+# Any JWT / bearer-session file, anywhere (defense in depth)
+*.jwt
 
 # Deploy run logs (per-run tee'd output)
 deploy/.logs/
