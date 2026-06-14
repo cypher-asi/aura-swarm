@@ -187,6 +187,45 @@ resource "aws_security_group_rule" "cluster_to_nodes" {
 }
 
 #------------------------------------------------------------------------------
+# Peer Pods ingress on the EKS-managed CLUSTER PRIMARY security group.
+#
+# CRITICAL: the managed node group attaches the EKS *cluster primary* security
+# group to the workers (NOT aws_security_group.node above — that one is attached
+# to the CAA pod VMs via AWS_SG_IDS / peer-pods-cm). So the worker<->pod-VM rules
+# defined on the node SG only cover the pod-VM side. The worker side needs the
+# matching ingress on the cluster primary SG, or:
+#   * vxlan (udp/9000) return traffic from the pod VM to the worker is dropped,
+#     so the peer pod has NO pod network (DNS/ClusterIP/pod-IP all time out)
+#     even though the agent-protocol-forwarder (tcp/15150, worker-initiated, hence
+#     allowed statefully) connects and the container starts; and
+#   * the in-guest CDH cannot reach the in-cluster KBS pod IP (tcp/8080) for
+#     attestation/DEK release.
+# Pod VMs launch into the agent subnets, so scope to the VPC CIDR.
+resource "aws_security_group_rule" "cluster_primary_caa" {
+  for_each          = { for r in local.caa_ingress_rules : "${r.protocol}-${r.from_port}" => r }
+  type              = "ingress"
+  security_group_id = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  from_port         = each.value.from_port
+  to_port           = each.value.to_port
+  protocol          = each.value.protocol
+  cidr_blocks       = [var.vpc_cidr]
+  description       = each.value.description
+}
+
+# In-guest CDH (on the pod VM) -> Trustee KBS pod IP for SNP attestation + DEK
+# release. The KBS pod uses the worker's primary SG (VPC CNI), so admit tcp/8080
+# from the VPC on the cluster primary SG.
+resource "aws_security_group_rule" "cluster_primary_kbs" {
+  type              = "ingress"
+  security_group_id = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  from_port         = 8080
+  to_port           = 8080
+  protocol          = "tcp"
+  cidr_blocks       = [var.vpc_cidr]
+  description       = "Peer Pods in-guest CDH to Trustee KBS (attestation/DEK release)"
+}
+
+#------------------------------------------------------------------------------
 # EKS Managed Node Group - System
 #
 # Hosts the platform system components (gateway, scheduler, CoreDNS, EFS
