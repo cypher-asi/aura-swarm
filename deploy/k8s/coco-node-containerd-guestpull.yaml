@@ -191,6 +191,64 @@ spec:
               fi
               echo "containerd guest-pull flags now effective"
 
+              # Ensure the kata-remote snapshotter is actually BOUND by containerd,
+              # not merely declared. kata-deploy points the kata-remote runtime at a
+              # nydus guest-pull snapshotter (a proxy plugin, e.g. nydus-for-kata-tee)
+              # whose grpc daemon typically starts AFTER containerd's last restart.
+              # containerd then leaves that proxy snapshotter UNBOUND (the plugin
+              # loads in error/skip state because its socket was absent at startup),
+              # and the per-runtime snapshotter never engages: the WORKLOAD image is
+              # pulled+unpacked on the HOST via overlayfs and a layer's content is not
+              # in the host store -> "content digest ...: not found"
+              # (CreateContainerError) while the pause sandbox still guest-pulls. The
+              # flags above can be perfectly correct and this still happens, so a
+              # flags-only "no restart needed" path leaves the node broken. Restart
+              # containerd ONCE here to bind the proxy plugin (the exact fix a manual
+              # `systemctl restart containerd` performs); idempotent — a no-op once the
+              # plugin is loaded "ok". Version-independent (the daemon-vs-containerd
+              # start-order race is the same on v2 and v3).
+              CTR="ctr -a /run/containerd/containerd.sock"
+              # Snapshotter the kata-remote runtime uses (default overlayfs => nothing
+              # to bind). Parse the runtimes.kata-remote block of the effective config.
+              SNAP="$(printf '%s' "$VERIFY" | awk '
+                /runtimes\.kata-remote\]/{in_r=1; next}
+                in_r && /^[[:space:]]*\[/{in_r=0}
+                in_r && /snapshotter[[:space:]]*=/{gsub(/.*=|["\x27[:space:]]/,"");print;exit}')"
+              if [ -n "$SNAP" ] && [ "$SNAP" != "overlayfs" ]; then
+                # Resolve the proxy plugin socket (diagnostics only; the bind check
+                # uses containerd's own plugin status, which is authoritative).
+                SOCK="$(printf '%s' "$VERIFY" | awk -v n="$SNAP" '
+                  $0 ~ ("proxy_plugins\\.(\""n"\"|"n")\\]"){in_p=1; next}
+                  in_p && /^[[:space:]]*\[/{in_p=0}
+                  in_p && /address[[:space:]]*=/{gsub(/.*=|["\x27[:space:]]/,"");print;exit}')"
+                # bound: containerd loaded the snapshotter proxy plugin with STATUS ok.
+                # `ctr plugins ls` columns: TYPE ID PLATFORMS STATUS; an unbound proxy
+                # plugin shows "error"/"skip" (or is absent) instead of "ok".
+                bound() { host $CTR plugins ls 2>/dev/null \
+                  | awk -v n="$SNAP" '$2==n && $NF=="ok"{f=1} END{exit f?0:1}'; }
+                if bound; then
+                  echo "kata-remote snapshotter ${SNAP} already bound by containerd (ok)"
+                else
+                  echo "kata-remote snapshotter ${SNAP} not bound by containerd; restarting containerd to bind the nydus proxy plugin..."
+                  host systemctl restart containerd
+                  sleep 5
+                fi
+                if ! bound; then
+                  echo "ERROR: kata-remote snapshotter ${SNAP} still not bound after restart"
+                  echo "       (image pulls fall back to host overlayfs -> 'content digest not found'). Diagnostics:"
+                  host $CTR plugins ls 2>/dev/null | grep -iE "TYPE|${SNAP}|nydus" | sed 's/^/  /' || true
+                  if [ -n "$SOCK" ]; then
+                    echo "  proxy plugin socket ${SOCK}:"
+                    host ls -l "$SOCK" 2>&1 | sed 's/^/    /' || true
+                  fi
+                  printf '%s' "$VERIFY" | grep -iE 'proxy_plugins' | sed 's/^/  /' || true
+                  exit 1
+                fi
+                echo "verified: kata-remote snapshotter ${SNAP} is bound (ok) - workload images guest-pull via nydus"
+              else
+                echo "note: kata-remote uses the default snapshotter (or is not configured yet); no nydus proxy plugin to bind"
+              fi
+
               # Regression guard for the import-clobber bug: if kata-deploy has
               # defined the kata-remote runtime in the main config, it MUST also
               # survive in the EFFECTIVE (merged) config. If it does not, an import
