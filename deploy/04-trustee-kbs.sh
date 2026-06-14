@@ -23,19 +23,19 @@ ensure_kubectl_context
 # The Trustee KBS + Attestation Service live in swarm-system and release the
 # per-agent DEK after SNP attestation; with Peer Pods the CDH runs inside the
 # AWS-managed pod VM. Before cutover confirm:
-echo -e "${YELLOW}!${NC} Peer Pods attestation: before cutover confirm that"
-echo -e "${YELLOW}!${NC}   - the AS reference values / policy.rego accept the AWS pod-VM launch"
-echo -e "${YELLOW}!${NC}     measurement + firmware (AWS does not document the launch digest, so"
-echo -e "${YELLOW}!${NC}     baseline it empirically or verify VLEK->AMD-root authenticity only);"
-echo -e "${YELLOW}!${NC}   - KBS<->CAA CDH/AS protocol versions are compatible with the pinned CAA chart."
+log_warn "Peer Pods attestation: before cutover confirm that"
+log_detail "  - the AS reference values / policy.rego accept the AWS pod-VM launch"
+log_detail "    measurement + firmware (AWS does not document the launch digest, so"
+log_detail "    baseline it empirically or verify VLEK->AMD-root authenticity only);"
+log_detail "  - KBS<->CAA CDH/AS protocol versions are compatible with the pinned CAA chart."
 
 #------------------------------------------------------------------------------
 # Namespaces + service secrets
 #------------------------------------------------------------------------------
 
-echo "Ensuring namespaces..."
+log_info "Ensuring namespaces..."
 kubectl apply -f "${SCRIPT_DIR}/k8s/00-namespaces.yaml" >/dev/null
-echo -e "${GREEN}✓${NC} Namespaces ${K8S_NAMESPACE_SYSTEM} / ${K8S_NAMESPACE_AGENTS}"
+log_ok "Namespaces ${K8S_NAMESPACE_SYSTEM} / ${K8S_NAMESPACE_AGENTS}"
 
 # INTERNAL_TOKEN: the service bearer token shared by gateway, scheduler and
 # the deploy tooling. Generated once into .secrets/; injected into the
@@ -47,7 +47,7 @@ ensure_internal_token
 #------------------------------------------------------------------------------
 
 echo ""
-echo "Ensuring Trustee KBS admin keypair..."
+log_info "Ensuring Trustee KBS admin keypair..."
 ensure_kbs_admin_keypair
 
 #------------------------------------------------------------------------------
@@ -55,7 +55,7 @@ ensure_kbs_admin_keypair
 #------------------------------------------------------------------------------
 
 echo ""
-echo "Applying Trustee manifests..."
+log_info "Applying Trustee manifests..."
 # The KBS repository PVC needs the EFS storage class; make sure it exists
 # (terraform output provides the filesystem id, exactly like the legacy flow).
 EFS_ID=$(tf_output efs_filesystem_id)
@@ -66,20 +66,20 @@ kubectl apply -f "${TMP_SC}" >/dev/null
 rm -f "${TMP_SC}"
 
 kubectl apply -f "${SCRIPT_DIR}/k8s/11-trustee.yaml"
-echo -e "${GREEN}✓${NC} Trustee manifests applied"
+log_ok "Trustee manifests applied"
 
 echo ""
-echo "Waiting for the KBS deployment..."
+log_info "Waiting for the KBS deployment..."
 kubectl rollout status deployment/kbs -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s \
     || step_fail "KBS deployment did not become ready (check kbs-repository PVC binding and the kbs-auth-public-key secret)"
-echo -e "${GREEN}✓${NC} KBS pod ready"
+log_ok "KBS pod ready"
 
 #------------------------------------------------------------------------------
 # Verify: service resolves + listener answers from inside the cluster
 #------------------------------------------------------------------------------
 
 echo ""
-echo "Checking KBS reachability in-cluster..."
+log_info "Checking KBS reachability in-cluster..."
 kbs_in_cluster_check \
     || step_fail "KBS service did not respond in-cluster (kbs.${K8S_NAMESPACE_SYSTEM}.svc.cluster.local:8080)"
 

@@ -29,9 +29,9 @@ trap gw_stop_port_forward EXIT
 FAILURES=0
 gate() { # gate <ok:0|1> <pass-msg> <fail-msg>
     if [[ "$1" -eq 0 ]]; then
-        echo -e "${GREEN}✓${NC} $2"
+        log_ok "$2"
     else
-        echo -e "${RED}✗${NC} $3"
+        log_err "$3"
         FAILURES=$((FAILURES + 1))
     fi
 }
@@ -89,7 +89,8 @@ gate "${RES}" \
     "Zero pods on kata-fc" \
     "${KATA_FC} pod(s) still on kata-fc:"
 if [[ "${KATA_FC}" != "0" ]]; then
-    jq -r '.[] | select(.runtime_class == "kata-fc" and .phase == "Running") | "    \(.agent_id)  \(.pod_name)"' "${PODS_JSON}"
+    jq -r '.[] | select(.runtime_class == "kata-fc" and .phase == "Running") | "\(.agent_id)  \(.pod_name)"' "${PODS_JSON}" \
+        | while IFS= read -r line; do log_detail "${line}"; done
 fi
 
 [[ "${NON_SNP}" == "0" ]] && RES=0 || RES=1
@@ -111,16 +112,16 @@ while IFS= read -r pod; do
     sealed=$(echo "${pod_json}" | jq -r '[.spec.containers[0].env[]? | select(.name=="AURA_STATE_ENCRYPTION") | .value] | first // ""')
     key_id=$(echo "${pod_json}" | jq -r '[.spec.containers[0].env[]? | select(.name=="AURA_STATE_KEY_ID") | .value] | first // ""')
     if [[ "${sealed}" == "sealed" && -n "${key_id}" ]]; then
-        echo "    ${pod}: sealed, key_id=${key_id}"
+        log_detail "${pod}: sealed, key_id=${key_id}"
     else
-        echo "    ${pod}: AURA_STATE_ENCRYPTION='${sealed}' AURA_STATE_KEY_ID='${key_id}'"
+        log_detail "${pod}: AURA_STATE_ENCRYPTION='${sealed}' AURA_STATE_KEY_ID='${key_id}'"
         SPOT_FAILS=$((SPOT_FAILS + 1))
     fi
 done < <(jq -r --argjson n "${SPOT_N}" '.[0:$n][].pod_name' "${PODS_JSON}")
 rm -f "${PODS_JSON}"
 
 if [[ "${SPOT_CHECKED}" -eq 0 ]]; then
-    echo -e "${YELLOW}⚠${NC} No running agent pods to spot-check (empty fleet or everything hibernating)"
+    log_warn "No running agent pods to spot-check (empty fleet or everything hibernating)"
 else
     [[ "${SPOT_FAILS}" == "0" ]] && RES=0 || RES=1
     gate "${RES}" \

@@ -55,7 +55,7 @@ if [[ "${SKIP_BACKUP_CHECK}" != "true" ]]; then
         --query 'Status' --output text 2>/dev/null || echo "MISSING")
     [[ "${RP_STATUS}" == "COMPLETED" ]] \
         || step_fail "EFS rollback recovery point is ${RP_STATUS}, expected COMPLETED — re-run ./09-efs-backup.sh"
-    echo -e "${GREEN}✓${NC} Rollback point verified: ${EFS_BACKUP_RECOVERY_POINT_ARN} (taken ${EFS_BACKUP_TAKEN_AT})"
+    log_ok "Rollback point verified: ${EFS_BACKUP_RECOVERY_POINT_ARN} (taken ${EFS_BACKUP_TAKEN_AT})"
     echo ""
 fi
 
@@ -64,7 +64,7 @@ fi
 #------------------------------------------------------------------------------
 
 PRE_LEGACY=$(count_pods_on_runtime_class "kata-fc")
-echo "Running legacy (kata-fc) pods before migration: ${PRE_LEGACY}"
+log_info "Running legacy (kata-fc) pods before migration: ${PRE_LEGACY}"
 echo ""
 
 deploy_platform_at_ref "${REF}"
@@ -74,32 +74,32 @@ echo ""
 # Verify: store migration ran (schema_version=2) + DEK backfill
 #------------------------------------------------------------------------------
 
-echo "Waiting for the v1 -> v2 store migration (gateway startup)..."
+log_info "Waiting for the v1 -> v2 store migration (gateway startup)..."
 gw_start_port_forward || step_fail "gateway port-forward failed after deploy"
 SCHEMA=""
 ELAPSED=0
 while [[ ${ELAPSED} -le 300 ]]; do
     SCHEMA=$(gw_schema_version || echo "null")
     [[ "${SCHEMA}" == "2" ]] && break
-    echo "  [${ELAPSED}s] schema_version=${SCHEMA}"
+    log_progress "[${ELAPSED}s] schema_version=${SCHEMA}"
     sleep 10
     ELAPSED=$((ELAPSED + 10))
 done
 gw_stop_port_forward
 [[ "${SCHEMA}" == "2" ]] \
     || step_fail "gateway reports schema_version=${SCHEMA}, expected 2 — check gateway logs: kubectl logs -n ${K8S_NAMESPACE_SYSTEM} deploy/aura-swarm-gateway"
-echo -e "${GREEN}✓${NC} Store schema_version=2 (records migrated to tiered + sealed)"
+log_ok "Store schema_version=2 (records migrated to tiered + sealed)"
 
 GW_LOGS=$(kubectl logs -n "${K8S_NAMESPACE_SYSTEM}" deploy/aura-swarm-gateway --tail=500 2>/dev/null || echo "")
 if echo "${GW_LOGS}" | grep -q "Store schema migration complete"; then
-    echo -e "${GREEN}✓${NC} Gateway log: 'Store schema migration complete'"
+    log_ok "Gateway log: 'Store schema migration complete'"
 else
-    echo -e "${YELLOW}⚠${NC} Migration-complete log line not in the last 500 lines (schema_version=2 already confirms it ran)"
+    log_warn "Migration-complete log line not in the last 500 lines (schema_version=2 already confirms it ran)"
 fi
 if echo "${GW_LOGS}" | grep -q "DEK backfill pass complete"; then
-    echo -e "${GREEN}✓${NC} Gateway log: 'DEK backfill pass complete'"
+    log_ok "Gateway log: 'DEK backfill pass complete'"
 else
-    echo -e "${YELLOW}⚠${NC} DEK backfill completion not in the last 500 lines; failures retry on the next gateway restart"
+    log_warn "DEK backfill completion not in the last 500 lines; failures retry on the next gateway restart"
 fi
 echo ""
 
@@ -107,13 +107,13 @@ echo ""
 # Enable + monitor the rolling pod migration
 #------------------------------------------------------------------------------
 
-echo "Enabling MIGRATION_RECREATE_LEGACY_PODS=true..."
+log_info "Enabling MIGRATION_RECREATE_LEGACY_PODS=true..."
 kubectl patch configmap aura-swarm-config -n "${K8S_NAMESPACE_SYSTEM}" \
     --type merge -p '{"data":{"MIGRATION_RECREATE_LEGACY_PODS":"true"}}' >/dev/null
 kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null
 kubectl rollout status deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s >/dev/null \
     || step_fail "scheduler restart did not complete after enabling the migration gate"
-echo -e "${GREEN}✓${NC} Scheduler restarted with the migration gate enabled"
+log_ok "Scheduler restarted with the migration gate enabled"
 echo ""
 
 # One legacy pod is replaced per ~30s pass; budget generously.
@@ -121,7 +121,7 @@ TIMEOUT="${R2_MIGRATION_TIMEOUT_SECS:-$(( PRE_LEGACY * 120 + 600 ))}"
 POLL=30
 ELAPSED=0
 
-echo "Monitoring the rolling recreation (timeout ${TIMEOUT}s)..."
+log_info "Monitoring the rolling recreation (timeout ${TIMEOUT}s)..."
 LEGACY_LEFT="${PRE_LEGACY}"
 while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     LEGACY_LEFT=$(count_pods_on_runtime_class "kata-fc")
@@ -129,18 +129,18 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     if [[ "${LEGACY_LEFT}" == "0" ]]; then
         break
     fi
-    echo "  [${ELAPSED}s] pods remaining on kata-fc: ${LEGACY_LEFT}  (on kata-remote: ${SNP_NOW})"
+    log_progress "[${ELAPSED}s] pods remaining on kata-fc: ${LEGACY_LEFT}  (on kata-remote: ${SNP_NOW})"
     sleep "${POLL}"
     ELAPSED=$((ELAPSED + POLL))
 done
 
 if [[ "${LEGACY_LEFT}" != "0" ]]; then
-    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o wide | sed 's/^/  /' || true
+    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o wide | indent || true
     step_fail "${LEGACY_LEFT} running pod(s) still on kata-fc after ${TIMEOUT}s — this script is safe to re-run to keep monitoring"
 fi
-echo -e "${GREEN}✓${NC} No running pod remains on kata-fc"
+log_ok "No running pod remains on kata-fc"
 echo ""
-echo "Note: hibernating/stopped agents migrate on their next wake/start; the"
-echo "convergence gate (step 10) checks records, not just running pods."
+log_info "Note: hibernating/stopped agents migrate on their next wake/start; the"
+log_detail "convergence gate (step 10) checks records, not just running pods."
 
 step_ok "11 (./11-r2-convergence.sh)"

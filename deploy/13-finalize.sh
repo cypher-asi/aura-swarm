@@ -26,9 +26,9 @@ trap gw_stop_port_forward EXIT
 FAILURES=0
 report() { # report <ok:0|1> <pass-msg> <fail-msg>
     if [[ "$1" -eq 0 ]]; then
-        echo -e "${GREEN}✓${NC} $2"
+        log_ok "$2"
     else
-        echo -e "${RED}✗${NC} $3"
+        log_err "$3"
         FAILURES=$((FAILURES + 1))
     fi
 }
@@ -37,19 +37,18 @@ report() { # report <ok:0|1> <pass-msg> <fail-msg>
 # Final fleet health report
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Nodes${NC}"
-kubectl get nodes -o custom-columns='NAME:.metadata.name,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type,CONFIDENTIAL:.metadata.labels.swarm\.io/confidential-node' --no-headers | sed 's/^/  /'
-echo ""
+log_section "Nodes"
+kubectl get nodes -o custom-columns='NAME:.metadata.name,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type,CONFIDENTIAL:.metadata.labels.swarm\.io/confidential-node' --no-headers | indent
 
-echo -e "${CYAN}Platform${NC}"
+log_section "Platform"
 PLATFORM_OK=0
 for d in aura-swarm-gateway aura-swarm-control aura-swarm-scheduler kbs; do
     READY=$(kubectl get deployment "${d}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
     if [[ "${READY:-0}" -ge 1 ]]; then
-        echo -e "  ${GREEN}✓${NC} ${d}: ready"
+        log_ok "${d}: ready"
     else
-        echo -e "  ${RED}✗${NC} ${d}: not ready"
+        log_err "${d}: not ready"
         PLATFORM_OK=1
     fi
 done
@@ -87,40 +86,40 @@ echo ""
 # EFS backup retention (prompt, never auto-delete)
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Pre-R2 EFS recovery point${NC}"
+log_section "Pre-R2 EFS recovery point"
 RETENTION_DAYS="${EFS_BACKUP_RETENTION_DAYS:-14}"
 
 if [[ ! -f "${EFS_BACKUP_STATE_FILE}" ]]; then
-    echo "  No recorded recovery point (${EFS_BACKUP_STATE_FILE} missing) — nothing to manage."
+    log_info "No recorded recovery point (${EFS_BACKUP_STATE_FILE} missing) — nothing to manage."
 else
     # shellcheck disable=SC1090
     source <(tr -d '\r' < "${EFS_BACKUP_STATE_FILE}")
-    echo "  Recovery point: ${EFS_BACKUP_RECOVERY_POINT_ARN}"
-    echo "  Taken at:       ${EFS_BACKUP_TAKEN_AT} (retention window: ${RETENTION_DAYS} days)"
+    log_kv "Recovery point" "${EFS_BACKUP_RECOVERY_POINT_ARN}"
+    log_kv "Taken at" "${EFS_BACKUP_TAKEN_AT} (retention window: ${RETENTION_DAYS} days)"
 
     TAKEN_EPOCH=$(date -d "${EFS_BACKUP_TAKEN_AT}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "${EFS_BACKUP_TAKEN_AT}" +%s 2>/dev/null || echo 0)
     NOW_EPOCH=$(date +%s)
     AGE_DAYS=$(( (NOW_EPOCH - TAKEN_EPOCH) / 86400 ))
-    echo "  Age:            ${AGE_DAYS} day(s)"
+    log_kv "Age" "${AGE_DAYS} day(s)"
 
     if [[ ${AGE_DAYS} -lt ${RETENTION_DAYS} ]]; then
         echo ""
-        echo -e "  ${YELLOW}Still inside the retention window — keeping the recovery point.${NC}"
-        echo "  Re-run this script after $(( RETENTION_DAYS - AGE_DAYS )) more day(s), or delete manually with:"
-        echo "    aws backup delete-recovery-point --backup-vault-name ${EFS_BACKUP_VAULT} \\"
-        echo "        --recovery-point-arn ${EFS_BACKUP_RECOVERY_POINT_ARN}"
+        log_info "Still inside the retention window — keeping the recovery point."
+        log_detail "Re-run this script after $(( RETENTION_DAYS - AGE_DAYS )) more day(s), or delete manually with:"
+        log_cmd "aws backup delete-recovery-point --backup-vault-name ${EFS_BACKUP_VAULT} \\"
+        log_detail "  --recovery-point-arn ${EFS_BACKUP_RECOVERY_POINT_ARN}"
     else
         echo ""
-        echo -e "  ${YELLOW}The retention window has elapsed.${NC} Delete the pre-R2 recovery point?"
+        log_info "The retention window has elapsed. Delete the pre-R2 recovery point?"
         read -r -p "  Type 'delete' to delete it now, anything else to keep it: " answer
         if [[ "${answer}" == "delete" ]]; then
             aws backup delete-recovery-point \
                 --backup-vault-name "${EFS_BACKUP_VAULT}" \
                 --recovery-point-arn "${EFS_BACKUP_RECOVERY_POINT_ARN}"
             rm -f "${EFS_BACKUP_STATE_FILE}"
-            echo -e "  ${GREEN}✓${NC} Recovery point deleted"
+            log_ok "Recovery point deleted"
         else
-            echo "  Kept. Re-run ./13-finalize.sh whenever you want to revisit."
+            log_info "Kept. Re-run ./13-finalize.sh whenever you want to revisit."
         fi
     fi
 fi

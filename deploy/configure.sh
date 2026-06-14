@@ -22,10 +22,7 @@ source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
 STEP_ID="configure"
-echo "=============================================="
-echo "  Aura Swarm — configure deploy/config.env"
-echo "=============================================="
-echo ""
+log_section "Aura Swarm — configure deploy/config.env"
 
 # Knobs configure.sh may write (each must already have an export line in
 # config.env). Anything else is rejected to catch typos.
@@ -71,7 +68,7 @@ apply_kv() {
 }
 
 show_config() {
-    echo -e "${CYAN}Effective deploy/config.env values${NC}"
+    log_section "Effective deploy/config.env values"
     local k
     for k in "${ALLOWED_KEYS[@]}"; do
         printf '  %-32s = %s\n' "${k}" "${!k:-}"
@@ -81,7 +78,7 @@ show_config() {
 if [[ $# -eq 0 ]]; then
     show_config
     echo ""
-    echo "Nothing to change. Pass KEY=VALUE or a flag (see the header of this script)."
+    log_info "Nothing to change. Pass KEY=VALUE or a flag (see the header of this script)."
     exit 0
 fi
 
@@ -125,4 +122,4 @@ echo ""
 source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 show_config
 echo ""
-echo -e "${YELLOW}ℹ${NC} Re-run the relevant numbered step to apply (e.g. ./02-snp-node-group.sh, then ./03-coco-operator.sh)."
+log_info "Re-run the relevant numbered step to apply (e.g. ./02-snp-node-group.sh, then ./03-coco-operator.sh)."

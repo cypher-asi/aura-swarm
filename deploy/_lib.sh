@@ -15,11 +15,108 @@
 # - gateway /internal/* APIs are reached via kubectl port-forward using the
 #   INTERNAL_TOKEN bearer secret
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+#==============================================================================
+# Logging core
+#
+# A consistent, capability-aware logging vocabulary shared by every rollout
+# script. It distinguishes steps, sections, status (ok/warn/err/info), context
+# detail, commands, and progress. Colour and Unicode icons auto-disable on
+# non-TTY / NO_COLOR / dumb terminals; the helpers read pre-computed variables
+# (not a live FD test) so output stays correct after stdout is tee'd to a file.
+#
+# Env knobs:
+#   NO_COLOR / DEPLOY_NO_COLOR   disable colour (any value)
+#   FORCE_COLOR                  force colour even when stdout is not a TTY
+#   DEPLOY_ASCII=1               ASCII icons instead of Unicode glyphs
+#   DEPLOY_LOG_TO_FILE=0         disable per-run file logging (default on)
+#   DEPLOY_LOG_DIR               override log directory (default deploy/.logs)
+#==============================================================================
+
+# Decide colour support once, while stdout is still the real terminal (this runs
+# at source time, before log_init may redirect stdout into the tee pipe).
+_log_supports_color() {
+    [[ -n "${FORCE_COLOR:-}" ]] && return 0
+    [[ -n "${NO_COLOR:-}" || -n "${DEPLOY_NO_COLOR:-}" ]] && return 1
+    [[ -t 1 ]] || return 1
+    case "${TERM:-}" in dumb | "") return 1 ;; esac
+    return 0
+}
+
+if _log_supports_color; then
+    if command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
+        RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"; YELLOW="$(tput setaf 3)"
+        BLUE="$(tput setaf 4)"; MAGENTA="$(tput setaf 5)"; CYAN="$(tput setaf 6)"
+        BOLD="$(tput bold)"; DIM="$(tput dim)"; NC="$(tput sgr0)"
+    else
+        RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+        BLUE=$'\033[0;34m'; MAGENTA=$'\033[0;35m'; CYAN=$'\033[0;36m'
+        BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+    fi
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; DIM=""; NC=""
+fi
+export RED GREEN YELLOW BLUE MAGENTA CYAN BOLD DIM NC
+# Drop FORCE_COLOR now that capabilities are decided, so it does not leak into
+# spawned tools (terraform/kubectl/etc.) via the file-logging re-exec.
+export -n FORCE_COLOR 2>/dev/null || true
+
+# Icon set (Unicode by default; ASCII fallback for DEPLOY_ASCII / dumb terms).
+if [[ "${DEPLOY_ASCII:-0}" == "1" || "${TERM:-}" == "dumb" ]]; then
+    ICON_OK="[OK]"; ICON_WARN="[!]"; ICON_ERR="[x]"; ICON_INFO="[i]"
+    ICON_STEP="#"; ICON_ARROW="->"; ICON_BULLET="*"; RULE_CHAR="="
+else
+    ICON_OK="✓"; ICON_WARN="⚠"; ICON_ERR="✗"; ICON_INFO="ℹ"
+    ICON_STEP="◆"; ICON_ARROW="↳"; ICON_BULLET="•"; RULE_CHAR="═"
+fi
+
+# Best-effort warning tally for the step footer.
+LOG_WARN_COUNT=0
+
+_log_rule() {
+    local n="${1:-60}" out="" i
+    for ((i = 0; i < n; i++)); do out+="${RULE_CHAR}"; done
+    printf '%s' "${out}"
+}
+
+# Section header (a labelled group of status lines under a step).
+log_section() {
+    printf '\n%s%s %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "$*" "${NC}"
+}
+
+# Status lines (2-space indent so they nest under the section header).
+log_ok()   { printf '  %s%s%s %s\n' "${GREEN}"  "${ICON_OK}"   "${NC}" "$*"; }
+log_info() { printf '  %s%s%s %s\n' "${BLUE}"   "${ICON_INFO}" "${NC}" "$*"; }
+log_warn() {
+    LOG_WARN_COUNT=$((LOG_WARN_COUNT + 1))
+    printf '  %s%s%s %s\n' "${YELLOW}" "${ICON_WARN}" "${NC}" "$*"
+}
+# Errors go to stderr so they survive command substitution.
+log_err()  { printf '  %s%s%s %s\n' "${RED}" "${ICON_ERR}" "${NC}" "$*" >&2; }
+
+# Dim, indented context/continuation lines (comments, notes, sub-detail).
+log_detail() { printf '    %s%s%s\n' "${DIM}" "$*" "${NC}"; }
+
+# A command about to run (or being shown for reference).
+log_cmd() { printf '  %s$ %s%s\n' "${DIM}" "$*" "${NC}"; }
+
+# A progress/poll line (e.g. "[30s] waiting ...").
+log_progress() { printf '  %s%s%s\n' "${DIM}" "$*" "${NC}"; }
+
+# Aligned key/value, for summaries (identity, region, ARNs, ...).
+log_kv() { printf '  %s%-22s%s %s\n' "${DIM}" "$1" "${NC}" "${2:-}"; }
+
+# Filter: uniformly indent a block of streamed sub-command output (4 spaces).
+# Usage:  some-command 2>&1 | indent
+indent() { sed 's/^/    /'; }
+
+# A boxed, red error banner (title only — print the body with log_detail after).
+log_abort() {
+    local rule; rule="$(_log_rule 60)"
+    printf '\n%s%s%s\n%s  %s %s%s\n%s%s%s\n\n' \
+        "${RED}${BOLD}" "${rule}" "${NC}" \
+        "${RED}${BOLD}" "${ICON_ERR}" "$*" "${NC}" \
+        "${RED}${BOLD}" "${rule}" "${NC}"
+}
 
 # config.env derives DEPLOY_DIR/PROJECT_ROOT from BASH_SOURCE, which resolves
 # to /dev/fd when sourced through the CRLF-stripping process substitution —
@@ -51,9 +148,68 @@ R2_DEFAULT_REF="af9e034"
 R3_DEFAULT_REF="master"
 
 #------------------------------------------------------------------------------
+# Per-run file logging
+#
+# Tee everything to deploy/.logs/<script>-<UTCstamp>.log so a run can be
+# diagnosed after the fact. The terminal keeps colour (tee's stdout is the
+# original FD); the file copy is ANSI-stripped so it stays grep-friendly.
+# Auto-invoked at the end of this file; opt out with DEPLOY_LOG_TO_FILE=0.
+#------------------------------------------------------------------------------
+
+DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-${DEPLOY_DIR}/.logs}"
+DEPLOY_LOG_FILE=""
+
+# Tee the whole run to a log file by re-executing the script once with its
+# combined output piped through awk: awk prints every line verbatim to the
+# terminal (colour preserved) and appends an ANSI-stripped copy to the log,
+# flushing per line. Because the parent shell waits on the pipeline, the file
+# is always fully flushed before exit (unlike a backgrounded `tee`, which
+# truncates on fast exits under Git Bash/WSL). Re-exec keeps stdin attached so
+# interactive prompts (confirm_plan, migration pauses) still work.
+#
+# Must be called as `log_init "$@"` so the script's own args survive the re-exec.
+log_init() {
+    [[ -n "${_LOG_INITED:-}" ]] && return 0
+    _LOG_INITED=1
+    [[ "${DEPLOY_LOG_TO_FILE:-1}" == "0" ]] && return 0
+    [[ -n "${_DEPLOY_LOG_REEXEC:-}" ]] && return 0   # already inside the wrapper
+    command -v awk >/dev/null 2>&1 || return 0
+    mkdir -p "${DEPLOY_LOG_DIR}" 2>/dev/null || return 0
+
+    local name stamp
+    name="$(basename "${0:-deploy}" .sh)"
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    DEPLOY_LOG_FILE="${DEPLOY_LOG_DIR}/${name}-${stamp}.log"
+    export DEPLOY_LOG_FILE _DEPLOY_LOG_REEXEC=1
+    # Carry the colour decision into the child (its stdout is now a pipe, so it
+    # would otherwise disable colour). FORCE_COLOR is dropped from the env right
+    # after the child detects capabilities, so spawned tools don't inherit it.
+    [[ -n "${NC}${BOLD}" ]] && export FORCE_COLOR=1
+
+    log_detail "logging this run to ${DEPLOY_LOG_FILE}"
+    local rc=0
+    set +e
+    "${BASH:-bash}" "$0" "$@" 2>&1 | awk -v f="${DEPLOY_LOG_FILE}" '
+        { print }
+        {
+            s = $0
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", s)  # CSI sequences (colour, cursor)
+            gsub(/\033[()][@-~]/, "", s)               # charset designations (e.g. ESC(B)
+            gsub(/\033[=>]/, "", s)                    # keypad modes
+            print s >> f
+            fflush(f)
+        }
+    '
+    rc=${PIPESTATUS[0]}
+    set -e
+    exit "${rc}"
+}
+
+#------------------------------------------------------------------------------
 # Step framing: every script begins with step_banner and ends with exactly one
 # step_ok (prints "STEP NN OK — proceed to <next>") or step_fail (prints
-# "STEP NN FAILED: <why>" and exits non-zero).
+# "STEP NN FAILED: <why>" and exits non-zero). The footer carries the elapsed
+# time and the count of warnings emitted during the step.
 #------------------------------------------------------------------------------
 
 STEP_ID=""
@@ -61,19 +217,30 @@ STEP_ID=""
 # "org-admin" (all IAM) or "ops-admin" (everything else). Set by step_banner's
 # optional 3rd arg and appended in brackets to every OK/FAILED line.
 STEP_OWNER=""
+STEP_START_EPOCH=""
+
+# Human elapsed since step_banner (e.g. "9s", "1m12s").
+_log_elapsed() {
+    [[ -n "${STEP_START_EPOCH:-}" ]] || { printf '0s'; return; }
+    local now=$(( $(date +%s) - STEP_START_EPOCH )) m s
+    m=$(( now / 60 )); s=$(( now % 60 ))
+    if (( m > 0 )); then printf '%dm%02ds' "${m}" "${s}"; else printf '%ds' "${s}"; fi
+}
 
 step_banner() {
     STEP_ID="$1"
     local title="$2"
     STEP_OWNER="${3:-}"
-    echo "=============================================="
-    echo "  Aura Swarm TEE Rollout - Step ${STEP_ID}"
-    echo "  ${title}"
-    if [[ -n "${STEP_OWNER}" ]]; then
-        echo "  Run as: ${STEP_OWNER}"
-    fi
-    echo "=============================================="
-    echo ""
+    LOG_WARN_COUNT=0
+    STEP_START_EPOCH="$(date +%s)"
+    local rule meta
+    rule="$(_log_rule)"
+    meta="Run as: ${STEP_OWNER:-n/a}  ${ICON_BULLET}  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '\n%s%s%s\n' "${BOLD}${CYAN}" "${rule}" "${NC}"
+    printf '%s %s  Aura Swarm TEE Rollout — Step %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "${STEP_ID}" "${NC}"
+    printf '%s    %s%s\n' "${BOLD}" "${title}" "${NC}"
+    printf '%s    %s%s\n' "${DIM}" "${meta}" "${NC}"
+    printf '%s%s%s\n' "${BOLD}${CYAN}" "${rule}" "${NC}"
 }
 
 # Bracketed owner suffix (e.g. " [ops-admin]") or empty when no owner is set.
@@ -83,19 +250,17 @@ _step_owner_tag() {
 
 step_ok() {
     local next="${1:-}"
-    echo ""
-    if [[ -n "${next}" ]]; then
-        echo -e "${GREEN}STEP ${STEP_ID} OK$(_step_owner_tag) — proceed to ${next}${NC}"
-    else
-        echo -e "${GREEN}STEP ${STEP_ID} OK$(_step_owner_tag)${NC}"
-    fi
+    local parts="STEP ${STEP_ID} OK$(_step_owner_tag)  ${ICON_BULLET}  $(_log_elapsed)"
+    [[ "${LOG_WARN_COUNT:-0}" -gt 0 ]] && parts+="  ${ICON_BULLET}  ${LOG_WARN_COUNT} warning(s)"
+    [[ -n "${next}" ]] && parts+="  —  proceed to ${next}"
+    printf '\n%s%s %s%s\n' "${GREEN}${BOLD}" "${ICON_OK}" "${parts}" "${NC}"
 }
 
 # Writes to stderr so the failure line survives command substitution
 # (e.g. failures inside render_k8s_manifests).
 step_fail() {
-    echo "" >&2
-    echo -e "${RED}STEP ${STEP_ID} FAILED$(_step_owner_tag): $*${NC}" >&2
+    local parts="STEP ${STEP_ID} FAILED$(_step_owner_tag)  ${ICON_BULLET}  $(_log_elapsed): $*"
+    printf '\n%s%s %s%s\n' "${RED}${BOLD}" "${ICON_ERR}" "${parts}" "${NC}" >&2
     exit 1
 }
 
@@ -116,14 +281,14 @@ require_cmds() {
 require_aws_auth() {
     local arn
     if ! arn=$(aws sts get-caller-identity --output text --query Arn 2>&1); then
-        echo "  aws sts get-caller-identity said:"
-        echo "    ${arn}"
+        log_detail "aws sts get-caller-identity said:"
+        log_detail "  ${arn}"
         step_fail "AWS credentials are missing or expired; refresh your keys/SSO session and re-run"
     fi
     AWS_CALLER_ARN="${arn}"
     AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     export AWS_CALLER_ARN AWS_ACCOUNT_ID
-    echo -e "${GREEN}✓${NC} AWS identity: ${AWS_CALLER_ARN} (account ${AWS_ACCOUNT_ID}, region ${AWS_REGION})"
+    log_ok "AWS identity: ${AWS_CALLER_ARN} (account ${AWS_ACCOUNT_ID}, region ${AWS_REGION})"
 }
 
 ecr_registry() {
@@ -133,20 +298,20 @@ ecr_registry() {
 ecr_login() {
     aws ecr get-login-password --region "${AWS_REGION}" \
         | docker login --username AWS --password-stdin "$(ecr_registry)" >/dev/null
-    echo -e "${GREEN}✓${NC} Docker authenticated with ECR ($(ecr_registry))"
+    log_ok "Docker authenticated with ECR ($(ecr_registry))"
 }
 
 # Verifies kubectl can talk to the deploy cluster; refreshes kubeconfig from
 # EKS once before failing (same recovery legacy 07-build-images.sh suggested).
 ensure_kubectl_context() {
     if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} kubectl authenticated to ${EKS_CLUSTER_NAME}"
+        log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME}"
         return 0
     fi
-    echo -e "${YELLOW}⚠${NC} kubectl cannot reach the cluster; refreshing kubeconfig..."
+    log_warn "kubectl cannot reach the cluster; refreshing kubeconfig..."
     aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}" >/dev/null
     if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} kubectl authenticated to ${EKS_CLUSTER_NAME} (kubeconfig refreshed)"
+        log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME} (kubeconfig refreshed)"
         return 0
     fi
     step_fail "kubectl cannot authenticate to ${EKS_CLUSTER_NAME} even after kubeconfig refresh"
@@ -180,7 +345,7 @@ require_docker() {
     if ! docker_daemon_ok "${timeout_secs}"; then
         step_fail "Docker is not running (or not responding within ${timeout_secs}s)"
     fi
-    echo -e "${GREEN}✓${NC} Docker daemon is responding"
+    log_ok "Docker daemon is responding"
 }
 
 #------------------------------------------------------------------------------
@@ -238,13 +403,13 @@ ensure_iam_policy() {
             versions=$(echo "${versions}" | tail -n +2)
             [[ -z "${vid}" ]] && break
             aws iam delete-policy-version --policy-arn "${policy_arn}" --version-id "${vid}" >/dev/null 2>&1 \
-                && echo -e "  ${YELLOW}↺${NC} Pruned old policy version ${vid}"
+                && log_detail "${ICON_ARROW} pruned old policy version ${vid}"
         done
         aws iam create-policy-version \
             --policy-arn "${policy_arn}" \
             --policy-document "${doc}" \
             --set-as-default >/dev/null
-        echo -e "${GREEN}✓${NC} Updated IAM policy ${policy_name}"
+        log_ok "Updated IAM policy ${policy_name}"
     else
         aws iam create-policy \
             --policy-name "${policy_name}" \
@@ -252,7 +417,7 @@ ensure_iam_policy() {
             --description "Aura Swarm staged rollout permissions for ${RESOURCE_PREFIX}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
             >/dev/null
-        echo -e "${GREEN}✓${NC} Created IAM policy ${policy_name}"
+        log_ok "Created IAM policy ${policy_name}"
     fi
 }
 
@@ -271,18 +436,18 @@ ensure_service_role() {
 
     if aws iam get-role --role-name "${role_name}" >/dev/null 2>&1; then
         aws iam update-assume-role-policy --role-name "${role_name}" --policy-document "${trust}" >/dev/null
-        echo -e "${GREEN}✓${NC} IAM role ${role_name} present (trust refreshed)"
+        log_ok "IAM role ${role_name} present (trust refreshed)"
     else
         aws iam create-role --role-name "${role_name}" \
             --assume-role-policy-document "${trust}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" >/dev/null
-        echo -e "${GREEN}✓${NC} Created IAM role ${role_name}"
+        log_ok "Created IAM role ${role_name}"
     fi
     local arn
     for arn in "${managed[@]}"; do
         aws iam attach-role-policy --role-name "${role_name}" --policy-arn "${arn}" >/dev/null
     done
-    echo -e "  ${GREEN}✓${NC} ${role_name}: ${#managed[@]} managed policy attachment(s) ensured"
+    log_detail "${role_name}: ${#managed[@]} managed policy attachment(s) ensured"
 }
 
 # Create-or-adopt the EKS cluster + node service roles ops-admin's terraform
@@ -332,8 +497,8 @@ ensure_oidc_provider_and_caa_role() {
     rc=$?
     if [[ ${rc} -ne 0 ]]; then
         if echo "${issuer}" | grep -qiE 'ResourceNotFound|No cluster found'; then
-            echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} not found yet — deferring OIDC provider + CAA IRSA role."
-            echo "  Re-run ./01-iam.sh (org-admin) AFTER ./02-snp-node-group.sh creates the cluster."
+            log_info "EKS cluster ${EKS_CLUSTER_NAME} not found yet — deferring OIDC provider + CAA IRSA role."
+            log_detail "Re-run ./01-iam.sh (org-admin) AFTER ./02-snp-node-group.sh creates the cluster."
             return 2
         fi
         if echo "${issuer}" | grep -qiE 'AccessDenied|not authorized|UnauthorizedException'; then
@@ -346,11 +511,11 @@ ensure_oidc_provider_and_caa_role() {
         step_fail "eks describe-cluster ${EKS_CLUSTER_NAME} failed: ${issuer}"
     fi
     if [[ -z "${issuer}" || "${issuer}" == "None" ]]; then
-        echo -e "${YELLOW}ℹ${NC} EKS cluster ${EKS_CLUSTER_NAME} has no OIDC issuer yet — deferring CAA IRSA role."
+        log_info "EKS cluster ${EKS_CLUSTER_NAME} has no OIDC issuer yet — deferring CAA IRSA role."
         return 2
     fi
     local host="${issuer#https://}"
-    echo -e "${GREEN}✓${NC} Cluster OIDC issuer: ${issuer}"
+    log_ok "Cluster OIDC issuer: ${issuer}"
 
     local provider_arn
     provider_arn=$(aws iam list-open-id-connect-providers --output json 2>/dev/null \
@@ -365,9 +530,9 @@ ensure_oidc_provider_and_caa_role() {
             --thumbprint-list "${thumbprint}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
             --query 'OpenIDConnectProviderArn' --output text)
-        echo -e "${GREEN}✓${NC} Created IAM OIDC provider ${provider_arn}"
+        log_ok "Created IAM OIDC provider ${provider_arn}"
     else
-        echo -e "${GREEN}✓${NC} IAM OIDC provider present (${provider_arn})"
+        log_ok "IAM OIDC provider present (${provider_arn})"
     fi
 
     local role_name="${RESOURCE_PREFIX}-caa-role"
@@ -393,12 +558,12 @@ JSON
 )
     if aws iam get-role --role-name "${role_name}" >/dev/null 2>&1; then
         aws iam update-assume-role-policy --role-name "${role_name}" --policy-document "${trust}" >/dev/null
-        echo -e "${GREEN}✓${NC} CAA IRSA role ${role_name} present (trust refreshed)"
+        log_ok "CAA IRSA role ${role_name} present (trust refreshed)"
     else
         aws iam create-role --role-name "${role_name}" \
             --assume-role-policy-document "${trust}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" >/dev/null
-        echo -e "${GREEN}✓${NC} Created CAA IRSA role ${role_name}"
+        log_ok "Created CAA IRSA role ${role_name}"
     fi
 
     # Inline pod-VM lifecycle policy. RunInstances/TerminateInstances act on
@@ -431,8 +596,8 @@ JSON
     aws iam put-role-policy --role-name "${role_name}" \
         --policy-name "${RESOURCE_PREFIX}-caa-policy" \
         --policy-document "${caa_policy}" >/dev/null
-    echo -e "${GREEN}✓${NC} CAA inline policy ensured (pod-VM lifecycle incl. ec2:Describe*)"
-    echo -e "  ${CYAN}CAA role ARN:${NC} arn:aws:iam::${AWS_ACCOUNT_ID}:role/${role_name}"
+    log_ok "CAA inline policy ensured (pod-VM lifecycle incl. ec2:Describe*)"
+    log_kv "CAA role ARN" "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${role_name}"
 }
 
 sso_instance_arn() {
@@ -468,17 +633,17 @@ find_permission_set_arn() {
 
 print_sso_manual_guidance() {
     local policy="$1" instance_arn="${2:-\$INSTANCE_ARN}" ps_arn="${3:-\$PS_ARN}"
-    echo -e "${YELLOW}ℹ${NC} Attach ${policy} to the permission set with an account"
-    echo "  that has IAM Identity Center admin (management or delegated-admin), then re-login:"
+    log_info "Attach ${policy} to the permission set with an account"
+    log_detail "that has IAM Identity Center admin (management or delegated-admin), then re-login:"
     echo ""
-    echo "    aws sso-admin attach-customer-managed-policy-reference-to-permission-set \\"
-    echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
-    echo "      --customer-managed-policy-reference Name=${policy},Path=/"
-    echo "    aws sso-admin provision-permission-set \\"
-    echo "      --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
-    echo "      --target-type ALL_PROVISIONED_ACCOUNTS"
+    log_cmd "aws sso-admin attach-customer-managed-policy-reference-to-permission-set \\"
+    log_detail "  --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
+    log_detail "  --customer-managed-policy-reference Name=${policy},Path=/"
+    log_cmd "aws sso-admin provision-permission-set \\"
+    log_detail "  --instance-arn ${instance_arn} --permission-set-arn ${ps_arn} \\"
+    log_detail "  --target-type ALL_PROVISIONED_ACCOUNTS"
     echo ""
-    echo "  Then refresh credentials (aws sso login, or paste fresh portal keys) and re-run."
+    log_detail "Then refresh credentials (aws sso login, or paste fresh portal keys) and re-run."
 }
 
 # ensure_policy_on_permission_set <policy_name> <permission_set_name>
@@ -490,30 +655,30 @@ ensure_policy_on_permission_set() {
 
     instance_arn=$(sso_instance_arn)
     if [[ -z "${instance_arn}" || "${instance_arn}" == "None" ]]; then
-        echo -e "${YELLOW}⚠${NC} No IAM Identity Center instance visible from this account."
+        log_warn "No IAM Identity Center instance visible from this account."
         print_sso_manual_guidance "${policy}"
         return 0
     fi
-    echo -e "${GREEN}✓${NC} Identity Center instance: ${instance_arn}"
+    log_ok "Identity Center instance: ${instance_arn}"
 
     if ! ps_arn=$(find_permission_set_arn "${instance_arn}" "${name}") || [[ -z "${ps_arn}" ]]; then
-        echo -e "${YELLOW}⚠${NC} Permission set '${name}' not found (need management/delegated-admin access)."
+        log_warn "Permission set '${name}' not found (need management/delegated-admin access)."
         print_sso_manual_guidance "${policy}"
         return 0
     fi
-    echo -e "${GREEN}✓${NC} Permission set: ${name} (${ps_arn})"
+    log_ok "Permission set: ${name} (${ps_arn})"
 
     if aws sso-admin list-customer-managed-policy-references-in-permission-set \
         --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" --output json 2>/dev/null \
         | jq -e --arg n "${policy}" \
             '.CustomerManagedPolicyReferences[]? | select(.Name == $n)' >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Permission set ${name} already references ${policy}"
+        log_ok "Permission set ${name} already references ${policy}"
     elif aws sso-admin attach-customer-managed-policy-reference-to-permission-set \
         --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" \
         --customer-managed-policy-reference "Name=${policy},Path=/" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Attached ${policy} reference to permission set ${name}"
+        log_ok "Attached ${policy} reference to permission set ${name}"
     else
-        echo -e "${YELLOW}⚠${NC} Could not modify permission set (need sso-admin / delegated-admin)."
+        log_warn "Could not modify permission set (need sso-admin / delegated-admin)."
         print_sso_manual_guidance "${policy}" "${instance_arn}" "${ps_arn}"
         return 0
     fi
@@ -521,14 +686,14 @@ ensure_policy_on_permission_set() {
     if aws sso-admin provision-permission-set \
         --instance-arn "${instance_arn}" --permission-set-arn "${ps_arn}" \
         --target-type ALL_PROVISIONED_ACCOUNTS >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Re-provisioned permission set ${name} (propagating to assigned accounts)"
+        log_ok "Re-provisioned permission set ${name} (propagating to assigned accounts)"
     else
-        echo -e "${YELLOW}⚠${NC} Attach recorded but provisioning failed; run provision-permission-set manually."
+        log_warn "Attach recorded but provisioning failed; run provision-permission-set manually."
     fi
 
     echo ""
-    echo -e "${YELLOW}ℹ${NC} Customer-managed policy '${policy}' must exist (same name/path)"
-    echo "  in every account this permission set is assigned to."
+    log_info "Customer-managed policy '${policy}' must exist (same name/path)"
+    log_detail "in every account this permission set is assigned to."
 }
 
 # verify_sso_role_action <role_prefix> <action>...
@@ -543,26 +708,26 @@ verify_sso_role_action() {
             '[.Roles[]? | select(.RoleName | startswith($p)) | .Arn][0] // empty')
 
     if [[ -z "${role_arn}" ]]; then
-        echo -e "${YELLOW}⚠${NC} Role matching ${prefix} not provisioned in this account yet."
-        echo "  It appears after the permission set is provisioned + assigned; skipping simulation."
+        log_warn "Role matching ${prefix} not provisioned in this account yet."
+        log_detail "It appears after the permission set is provisioned + assigned; skipping simulation."
         return 0
     fi
 
-    echo "Simulating ${actions[*]} for ${role_arn}..."
+    log_info "Simulating ${actions[*]} for ${role_arn}..."
     result=$(aws iam simulate-principal-policy \
         --policy-source-arn "${role_arn}" \
         --action-names "${actions[@]}" \
         --query 'EvaluationResults[?EvalDecision!=`allowed`].ActionName' \
         --output text 2>&1) || {
-        echo -e "${YELLOW}⚠${NC} Could not simulate policy (need iam:SimulatePrincipalPolicy): ${result}"
+        log_warn "Could not simulate policy (need iam:SimulatePrincipalPolicy): ${result}"
         return 0
     }
 
     if [[ -n "${result}" && "${result}" != "None" ]]; then
-        echo -e "${YELLOW}⚠${NC} Role ${prefix} still missing: ${result}"
-        echo "  Provisioning may still be propagating, or the user must re-login to pick it up."
+        log_warn "Role ${prefix} still missing: ${result}"
+        log_detail "Provisioning may still be propagating, or the user must re-login to pick it up."
     else
-        echo -e "${GREEN}✓${NC} Role ${prefix} can perform: ${actions[*]}"
+        log_ok "Role ${prefix} can perform: ${actions[*]}"
     fi
 }
 
@@ -617,7 +782,7 @@ wait_nodegroups_active() {
         for g in "${groups[@]}"; do
             status=$(nodegroup_status "${g}")
             [[ "${status}" == "ACTIVE" ]] || all_ok=false
-            echo "  [${elapsed}s] ${g}: ${status}"
+            log_progress "[${elapsed}s] ${g}: ${status}"
         done
         [[ "${all_ok}" == "true" ]] && return 0
         sleep "${poll}"
@@ -658,16 +823,16 @@ apply_with_describeupdate_fallback() {
 
     if grep -qiE 'DescribeUpdate|AccessDeniedException|not authorized to perform' "${log}"; then
         echo ""
-        echo -e "${YELLOW}⚠${NC} terraform could not poll the node-group update"
-        echo "  (eks:DescribeUpdate denied — identity policy or an org SCP)."
-        echo "  Falling back to direct convergence via eks:DescribeNodegroup..."
+        log_warn "terraform could not poll the node-group update"
+        log_detail "(eks:DescribeUpdate denied — identity policy or an org SCP)."
+        log_detail "Falling back to direct convergence via eks:DescribeNodegroup..."
         rm -f "${log}"
         if wait_nodegroups_active "${timeout}"; then
-            echo -e "${GREEN}✓${NC} Node groups reached ACTIVE — the update applied despite the polling denial."
-            echo -e "${YELLOW}ℹ${NC} terraform state may not have recorded this update's completion."
-            echo "  A later terraform run reconciles once eks:DescribeUpdate is granted"
-            echo "  (attach ${OPS_IAM_POLICY} to the ${OPS_SSO_PERMISSION_SET:-ops-admin} permission set and"
-            echo "  clear any SCP denying eks:DescribeUpdate)."
+            log_ok "Node groups reached ACTIVE — the update applied despite the polling denial."
+            log_info "terraform state may not have recorded this update's completion."
+            log_detail "A later terraform run reconciles once eks:DescribeUpdate is granted"
+            log_detail "(attach ${OPS_IAM_POLICY} to the ${OPS_SSO_PERMISSION_SET:-ops-admin} permission set and"
+            log_detail "clear any SCP denying eks:DescribeUpdate)."
             return 0
         fi
         step_fail "node groups did not reach ACTIVE — eks:DescribeUpdate is denied AND convergence failed; fix the identity policy/SCP (see ./01-iam.sh) before retrying"
@@ -690,12 +855,12 @@ load_secret() {
 # deploy verification for /internal/* routes. Generated once if missing.
 ensure_internal_token() {
     if [[ -n "$(load_secret INTERNAL_TOKEN)" ]]; then
-        echo -e "${GREEN}✓${NC} .secrets/INTERNAL_TOKEN present"
+        log_ok ".secrets/INTERNAL_TOKEN present"
         return 0
     fi
     mkdir -p "${SECRETS_DIR}"
     openssl rand -hex 32 | tr -d '\n' > "${SECRETS_DIR}/INTERNAL_TOKEN"
-    echo -e "${GREEN}✓${NC} Generated new .secrets/INTERNAL_TOKEN"
+    log_ok "Generated new .secrets/INTERNAL_TOKEN"
 }
 
 internal_token() {
@@ -846,7 +1011,7 @@ ensure_smoke_test_token() {
 ensure_kbs_admin_keypair() {
     local key="${SECRETS_DIR}/kbs-admin.key"
     if [[ ! -f "${key}" ]]; then
-        echo "  Generating new Ed25519 KBS admin keypair at .secrets/kbs-admin.key..."
+        log_info "Generating new Ed25519 KBS admin keypair at .secrets/kbs-admin.key..."
         mkdir -p "${SECRETS_DIR}"
         openssl genpkey -algorithm ed25519 -out "${key}"
     fi
@@ -858,7 +1023,7 @@ ensure_kbs_admin_keypair() {
         -n "${K8S_NAMESPACE_SYSTEM}" \
         --dry-run=client -o yaml | kubectl apply -f -
     rm -f "${pub_tmp}"
-    echo -e "${GREEN}✓${NC} kbs-auth-public-key secret in sync with .secrets/kbs-admin.key"
+    log_ok "kbs-auth-public-key secret in sync with .secrets/kbs-admin.key"
 }
 
 #------------------------------------------------------------------------------
@@ -881,7 +1046,7 @@ gw_internal_get() {
     local endpoint="$1"
     local token
     if ! token="$(internal_token)"; then
-        echo -e "${RED}✗${NC} Missing INTERNAL_TOKEN for gateway internal API." >&2
+        log_err "Missing INTERNAL_TOKEN for gateway internal API."
         return 1
     fi
     curl -fsS -H "Authorization: Bearer ${token}" \
@@ -922,9 +1087,9 @@ gw_start_port_forward() {
             sleep 1
         done
     done
-    echo -e "${RED}✗${NC} Failed to port-forward aura-swarm-gateway after multiple attempts."
+    log_err "Failed to port-forward aura-swarm-gateway after multiple attempts."
     if [[ -s "${log_path}" ]]; then
-        sed 's/^/  /' "${log_path}" || true
+        indent < "${log_path}" || true
     fi
     rm -f "${log_path}"
     return 1
@@ -949,30 +1114,50 @@ gw_schema_version() {
 # avoids a `base64 --decode` round-trip that is both needless and fragile
 # across platforms (a failed decode silently yields the empty-string hash for
 # every pod, which would make distinct specs look identical).
+# sha256 of stdin -> bare hex digest. Portable across the tools that ship on
+# the platforms these scripts run on (Linux/macOS/Git-Bash): coreutils
+# sha256sum, BSD/macOS `shasum -a 256`, then openssl as a last resort.
+_sha256_hex() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        openssl dgst -sha256 | awk '{print $NF}'
+    fi
+}
+
 snapshot_agent_pods() {
     local output_path="$1"
     local raw
     raw=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o json)
 
+    # Build {pod_name: spec_hash} pairs in a temp file as a STREAM of one-object-
+    # per-line JSON values, each emitted by `jq -n` so it is always valid JSON.
+    # We then merge them with --slurpfile (below) instead of feeding a shell-
+    # built string to --argjson. This avoids two Windows/Git-Bash footguns:
+    #   - the ambiguous "${var:-{}}" default, where bash matches the FIRST `}` and
+    #     appends a stray `}` for any non-empty value (-> invalid --argjson JSON);
+    #   - native jq.exe emitting CRLF, which --argjson rejects but --slurpfile
+    #     (a JSON stream parse) tolerates as inter-value whitespace.
     # Windows-native jq.exe writes CRLF on stdout; strip CR so the per-line
-    # `read` does not capture a trailing \r and so the final --argjson payload
-    # below is valid JSON (a trailing \r makes jq reject it).
-    local spec_hashes
-    spec_hashes=$(
-        printf '%s' "${raw}" \
-            | jq -r '.items[] | [(.metadata.name // ""), (.spec | @json | @base64)] | @tsv' \
-            | tr -d '\r' \
-            | while IFS=$'\t' read -r pod_name spec_b64; do
-                [[ -z "${pod_name}" ]] && continue
-                hash=$(printf '%s' "${spec_b64}" | sha256sum | awk '{print $1}')
-                printf '%s\t%s\n' "${pod_name}" "${hash}"
-              done \
-            | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}' \
-            | tr -d '\r'
-    )
+    # `read` does not capture a trailing \r in the base64 payload.
+    local hashes_file
+    hashes_file=$(mktemp)
+    printf '%s' "${raw}" \
+        | jq -r '.items[] | [(.metadata.name // ""), (.spec | @json | @base64)] | @tsv' \
+        | tr -d '\r' \
+        | while IFS=$'\t' read -r pod_name spec_b64; do
+            [[ -z "${pod_name}" ]] && continue
+            hash=$(printf '%s' "${spec_b64}" | _sha256_hex)
+            jq -nc --arg name "${pod_name}" --arg hash "${hash}" '{($name): $hash}'
+          done > "${hashes_file}"
 
-    printf '%s' "${raw}" | jq --argjson spec_hashes "${spec_hashes:-{}}" '
-        [
+    # --slurpfile reads the stream into an array; `add // {}` folds it into one
+    # map (and yields {} when there are no agent pods at all).
+    printf '%s' "${raw}" | jq --slurpfile spec_hash_rows "${hashes_file}" '
+        ($spec_hash_rows | add // {}) as $spec_hashes
+        | [
             .items[] | {
                 agent_id: (.metadata.labels["swarm.io/agent-id"] // ""),
                 pod_name: (.metadata.name // ""),
@@ -992,6 +1177,7 @@ snapshot_agent_pods() {
             }
         ] | sort_by(.agent_id, .pod_name)
     ' > "${output_path}"
+    rm -f "${hashes_file}"
 }
 
 # Counts only RUNNING pods on the given runtime class. Terminal pods
@@ -1006,14 +1192,15 @@ count_pods_on_runtime_class() {
 }
 
 print_fleet_report() {
-    echo -e "${CYAN}Fleet report${NC}"
+    log_section "Fleet report"
     local pods_json
     pods_json=$(mktemp)
     snapshot_agent_pods "${pods_json}"
     local total
     total=$(jq 'length' "${pods_json}")
-    echo "  Agent pods: ${total}"
-    jq -r 'group_by(.runtime_class) | .[] | "    \(.[0].runtime_class): \(length)"' "${pods_json}"
+    log_kv "Agent pods" "${total}"
+    jq -r 'group_by(.runtime_class) | .[] | "\(.[0].runtime_class): \(length)"' "${pods_json}" \
+        | while IFS= read -r line; do log_detail "${line}"; done
     rm -f "${pods_json}"
 
     if kubectl get svc aura-swarm-gateway -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
@@ -1022,13 +1209,13 @@ print_fleet_report() {
             agents=$(gw_internal_get "/internal/agents/all" 2>/dev/null | jq 'length' || echo "?")
             schema=$(gw_schema_version || echo "?")
             gw_stop_port_forward
-            echo "  Persisted agents: ${agents}"
-            echo "  Store schema_version: ${schema}"
+            log_kv "Persisted agents" "${agents}"
+            log_kv "Store schema_version" "${schema}"
         else
-            echo -e "  ${YELLOW}⚠${NC} Gateway unreachable; skipping persisted-agent / schema report"
+            log_warn "Gateway unreachable; skipping persisted-agent / schema report"
         fi
     else
-        echo "  Gateway service not deployed yet"
+        log_detail "Gateway service not deployed yet"
     fi
 }
 
@@ -1073,7 +1260,7 @@ set_config_value() {
     fi
     mv "${tmp}" "${CONFIG_FILE}"
     export "${key}=${value}"
-    echo -e "${GREEN}✓${NC} config.env: ${key}=${value}"
+    log_ok "config.env: ${key}=${value}"
 }
 
 # Echo the newest available x86_64 AMI matching (owners, name) in AWS_REGION, or
@@ -1126,13 +1313,13 @@ resolve_podvm_ami() {
 # (and export it into the current shell). Callers must require_aws_auth first.
 ensure_podvm_ami() {
     if [[ -n "${PODVM_AMI_ID:-}" ]]; then
-        echo -e "${GREEN}✓${NC} PODVM_AMI_ID set: ${PODVM_AMI_ID}"
+        log_ok "PODVM_AMI_ID set: ${PODVM_AMI_ID}"
         return 0
     fi
     if [[ -n "${PODVM_AMI_NAME_FILTER:-}" ]]; then
-        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (name='${PODVM_AMI_NAME_FILTER}', owners='${PODVM_AMI_OWNERS:-<any>}')..."
+        log_info "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (name='${PODVM_AMI_NAME_FILTER}', owners='${PODVM_AMI_OWNERS:-<any>}')..."
     else
-        echo "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (CoCo community 'podvm-fedora-amd64-${CAA_CHART_VERSION:-?}', else any podvm image)..."
+        log_info "No PODVM_AMI_ID set — discovering a pod-VM AMI in ${AWS_REGION} (CoCo community 'podvm-fedora-amd64-${CAA_CHART_VERSION:-?}', else any podvm image)..."
     fi
     local ami
     ami="$(resolve_podvm_ami)"
@@ -1147,19 +1334,19 @@ or build a self-built SEV-SNP image (TEE_PLATFORM=amd; see deploy/PEER-PODS-PLAN
 # Dump describe(Events) + recent logs for the pods of a daemonset (diagnostics).
 dump_daemonset_diagnostics() {
     local ns="$1" ds="$2" pod
-    echo -e "${YELLOW}--- ${ds} diagnostics ---${NC}"
-    kubectl -n "${ns}" get pods -o wide 2>&1 | sed 's/^/  /' || true
+    log_section "${ds} diagnostics"
+    kubectl -n "${ns}" get pods -o wide 2>&1 | indent || true
     pod=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
         | jq -r --arg ds "${ds}" '[.items[] | select((.metadata.ownerReferences // [])[]?.name == $ds) | .metadata.name][0] // ""' 2>/dev/null || echo "")
     if [[ -n "${pod}" ]]; then
-        echo "  Events for ${pod}:"
-        kubectl -n "${ns}" describe pod "${pod}" 2>/dev/null | sed -n '/Events:/,$p' | sed 's/^/    /' || true
-        echo "  Logs (current) for ${pod}:"
-        kubectl -n "${ns}" logs "${pod}" --tail=50 2>&1 | sed 's/^/    /' || true
-        echo "  Logs (previous) for ${pod}:"
-        kubectl -n "${ns}" logs "${pod}" --previous --tail=50 2>&1 | sed 's/^/    /' || true
+        log_detail "Events for ${pod}:"
+        kubectl -n "${ns}" describe pod "${pod}" 2>/dev/null | sed -n '/Events:/,$p' | indent || true
+        log_detail "Logs (current) for ${pod}:"
+        kubectl -n "${ns}" logs "${pod}" --tail=50 2>&1 | indent || true
+        log_detail "Logs (previous) for ${pod}:"
+        kubectl -n "${ns}" logs "${pod}" --previous --tail=50 2>&1 | indent || true
     fi
-    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+    log_detail "--- end diagnostics ---"
 }
 
 # Wait for a DaemonSet to be fully Ready, but FAIL FAST when its pods enter
@@ -1169,7 +1356,7 @@ dump_daemonset_diagnostics() {
 wait_daemonset_ready() {
     local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" restarts="${5:-3}" min_ready="${6:-0}"
     local elapsed=0 desired ready bad target
-    echo "Waiting for daemonset ${ds} in ${ns} (fail-fast on CrashLoopBackOff, timeout ${timeout}s)..."
+    log_info "Waiting for daemonset ${ds} in ${ns} (fail-fast on CrashLoopBackOff, timeout ${timeout}s)..."
     while (( elapsed <= timeout )); do
         desired=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
         ready=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
@@ -1181,7 +1368,7 @@ wait_daemonset_ready() {
             (( target > ${desired:-0} )) && target="${desired:-0}"
         fi
         if [[ "${desired:-0}" -ge 1 && "${ready:-0}" -ge "${target}" ]]; then
-            echo -e "${GREEN}✓${NC} daemonset ${ds} Ready (${ready}/${desired}; needed ${target})"
+            log_ok "daemonset ${ds} Ready (${ready}/${desired}; needed ${target})"
             return 0
         fi
         # Fail fast: any owned pod with a CrashLoopBackOff container or restartCount >= threshold.
@@ -1193,14 +1380,14 @@ wait_daemonset_ready() {
               | "\($p.metadata.name): \(.state.waiting.reason // ("restartCount=" + ((.restartCount // 0)|tostring)))"
             ] | .[0] // ""' 2>/dev/null || echo "")
         if [[ -n "${bad}" ]]; then
-            echo -e "${RED}✗${NC} daemonset ${ds} is failing fast — ${bad}"
+            log_err "daemonset ${ds} is failing fast — ${bad}"
             dump_daemonset_diagnostics "${ns}" "${ds}"
             return 1
         fi
-        echo "  [${elapsed}s] ${ds} Ready: ${ready:-0}/${desired:-0}"
+        log_progress "[${elapsed}s] ${ds} Ready: ${ready:-0}/${desired:-0}"
         sleep "${poll}"; elapsed=$((elapsed + poll))
     done
-    echo -e "${RED}✗${NC} daemonset ${ds} not Ready (${ready:-0}/${desired:-0}) after ${timeout}s"
+    log_err "daemonset ${ds} not Ready (${ready:-0}/${desired:-0}) after ${timeout}s"
     dump_daemonset_diagnostics "${ns}" "${ds}"
     return 1
 }
@@ -1216,10 +1403,10 @@ ensure_cert_manager() {
         local have
         have=$(kubectl get crd certificates.cert-manager.io \
             -o jsonpath='{.metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null)
-        echo -e "${GREEN}✓${NC} cert-manager already present (${have:-version unknown}) — skipping install"
+        log_ok "cert-manager already present (${have:-version unknown}) — skipping install"
         return 0
     fi
-    echo "Installing cert-manager ${version} (peer-pods webhook prerequisite) into ${ns}..."
+    log_info "Installing cert-manager ${version} (peer-pods webhook prerequisite) into ${ns}..."
     helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null 2>&1 || true
     helm repo update >/dev/null 2>&1 || true
     if ! helm upgrade --install cert-manager jetstack/cert-manager \
@@ -1231,7 +1418,7 @@ ensure_cert_manager() {
     fi
     kubectl get crd certificates.cert-manager.io >/dev/null 2>&1 \
         || step_fail "cert-manager install finished but the certificates.cert-manager.io CRD is missing"
-    echo -e "${GREEN}✓${NC} cert-manager ${version} installed and Ready"
+    log_ok "cert-manager ${version} installed and Ready"
 }
 
 # True when a peer-pods / CoCo MutatingWebhookConfiguration is registered (the
@@ -1334,35 +1521,35 @@ kata_remote_overhead_is_zero() {
 wait_peerpods_node_capacity() {
     local ns="$1" ds="$2" timeout="${3:-300}" poll="${4:-10}" quiet="${5:-}"
     local elapsed=0 total advertised cm_limit can_patch
-    echo "Waiting for worker nodes to advertise kata.peerpods.io/vm capacity (timeout ${timeout}s)..."
+    log_info "Waiting for worker nodes to advertise kata.peerpods.io/vm capacity (timeout ${timeout}s)..."
     while (( elapsed <= timeout )); do
         total=$(kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
             | jq '[.items[]] | length' 2>/dev/null || echo 0)
         advertised=$(kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
             | jq '[.items[] | select(((.status.allocatable["kata.peerpods.io/vm"] // "0") | tonumber? // 0) >= 1)] | length' 2>/dev/null || echo 0)
         if [[ "${total:-0}" -ge 1 && "${advertised:-0}" -ge "${total:-0}" ]]; then
-            echo -e "${GREEN}✓${NC} Worker nodes advertise kata.peerpods.io/vm capacity (${advertised}/${total})"
+            log_ok "Worker nodes advertise kata.peerpods.io/vm capacity (${advertised}/${total})"
             peerpods_node_capacity_summary
             return 0
         fi
-        echo "  [${elapsed}s] nodes advertising kata.peerpods.io/vm: ${advertised:-0}/${total:-0}"
+        log_progress "[${elapsed}s] nodes advertising kata.peerpods.io/vm: ${advertised:-0}/${total:-0}"
         sleep "${poll}"; elapsed=$((elapsed + poll))
     done
 
     # Intermediate attempts (called by ensure_peerpods_node_capacity) suppress the
     # heavy diagnostic dump so it only prints once, on the final failure.
     [[ "${quiet}" == "quiet" ]] && return 1
-    echo -e "${RED}✗${NC} worker nodes did not advertise kata.peerpods.io/vm capacity after ${timeout}s"
+    log_err "worker nodes did not advertise kata.peerpods.io/vm capacity after ${timeout}s"
     cm_limit=$(kubectl -n "${ns}" get configmap peer-pods-cm \
         -o jsonpath='{.data.PEERPODS_LIMIT_PER_NODE}' 2>/dev/null || true)
     can_patch=$(kubectl auth can-i patch nodes/status \
         --as="system:serviceaccount:${ns}:cloud-api-adaptor" 2>/dev/null || true)
-    echo "  peer-pods-cm PEERPODS_LIMIT_PER_NODE: ${cm_limit:-<missing>}"
-    echo "  cloud-api-adaptor SA can patch nodes/status: ${can_patch:-<unknown>}"
-    echo "  node capacity/allocatable kata.peerpods.io/vm:"
+    log_detail "peer-pods-cm PEERPODS_LIMIT_PER_NODE: ${cm_limit:-<missing>}"
+    log_detail "cloud-api-adaptor SA can patch nodes/status: ${can_patch:-<unknown>}"
+    log_detail "node capacity/allocatable kata.peerpods.io/vm:"
     peerpods_node_capacity_summary
-    echo "  CAA daemonset log (tail):"
-    kubectl logs -n "${ns}" ds/"${ds}" --tail=80 2>/dev/null | sed 's/^/    /' || true
+    log_detail "CAA daemonset log (tail):"
+    kubectl logs -n "${ns}" ds/"${ds}" --tail=80 2>/dev/null | indent || true
     return 1
 }
 
@@ -1388,25 +1575,25 @@ ensure_peerpods_node_capacity() {
 
     if wait_peerpods_node_capacity "${ns}" "${ds}" "${grace}" 10 quiet; then return 0; fi
 
-    echo -e "${YELLOW}⚠${NC} kata.peerpods.io/vm not advertised yet. CAA sets it ONCE per pod at"
-    echo "  startup and does not reconcile, so a flaky restart can leave a node bare."
-    echo "  Restarting ${ds} so each pod re-runs its one-time advertisement..."
+    log_warn "kata.peerpods.io/vm not advertised yet. CAA sets it ONCE per pod at"
+    log_detail "startup and does not reconcile, so a flaky restart can leave a node bare."
+    log_detail "Restarting ${ds} so each pod re-runs its one-time advertisement..."
     kubectl -n "${ns}" rollout restart daemonset/"${ds}" >/dev/null 2>&1 || true
     wait_daemonset_ready "${ns}" "${ds}" "${grace}" >/dev/null 2>&1 || true
     if wait_peerpods_node_capacity "${ns}" "${ds}" "${grace}" 10 quiet; then return 0; fi
 
     if [[ "${CAA_SELF_ADVERTISE_VM_CAPACITY:-true}" == "true" ]]; then
         local limit="${CAA_PEERPODS_LIMIT_PER_NODE:-10}" node
-        echo -e "${YELLOW}⚠${NC} CAA still has not advertised it — self-advertising ${limit}/worker"
-        echo "  (set CAA_SELF_ADVERTISE_VM_CAPACITY=false to disable and fail instead)..."
+        log_warn "CAA still has not advertised it — self-advertising ${limit}/worker"
+        log_detail "(set CAA_SELF_ADVERTISE_VM_CAPACITY=false to disable and fail instead)..."
         for node in $(kubectl get nodes -l node.kubernetes.io/worker \
                 -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
             if kubectl patch node "${node}" --subresource=status --type=json \
                 -p="[{\"op\":\"add\",\"path\":\"/status/capacity/kata.peerpods.io~1vm\",\"value\":\"${limit}\"}]" \
                 >/dev/null 2>&1; then
-                echo -e "  ${GREEN}✓${NC} patched ${node} kata.peerpods.io/vm=${limit}"
+                log_ok "patched ${node} kata.peerpods.io/vm=${limit}"
             else
-                echo -e "  ${YELLOW}⚠${NC} could not patch ${node} (check kubectl >=1.24 and nodes/status RBAC)"
+                log_warn "could not patch ${node} (check kubectl >=1.24 and nodes/status RBAC)"
             fi
         done
     fi
@@ -1505,7 +1692,7 @@ ensure_caa_hypervisor_socket() {
     # run/pin a single kata-remote pod). require=all => every node must serve it.
     local require="${CAA_HYPERVISOR_SOCKET_REQUIRE:-all}"
     local poll=10
-    echo "Verifying ${require} ${ds} pod(s) serve the remote-hypervisor socket (${sock})..."
+    log_info "Verifying ${require} ${ds} pod(s) serve the remote-hypervisor socket (${sock})..."
     local round desired running missing missing_n served elapsed n pod
     for (( round=0; round<=rounds; round++ )); do
         # Poll up to ${grace}s (gives a freshly (re)started adaptor time to bind).
@@ -1518,13 +1705,13 @@ ensure_caa_hypervisor_socket() {
             served=$(( ${running:-0} - missing_n ))
             if [[ "${require}" == "one" ]]; then
                 if (( served >= 1 )); then
-                    echo -e "${GREEN}✓${NC} a ${ds} pod serves ${sock} (kata-remote sandbox creation can reach the hypervisor)"
+                    log_ok "a ${ds} pod serves ${sock} (kata-remote sandbox creation can reach the hypervisor)"
                     return 0
                 fi
             else
                 desired=$(kubectl -n "${ns}" get ds "${ds}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
                 if [[ "${desired:-0}" -ge 1 && "${running:-0}" -ge "${desired:-0}" && -z "${missing}" ]]; then
-                    echo -e "${GREEN}✓${NC} all ${ds} pods serve ${sock} (kata-remote sandbox creation can reach the hypervisor)"
+                    log_ok "all ${ds} pods serve ${sock} (kata-remote sandbox creation can reach the hypervisor)"
                     return 0
                 fi
             fi
@@ -1537,18 +1724,18 @@ ensure_caa_hypervisor_socket() {
         # In require=one mode, only restart if NOTHING serves it yet (one bad
         # node does not matter when another is healthy — that early-returns above).
         n=$(printf '%s\n' "${missing}" | grep -c .)
-        echo -e "  ${YELLOW}⚠${NC} ${n} pod(s) still missing ${sock} after ${grace}s; clean-restarting them (delete, no surge):"
+        log_warn "${n} pod(s) still missing ${sock} after ${grace}s; clean-restarting them (delete, no surge):"
         while IFS= read -r pod; do
             [[ -z "${pod}" ]] && continue
-            echo "    deleting ${pod}"
+            log_detail "deleting ${pod}"
             kubectl -n "${ns}" delete pod "${pod}" --wait=false >/dev/null 2>&1 || true
         done <<< "${missing}"
         sleep "${poll}"
     done
-    echo -e "${RED}✗${NC} no ${ds} pod serves ${sock} (require=${require}); still missing:"
-    printf '%s\n' "${missing}" | sed 's/^/    /'
-    echo "  Inspect the CAA log on a failing node for a listener/bind error:"
-    echo "    kubectl -n ${ns} logs <pod> | grep -iE 'hypervisor|socket|listen|bind|server started'"
+    log_err "no ${ds} pod serves ${sock} (require=${require}); still missing:"
+    printf '%s\n' "${missing}" | indent >&2
+    log_detail "Inspect the CAA log on a failing node for a listener/bind error:"
+    log_detail "kubectl -n ${ns} logs <pod> | grep -iE 'hypervisor|socket|listen|bind|server started'"
     return 1
 }
 
@@ -1557,9 +1744,9 @@ ensure_caa_hypervisor_socket() {
 # Returns the number of problems found so callers can decide.
 validate_confidential_runtime_config() {
     local problems=0
-    echo -e "${GREEN}✓${NC} Confidential agents run as Peer Pods (CAA kata-remote; per-agent SEV-SNP pod VM)"
+    log_ok "Confidential agents run as Peer Pods (CAA kata-remote; per-agent SEV-SNP pod VM)"
     if [[ -z "${PODVM_AMI_ID:-}" ]]; then
-        echo -e "${YELLOW}⚠${NC} PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
+        log_warn "PODVM_AMI_ID is empty — CAA cannot launch pod VMs (run: ./configure.sh PODVM_AMI_ID=ami-...)"
         problems=$((problems + 1))
     fi
     # The peer-pods webhook is what lets kata-remote pods schedule by pod-VM
@@ -1571,15 +1758,15 @@ validate_confidential_runtime_config() {
         whout=$(peerpods_webhook_effective) || whrc=$?
         case "${whrc}" in
             0)
-                echo -e "${GREEN}✓${NC} Peer-pods mutating webhook effective (kata-remote pods schedule via kata.peerpods.io/vm)"
+                log_ok "Peer-pods mutating webhook effective (kata-remote pods schedule via kata.peerpods.io/vm)"
                 ;;
             1)
-                echo -e "${YELLOW}⚠${NC} Peer-pods webhook is registered but NOT effective — the API server cannot call it, so kata-remote pods stay unmutated (cpu/memory kept) and go Unschedulable 'Insufficient cpu'. Check cert-manager CA injection:"
-                printf '%s\n' "${whout}" | sed 's/^/    /'
+                log_warn "Peer-pods webhook is registered but NOT effective — the API server cannot call it, so kata-remote pods stay unmutated (cpu/memory kept) and go Unschedulable 'Insufficient cpu'. Check cert-manager CA injection:"
+                printf '%s\n' "${whout}" | indent
                 problems=$((problems + 1))
                 ;;
             *)
-                echo -e "${YELLOW}⚠${NC} CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration found — kata-remote pods will keep their cpu/memory requests and can go Unschedulable on busy nodes. Run ./03-coco-operator.sh."
+                log_warn "CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration found — kata-remote pods will keep their cpu/memory requests and can go Unschedulable on busy nodes. Run ./03-coco-operator.sh."
                 problems=$((problems + 1))
                 ;;
         esac
@@ -1650,7 +1837,7 @@ enable_storage = ${existing_storage}
 enable_eks     = ${existing_eks}
 enable_ecr     = ${existing_ecr}
 EOF
-    echo -e "${GREEN}✓${NC} Regenerated terraform.tfvars (flags: network=${existing_network} storage=${existing_storage} eks=${existing_eks} ecr=${existing_ecr})"
+    log_ok "Regenerated terraform.tfvars (flags: network=${existing_network} storage=${existing_storage} eks=${existing_eks} ecr=${existing_ecr})"
 }
 
 warn_about_destroys() {
@@ -1668,10 +1855,7 @@ warn_about_destroys() {
     local destroy_count
     destroy_count=$(echo "${destroyed_lines}" | wc -l | tr -d ' ')
 
-    echo ""
-    echo -e "${RED}================================================================${NC}"
-    echo -e "${RED}  WARNING: This plan will DESTROY ${destroy_count} resource(s)${NC}"
-    echo -e "${RED}================================================================${NC}"
+    log_abort "WARNING: this plan will DESTROY ${destroy_count} resource(s)"
     echo "${destroyed_lines}" | sed 's/.*# /  - /; s/ will be destroyed.*//'
     echo ""
 }
@@ -1680,19 +1864,19 @@ confirm_plan() {
     local plan_file="$1"
     warn_about_destroys "${plan_file}"
     echo ""
-    echo -e "${YELLOW}Review the plan above before proceeding${NC}"
     if [[ "${PLAN_HAS_DESTROYS}" == "true" ]]; then
-        echo -e "${RED}Type 'destroy' to confirm destructive changes, or anything else to abort.${NC}"
+        printf '%sType '\''destroy'\'' to confirm destructive changes, or anything else to abort.%s\n' "${RED}${BOLD}" "${NC}"
         read -r -p "Confirm: " confirm
         if [[ "${confirm}" != "destroy" ]]; then
-            echo "Aborted. No changes applied."
+            log_info "Aborted. No changes applied."
             exit 0
         fi
     else
+        printf '%sReview the plan above before proceeding.%s\n' "${YELLOW}" "${NC}"
         read -r -p "Apply this plan? (yes/no) [no]: " confirm
         confirm=${confirm:-no}
         if [[ "${confirm}" != "yes" ]]; then
-            echo "Aborted. Run this script again when ready."
+            log_info "Aborted. Run this script again when ready."
             exit 0
         fi
     fi
@@ -1777,7 +1961,7 @@ build_and_push_platform_images() {
 
     local worktree
     worktree=$(mktemp -d)/src
-    echo "Checking out ${ref} (${sha}) into a throwaway worktree..."
+    log_info "Checking out ${ref} (${sha}) into a throwaway worktree..."
     git -C "${PROJECT_ROOT}" worktree add --detach "${worktree}" "${sha}" >/dev/null
 
     local build_rc=0
@@ -1789,12 +1973,11 @@ build_and_push_platform_images() {
         # Skip rebuild if this exact tag already exists in ECR (idempotent re-run)
         if aws ecr describe-images --repository-name "${image_name}" \
             --image-ids imageTag="${PLATFORM_IMAGE_TAG}" >/dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC} ${full_image} already in ECR — skipping build"
+            log_ok "${full_image} already in ECR — skipping build"
             continue
         fi
 
-        echo ""
-        echo "Building ${service} at ${PLATFORM_IMAGE_TAG}..."
+        log_section "Building ${service} at ${PLATFORM_IMAGE_TAG}"
         local cargo_features=""
         if [[ "${service}" == "gateway" && "${DEV_MODE:-false}" == "true" ]]; then
             cargo_features="--features dev-mode"
@@ -1813,7 +1996,7 @@ build_and_push_platform_images() {
             build_rc=1
             break
         fi
-        echo -e "${GREEN}✓${NC} Pushed ${full_image}"
+        log_ok "Pushed ${full_image}"
     done
 
     git -C "${PROJECT_ROOT}" worktree remove --force "${worktree}" >/dev/null 2>&1 || true
@@ -1852,7 +2035,7 @@ resolve_pinned_harness_image() {
         step_fail "AURA_HARNESS_IMAGE must be pinned to an immutable digest (got: ${PINNED_HARNESS_IMAGE})"
     fi
     export PINNED_HARNESS_IMAGE
-    echo -e "${GREEN}✓${NC} Pinned harness image: ${PINNED_HARNESS_IMAGE}"
+    log_ok "Pinned harness image: ${PINNED_HARNESS_IMAGE}"
 }
 
 #------------------------------------------------------------------------------
@@ -1926,11 +2109,11 @@ apply_platform_manifests() {
 
     local manifest
     for manifest in "${manifests[@]}"; do
-        echo "Applying ${manifest}..."
+        log_cmd "kubectl apply -f ${manifest}"
         kubectl apply -f "${tmp_dir}/${manifest}" >/dev/null
     done
     rm -rf "${tmp_dir}"
-    echo -e "${GREEN}✓${NC} Manifests applied (images at tag ${image_tag})"
+    log_ok "Manifests applied (images at tag ${image_tag})"
 
     kubectl rollout restart deployment/aura-swarm-scheduler -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null
 }
@@ -1941,7 +2124,7 @@ wait_platform_rollouts() {
         kubectl rollout status "deployment/${d}" -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s \
             || step_fail "rollout of ${d} did not complete"
     done
-    echo -e "${GREEN}✓${NC} Gateway/control/scheduler rollouts complete"
+    log_ok "Gateway/control/scheduler rollouts complete"
 }
 
 wait_pvcs_bound() {
@@ -1953,10 +2136,10 @@ wait_pvcs_bound() {
         ctl=$(kubectl get pvc aura-swarm-control-data -n "${K8S_NAMESPACE_SYSTEM}" \
             -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
         if [[ "${gw}" == "Bound" && "${ctl}" == "Bound" ]]; then
-            echo -e "${GREEN}✓${NC} Platform PVCs bound"
+            log_ok "Platform PVCs bound"
             return 0
         fi
-        echo "  [${elapsed}s] gateway-data=${gw} control-data=${ctl}"
+        log_progress "[${elapsed}s] gateway-data=${gw} control-data=${ctl}"
         sleep "${interval}"
         elapsed=$((elapsed + interval))
     done
@@ -1992,7 +2175,7 @@ kbs_in_cluster_check() {
     if [[ "${code}" == "000" ]]; then
         return 1
     fi
-    echo -e "${GREEN}✓${NC} KBS service resolves and responds in-cluster (HTTP ${code})"
+    log_ok "KBS service resolves and responds in-cluster (HTTP ${code})"
 }
 
 # Poll until a jq condition over the agent-pod snapshot holds.
@@ -2006,13 +2189,18 @@ wait_for_pods_condition() {
         snapshot_agent_pods "${snap}"
         if [[ "$(jq "${expr}" "${snap}")" == "true" ]]; then
             rm -f "${snap}"
-            echo -e "${GREEN}✓${NC} ${desc} (after ${elapsed}s)"
+            log_ok "${desc} (after ${elapsed}s)"
             return 0
         fi
-        echo "  [${elapsed}s] waiting: ${desc}"
+        log_progress "[${elapsed}s] waiting: ${desc}"
         sleep "${poll}"
         elapsed=$((elapsed + poll))
     done
     rm -f "${snap}"
     return 1
 }
+
+# Start per-run file logging now that all helpers + DEPLOY_DIR are defined.
+# Forward "$@" so the script's own arguments survive the re-exec wrapper.
+# Opt out with DEPLOY_LOG_TO_FILE=0.
+log_init "$@"

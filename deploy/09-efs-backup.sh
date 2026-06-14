@@ -27,7 +27,7 @@ require_aws_auth
 EFS_ARN=$(tf_output efs_filesystem_arn)
 EFS_ID=$(tf_output efs_filesystem_id)
 [[ -n "${EFS_ARN}" ]] || step_fail "could not read the EFS filesystem ARN from terraform output"
-echo "Filesystem: ${EFS_ID}"
+log_info "Filesystem: ${EFS_ID}"
 
 BACKUP_VAULT="${BACKUP_VAULT_NAME:-Default}"
 aws backup describe-backup-vault --backup-vault-name "${BACKUP_VAULT}" >/dev/null 2>&1 \
@@ -42,14 +42,14 @@ fi
 # Start the on-demand backup job
 #------------------------------------------------------------------------------
 
-echo "Starting on-demand backup job into vault '${BACKUP_VAULT}'..."
+log_info "Starting on-demand backup job into vault '${BACKUP_VAULT}'..."
 JOB_ID=$(aws backup start-backup-job \
     --backup-vault-name "${BACKUP_VAULT}" \
     --resource-arn "${EFS_ARN}" \
     --iam-role-arn "${BACKUP_ROLE_ARN}" \
     --recovery-point-tags "Purpose=pre-r2-migration,Project=${PROJECT_NAME},Environment=${ENVIRONMENT}" \
     --query 'BackupJobId' --output text)
-echo "  Backup job: ${JOB_ID}"
+log_detail "Backup job: ${JOB_ID}"
 
 #------------------------------------------------------------------------------
 # Wait for completion
@@ -73,7 +73,7 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
             step_fail "backup job ${JOB_ID} ended in state ${STATE}"
             ;;
     esac
-    echo "  [${ELAPSED}s] state=${STATE} progress=${PERCENT}%"
+    log_progress "[${ELAPSED}s] state=${STATE} progress=${PERCENT}%"
     sleep "${POLL}"
     ELAPSED=$((ELAPSED + POLL))
 done
@@ -100,11 +100,11 @@ RP_STATUS=$(aws backup describe-recovery-point \
     echo "EFS_BACKUP_TAKEN_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 } > "${EFS_BACKUP_STATE_FILE}"
 
-echo -e "${GREEN}✓${NC} Recovery point COMPLETED: ${RECOVERY_POINT_ARN}"
-echo -e "${GREEN}✓${NC} Rollback point recorded in ${EFS_BACKUP_STATE_FILE}"
+log_ok "Recovery point COMPLETED: ${RECOVERY_POINT_ARN}"
+log_ok "Rollback point recorded in ${EFS_BACKUP_STATE_FILE}"
 echo ""
-echo "Rollback procedure (if R2 goes wrong): restore this recovery point,"
-echo "redeploy the R1 images (./07-deploy-r1.sh), and unset"
-echo "MIGRATION_RECREATE_LEGACY_PODS in the aura-swarm-config ConfigMap."
+log_info "Rollback procedure (if R2 goes wrong): restore this recovery point,"
+log_detail "redeploy the R1 images (./07-deploy-r1.sh), and unset"
+log_detail "MIGRATION_RECREATE_LEGACY_PODS in the aura-swarm-config ConfigMap."
 
 step_ok "10 (./10-deploy-r2-migrate.sh)"

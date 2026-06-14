@@ -47,7 +47,7 @@ SCHEMA=$(gw_schema_version || echo "null")
 gw_stop_port_forward
 [[ "${SCHEMA}" == "2" ]] \
     || step_fail "schema_version=${SCHEMA}, expected 2 — R2 has not completed"
-echo -e "${GREEN}✓${NC} R2 convergence preconditions hold (schema v2, zero kata-fc pods)"
+log_ok "R2 convergence preconditions hold (schema v2, zero kata-fc pods)"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -60,19 +60,19 @@ gw_start_port_forward || step_fail "gateway port-forward failed after deploy"
 HEALTH_STATUS=$(gw_internal_get "/internal/health" | jq -r '.status // empty')
 gw_stop_port_forward
 [[ "${HEALTH_STATUS}" == "ok" ]] || step_fail "gateway /internal/health not ok after the R3 deploy"
-echo -e "${GREEN}✓${NC} R3 platform deployed and healthy"
+log_ok "R3 platform deployed and healthy"
 echo ""
 
 #------------------------------------------------------------------------------
 # Retire kata-fc
 #------------------------------------------------------------------------------
 
-echo "Deleting the kata-fc RuntimeClass..."
+log_cmd "kubectl delete runtimeclass kata-fc --ignore-not-found"
 kubectl delete runtimeclass kata-fc --ignore-not-found
 if kubectl get runtimeclass kata-fc >/dev/null 2>&1; then
     step_fail "kata-fc RuntimeClass still exists after delete"
 fi
-echo -e "${GREEN}✓${NC} kata-fc RuntimeClass gone"
+log_ok "kata-fc RuntimeClass gone"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -84,7 +84,7 @@ regenerate_tfvars
 terraform init -upgrade -input=false >/dev/null
 
 PLAN_FILE="r3-system-pool.tfplan"
-echo "Planning the shrunk system pool (${NODE_DESIRED_COUNT} x ${NODE_INSTANCE_TYPE})..."
+log_info "Planning the shrunk system pool (${NODE_DESIRED_COUNT} x ${NODE_INSTANCE_TYPE})..."
 terraform plan -out="${PLAN_FILE}"
 
 if plan_replaces_efs "${PLAN_FILE}"; then
@@ -93,7 +93,7 @@ fi
 
 confirm_plan "${PLAN_FILE}"
 terraform apply "${PLAN_FILE}"
-echo -e "${GREEN}✓${NC} System pool applied"
+log_ok "System pool applied"
 cd "${SCRIPT_DIR}"
 echo ""
 
@@ -106,12 +106,12 @@ KATA_FC=$(count_pods_on_runtime_class "kata-fc")
 if kubectl get runtimeclass kata-fc >/dev/null 2>&1; then
     step_fail "kata-fc RuntimeClass reappeared"
 fi
-echo -e "${GREEN}✓${NC} No kata-fc artifacts remain"
+log_ok "No kata-fc artifacts remain"
 
 # Fleet health: platform rollouts already verified; check agent pods settle.
 if ! wait_for_pods_condition '[.[] | select(.phase != "Running" or (.ready | not))] | length == 0' 600 \
     "every agent pod Running and Ready"; then
-    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o wide | sed 's/^/  /'
+    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent -o wide | indent
     step_fail "agent pods did not settle to Running/Ready within 600s"
 fi
 

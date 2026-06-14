@@ -73,5 +73,30 @@ Between steps 07 and 09, soak R1 in production for as long as you need confidenc
 - `iam/` — the `org-admin`/`ops-admin` IAM policy templates (applied by step 01 only).
 - `k8s/` — platform manifests, templated at deploy time (images, secrets, EFS id) by the deploy steps; never edited in place.
 - `config.env` — environment knobs shared by all steps.
-- `_lib.sh` — step framing, terraform/ECR/port-forward helpers reused across scripts.
+- `_lib.sh` — logging vocabulary, step framing, terraform/ECR/port-forward helpers reused across scripts.
 - `legacy/` — pre-TEE-rollout scripts, kept for reference (including `destroy.sh`, `diagnose.sh`, `fix-pending-pods.sh`, and the image build tooling `07-build-images.sh`).
+
+## Logging
+
+Every step uses a shared, capability-aware logging vocabulary defined in `_lib.sh` so live deploy output is consistent and easy to scan. Each line type is visually distinct:
+
+- `step_banner` / `step_ok` / `step_fail` — the ruled step header and the success/failure footer (footer carries elapsed time + warning count).
+- `log_section "Title"` — a `◆`-prefixed group header.
+- `log_ok` (`✓`) / `log_warn` (`⚠`) / `log_err` (`✗`) / `log_info` (`ℹ`) — status lines (errors go to stderr; warnings are tallied in the step footer).
+- `log_detail` — dim, indented context/continuation.
+- `log_cmd` — a `$ command` about to run.
+- `log_progress` — poll/wait lines (e.g. `[30s] …`).
+- `log_kv "key" "value"` — aligned summary pairs.
+- `indent` — a filter that uniformly indents streamed sub-command output (`kubectl … | indent`).
+- `log_abort "TITLE"` — a boxed red banner for hard-stop conditions.
+
+Colour and Unicode icons auto-disable when stdout is not a TTY (or on `dumb` terminals); `tput` is used when available, otherwise raw ANSI.
+
+Environment knobs:
+
+- `NO_COLOR` / `DEPLOY_NO_COLOR` — disable colour. `FORCE_COLOR` — force colour even when piped.
+- `DEPLOY_ASCII=1` — ASCII icons instead of Unicode glyphs.
+- `DEPLOY_LOG_TO_FILE=0` — disable per-run file logging (on by default).
+- `DEPLOY_LOG_DIR` — override the log directory (default `deploy/.logs/`, git-ignored).
+
+By default each run is tee'd to `deploy/.logs/<script>-<UTC timestamp>.log` (a colour-stripped copy of everything printed) so a run can be diagnosed after the fact.

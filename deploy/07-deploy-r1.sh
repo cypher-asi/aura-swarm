@@ -66,7 +66,7 @@ PRE_LEGACY_JSON="${TMP_DIR}/pre-legacy-pods.json"
 snapshot_agent_pods "${TMP_DIR}/pre-all-pods.json"
 jq '[.[] | select(.runtime_class == "kata-fc")]' "${TMP_DIR}/pre-all-pods.json" > "${PRE_LEGACY_JSON}"
 LEGACY_COUNT=$(jq 'length' "${PRE_LEGACY_JSON}")
-echo "Legacy (kata-fc) pods before deploy: ${LEGACY_COUNT}"
+log_info "Legacy (kata-fc) pods before deploy: ${LEGACY_COUNT}"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -85,7 +85,7 @@ HEALTH=$(gw_internal_get "/internal/health" || echo "")
 gw_stop_port_forward
 [[ "$(echo "${HEALTH}" | jq -r '.status // empty')" == "ok" ]] \
     || step_fail "gateway /internal/health did not report ok (got: ${HEALTH:-no response})"
-echo -e "${GREEN}✓${NC} Gateway /internal/health OK"
+log_ok "Gateway /internal/health OK"
 
 #------------------------------------------------------------------------------
 # Verify: legacy pods untouched (R1 must not churn kata-fc pods)
@@ -112,17 +112,17 @@ if [[ "${LEGACY_MISSING}" != "0" || "${LEGACY_CHANGED}" != "0" ]]; then
     echo "${LEGACY_DIFF}" | jq .
     step_fail "legacy kata-fc pods were touched by the R1 deploy (${LEGACY_MISSING} missing, ${LEGACY_CHANGED} spec-changed) — R1 must leave legacy agents unchanged"
 fi
-echo -e "${GREEN}✓${NC} All ${LEGACY_COUNT} legacy kata-fc pod(s) untouched (same pods, runtime class, spec hash)"
+log_ok "All ${LEGACY_COUNT} legacy kata-fc pod(s) untouched (same pods, runtime class, spec hash)"
 
 #------------------------------------------------------------------------------
 # Verify: one new test agent lands on SNP with sealed env + billing sku
 #------------------------------------------------------------------------------
 
 if [[ "${SKIP_TEST_AGENT}" == "true" ]]; then
-    echo -e "${YELLOW}⚠${NC} Skipping test-agent verification (--skip-test-agent)"
+    log_warn "Skipping test-agent verification (--skip-test-agent)"
 else
     echo ""
-    echo "Creating R1 test agent..."
+    log_info "Creating R1 test agent..."
     gw_start_port_forward || step_fail "gateway port-forward failed"
 
     CREATE_RESP=$(gw_user_api POST "/v1/agents" \
@@ -130,7 +130,7 @@ else
         || step_fail "test agent creation failed (check SMOKE_TEST_TOKEN)"
     TEST_AGENT_ID=$(echo "${CREATE_RESP}" | jq -r '.agent_id // .id // empty')
     [[ -n "${TEST_AGENT_ID}" ]] || step_fail "could not parse agent id from create response: ${CREATE_RESP}"
-    echo "  Test agent: ${TEST_AGENT_ID}"
+    log_detail "Test agent: ${TEST_AGENT_ID}"
 
     # Wait for its pod and inspect runtime class + sealed-env injection.
     POD_NAME=""
@@ -144,7 +144,7 @@ else
                 -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
             [[ "${PHASE}" == "Running" ]] && break
         fi
-        echo "  [${ELAPSED}s] waiting for test agent pod (pod=${POD_NAME:-none})"
+        log_progress "[${ELAPSED}s] waiting for test agent pod (pod=${POD_NAME:-none})"
         sleep 15
         ELAPSED=$((ELAPSED + 15))
     done
@@ -154,13 +154,13 @@ else
     RUNTIME_CLASS=$(echo "${POD_JSON}" | jq -r '.spec.runtimeClassName // "<none>"')
     [[ "${RUNTIME_CLASS}" == "kata-remote" ]] \
         || step_fail "test agent pod is on '${RUNTIME_CLASS}', expected kata-remote"
-    echo -e "${GREEN}✓${NC} Test agent pod on kata-remote"
+    log_ok "Test agent pod on kata-remote"
 
     SEALED=$(echo "${POD_JSON}" | jq -r '[.spec.containers[0].env[]? | select(.name == "AURA_STATE_ENCRYPTION") | .value] | first // ""')
     KBS_ENV=$(echo "${POD_JSON}" | jq -r '[.spec.containers[0].env[]? | select(.name == "AURA_KBS_URL") | .value] | first // ""')
     [[ "${SEALED}" == "sealed" ]] || step_fail "test agent pod missing AURA_STATE_ENCRYPTION=sealed (got '${SEALED}')"
     [[ -n "${KBS_ENV}" ]] || step_fail "test agent pod missing AURA_KBS_URL"
-    echo -e "${GREEN}✓${NC} Test agent env: AURA_STATE_ENCRYPTION=sealed, AURA_KBS_URL=${KBS_ENV}"
+    log_ok "Test agent env: AURA_STATE_ENCRYPTION=sealed, AURA_KBS_URL=${KBS_ENV}"
 
     # Billing sku: the usage API must report tier/sku data for the new agent.
     USAGE=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/usage" || echo "")
@@ -168,13 +168,13 @@ else
     if [[ "${SKU_SEEN}" == "0" ]]; then
         step_fail "usage API shows no sku/tier for the test agent — tier billing not visible (response: ${USAGE:0:200})"
     fi
-    echo -e "${GREEN}✓${NC} Billing sku/tier visible in the usage API"
+    log_ok "Billing sku/tier visible in the usage API"
 
-    echo "  Destroying test agent..."
+    log_info "Destroying test agent..."
     gw_user_api DELETE "/v1/agents/${TEST_AGENT_ID}" >/dev/null \
         && TEST_AGENT_ID=""
     gw_stop_port_forward
-    echo -e "${GREEN}✓${NC} Test agent cleaned up"
+    log_ok "Test agent cleaned up"
 fi
 
 step_ok "08 (./08-r1-soak-check.sh — run repeatedly during the soak window)"

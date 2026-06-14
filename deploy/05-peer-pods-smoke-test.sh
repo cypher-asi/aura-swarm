@@ -68,6 +68,25 @@ KBS_REPO_DIR="/opt/confidential-containers/kbs"
 CDH_RESOURCE_URL="${CDH_RESOURCE_URL:-http://127.0.0.1:8006/cdh/resource}"
 SMOKE_RESOURCE_PATH="default/peer-pods-smoke-test/dek"
 SMOKE_RESOURCE_DIR="$(dirname "${SMOKE_RESOURCE_PATH}")"
+# KBS (Trustee >= v0.20) stores resources via the kvstorage LocalFs backend: the
+# resource plugin uses the unified storage backend under the "repository"
+# namespace, and EACH resource is a SINGLE flat file whose name is the resource
+# path with every "/" replaced by the literal 4-char string "\x2F" (see
+# deps/key-value-storage/src/local_fs/mod.rs: dir_path.join(key.replace('/',
+# "\\x2F"))). So the on-disk file for default/peer-pods-smoke-test/dek is
+#   <dir_path>/repository/default\x2Fpeer-pods-smoke-test\x2Fdek
+# NOT a nested default/peer-pods-smoke-test/dek tree. Writing the nested tree (or
+# omitting the repository namespace dir) makes KBS return "resource not found"
+# even though attestation succeeds.
+KBS_REPO_NS_DIR="${KBS_REPO_DIR}/repository"
+SMOKE_RESOURCE_KEY_ESC="${SMOKE_RESOURCE_PATH//\//\\x2F}"
+SMOKE_RESOURCE_FILE="${KBS_REPO_NS_DIR}/${SMOKE_RESOURCE_KEY_ESC}"
+# The flat filename contains literal backslashes ("\x2F"). Embedding it directly
+# in a YAML double-quoted scalar or a JSON string is a trap: YAML/JSON treat
+# "\x2F" as an escape and turn it back into "/", recreating the WRONG nested path.
+# So hand the writer/rm pods the base64 of the exact filename and decode it inside
+# the container, which is immune to the heredoc + YAML + shell escaping layers.
+SMOKE_RESOURCE_NAME_B64="$(printf '%s' "${SMOKE_RESOURCE_KEY_ESC}" | base64 | tr -d '\n')"
 
 SMOKE_SETTER_POD="peer-pods-smoke-kbs-setter"
 SMOKE_RM_POD="peer-pods-smoke-kbs-rm"
@@ -122,24 +141,24 @@ new_podvm_id() {
 # — the pod's sandbox-creation Events, the pod VM's EC2 state, and the CAA
 # daemonset log tail. All read-only.
 dump_containercreating_diagnostics() {
-    echo -e "${YELLOW}--- kata-remote ContainerCreating diagnostics ---${NC}"
-    echo "  pod sandbox events (a repeated FailedCreatePodSandBox shows the real cause):"
+    log_info "--- kata-remote ContainerCreating diagnostics ---"
+    log_detail "pod sandbox events (a repeated FailedCreatePodSandBox shows the real cause):"
     kubectl describe pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
-        | sed -n '/Events:/,$p' | sed 's/^/    /' || true
+        | sed -n '/Events:/,$p' | indent || true
     if [[ -n "${NEW_PODVM_ID}" ]]; then
-        echo "  pod VM ${NEW_PODVM_ID} (CAA launched it for this run):"
+        log_detail "pod VM ${NEW_PODVM_ID} (CAA launched it for this run):"
         aws ec2 describe-instances --region "${AWS_REGION}" --instance-ids "${NEW_PODVM_ID}" \
             --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,type:InstanceType,ami:ImageId,launched:LaunchTime,reason:StateReason.Message}' \
-            --output table 2>&1 | sed 's/^/    /' || true
+            --output table 2>&1 | indent || true
     else
-        echo "  pod VM: none matching '${PODVM_NAME_FILTER}' detected yet"
-        echo "          (CAA may not have called RunInstances — check the CAA log below for an AWS error)"
+        log_detail "pod VM: none matching '${PODVM_NAME_FILTER}' detected yet"
+        log_detail "(CAA may not have called RunInstances — check the CAA log below for an AWS error)"
     fi
-    echo "  CAA daemonset log (tail):"
+    log_detail "CAA daemonset log (tail):"
     kubectl logs -n "${CAA_NAMESPACE:-confidential-containers-system}" \
         ds/"${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" --tail=80 2>/dev/null \
-        | sed 's/^/    /' || true
-    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        | indent || true
+    log_info "--- end diagnostics ---"
 }
 
 # Most recent Event for the smoke pod as "reason: message" (empty if none). The
@@ -209,7 +228,7 @@ cleanup() {
     # throwaway key material outlives the test (best-effort; mounts the RWX PVC).
     kubectl run "${SMOKE_RM_POD}" -n "${K8S_NAMESPACE_SYSTEM}" --restart=Never --quiet \
         --image="${SMOKE_WRITER_IMAGE}" \
-        --overrides="{\"spec\":{\"volumes\":[{\"name\":\"repo\",\"persistentVolumeClaim\":{\"claimName\":\"${KBS_REPO_PVC}\"}}],\"containers\":[{\"name\":\"rm\",\"image\":\"${SMOKE_WRITER_IMAGE}\",\"command\":[\"rm\",\"-f\",\"${KBS_REPO_DIR}/${SMOKE_RESOURCE_PATH}\"],\"volumeMounts\":[{\"name\":\"repo\",\"mountPath\":\"${KBS_REPO_DIR}\"}]}]}}" \
+        --overrides="{\"spec\":{\"volumes\":[{\"name\":\"repo\",\"persistentVolumeClaim\":{\"claimName\":\"${KBS_REPO_PVC}\"}}],\"containers\":[{\"name\":\"rm\",\"image\":\"${SMOKE_WRITER_IMAGE}\",\"command\":[\"sh\",\"-c\",\"f=\$(printf %s '${SMOKE_RESOURCE_NAME_B64}' | base64 -d); rm -f ${KBS_REPO_NS_DIR}/\$f\"],\"volumeMounts\":[{\"name\":\"repo\",\"mountPath\":\"${KBS_REPO_DIR}\"}]}]}}" \
         >/dev/null 2>&1 || true
     kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${SMOKE_RM_POD}" \
         -n "${K8S_NAMESPACE_SYSTEM}" --timeout=60s >/dev/null 2>&1 || true
@@ -220,7 +239,7 @@ cleanup() {
     if [[ -n "${NEW_PODVM_ID}" ]]; then
         case "$(instance_state "${NEW_PODVM_ID}")" in
             pending|running|stopping|stopped)
-                echo -e "${YELLOW}⚠${NC} Terminating leftover pod VM ${NEW_PODVM_ID} (cleanup safety net)..." >&2
+                log_warn "Terminating leftover pod VM ${NEW_PODVM_ID} (cleanup safety net)..." >&2
                 aws ec2 terminate-instances --region "${AWS_REGION}" \
                     --instance-ids "${NEW_PODVM_ID}" >/dev/null 2>&1 || true
                 ;;
@@ -239,7 +258,7 @@ NEW_PODVM_ID=""
 
 BEFORE_IDS="$(podvm_instance_ids "pending,running,shutting-down,stopping,stopped")"
 BEFORE_COUNT=$(printf '%s\n' "${BEFORE_IDS}" | sed '/^$/d' | wc -l | tr -d ' ')
-echo "Pod VMs matching '${PODVM_NAME_FILTER}' before launch: ${BEFORE_COUNT}"
+log_info "Pod VMs matching '${PODVM_NAME_FILTER}' before launch: ${BEFORE_COUNT}"
 
 #------------------------------------------------------------------------------
 # 1. Provision the scratch KBS resource
@@ -247,7 +266,7 @@ echo "Pod VMs matching '${PODVM_NAME_FILTER}' before launch: ${BEFORE_COUNT}"
 
 SMOKE_VALUE=$(openssl rand -hex 32)
 
-echo "Provisioning scratch KBS resource ${SMOKE_RESOURCE_PATH} (writing into the ${KBS_REPO_PVC} PVC)..."
+log_info "Provisioning scratch KBS resource ${SMOKE_RESOURCE_PATH} (writing into the ${KBS_REPO_PVC} PVC)..."
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -262,7 +281,13 @@ spec:
       command:
         - sh
         - -c
-        - "mkdir -p '${KBS_REPO_DIR}/${SMOKE_RESOURCE_DIR}' && printf '%s' '${SMOKE_VALUE}' > '${KBS_REPO_DIR}/${SMOKE_RESOURCE_PATH}' && echo wrote '${KBS_REPO_DIR}/${SMOKE_RESOURCE_PATH}' && ls -l '${KBS_REPO_DIR}/${SMOKE_RESOURCE_PATH}'"
+        - |
+          set -e
+          mkdir -p '${KBS_REPO_NS_DIR}'
+          f=\$(printf '%s' '${SMOKE_RESOURCE_NAME_B64}' | base64 -d)
+          printf '%s' '${SMOKE_VALUE}' > "${KBS_REPO_NS_DIR}/\$f"
+          echo "wrote ${KBS_REPO_NS_DIR}/\$f"
+          ls -l "${KBS_REPO_NS_DIR}/\$f"
       volumeMounts:
         - { name: repo, mountPath: ${KBS_REPO_DIR} }
   volumes:
@@ -275,34 +300,34 @@ SETTER_TIMEOUT="${SETTER_TIMEOUT_SECS:-180}"
 SETTER_POLL=10
 SETTER_ELAPSED=0
 SETTER_PHASE=""
-echo "Waiting for the KBS resource writer pod (timeout ${SETTER_TIMEOUT}s)..."
+log_info "Waiting for the KBS resource writer pod (timeout ${SETTER_TIMEOUT}s)..."
 while [[ ${SETTER_ELAPSED} -le ${SETTER_TIMEOUT} ]]; do
     SETTER_PHASE=$(kubectl get pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
     [[ "${SETTER_PHASE}" == "Succeeded" || "${SETTER_PHASE}" == "Failed" ]] && break
     SETTER_WAIT=$(kubectl get pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
-    echo "  [${SETTER_ELAPSED}s] setter pod: ${SETTER_PHASE:-Pending} ${SETTER_WAIT:+(${SETTER_WAIT})}"
+    log_progress "[${SETTER_ELAPSED}s] setter pod: ${SETTER_PHASE:-Pending} ${SETTER_WAIT:+(${SETTER_WAIT})}"
     sleep "${SETTER_POLL}"
     SETTER_ELAPSED=$((SETTER_ELAPSED + SETTER_POLL))
 done
 
 if [[ "${SETTER_PHASE}" != "Succeeded" ]]; then
-    echo -e "${YELLOW}--- KBS resource writer diagnostics ---${NC}"
-    echo "  image: ${SMOKE_WRITER_IMAGE}"
-    echo "  phase: $(kubectl get pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" -o jsonpath='{.status.phase}' 2>/dev/null)"
-    echo "  container state:"
+    log_info "--- KBS resource writer diagnostics ---"
+    log_detail "image: ${SMOKE_WRITER_IMAGE}"
+    log_detail "phase: $(kubectl get pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" -o jsonpath='{.status.phase}' 2>/dev/null)"
+    log_detail "container state:"
     kubectl get pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{range .status.containerStatuses[*]}    {.name}: ready={.ready} waiting={.state.waiting.reason} {.state.waiting.message} terminated={.state.terminated.reason}(exit {.state.terminated.exitCode}){"\n"}{end}' 2>/dev/null || true
-    echo "  events:"
+    log_detail "events:"
     kubectl describe pod "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
-        | sed -n '/Events:/,$p' | sed 's/^/    /' || true
-    echo "  logs (current):"
-    kubectl logs "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>&1 | sed 's/^/    /' || true
-    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        | sed -n '/Events:/,$p' | indent || true
+    log_detail "logs (current):"
+    kubectl logs "${SMOKE_SETTER_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>&1 | indent || true
+    log_info "--- end diagnostics ---"
     step_fail "could not provision the scratch KBS resource (writer pod failed)"
 fi
-echo -e "${GREEN}✓${NC} Scratch resource provisioned in KBS"
+log_ok "Scratch resource provisioned in KBS"
 
 #------------------------------------------------------------------------------
 # 2. Throwaway kata-remote pod: CAA boots a pod VM that attests + fetches via CDH
@@ -318,16 +343,16 @@ if [[ "${PEER_PODS_REQUIRE_WEBHOOK:-true}" == "true" ]]; then
     WH_RC=0
     WH_DIAG=$(peerpods_webhook_effective) || WH_RC=$?
     if [[ ${WH_RC} -ne 0 ]]; then
-        echo -e "${YELLOW}--- peer-pods webhook diagnostics ---${NC}"
-        printf '%s\n' "${WH_DIAG}" | sed 's/^/  /'
-        echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        log_info "--- peer-pods webhook diagnostics ---"
+        printf '%s\n' "${WH_DIAG}" | indent
+        log_info "--- end diagnostics ---"
         if [[ ${WH_RC} -eq 2 ]]; then
             step_fail "no peer-pods MutatingWebhookConfiguration is registered — kata-remote pods keep cpu/memory and never schedule. Run ./03-coco-operator.sh (CAA_ENABLE_WEBHOOK=true) first, or set PEER_PODS_REQUIRE_WEBHOOK=false to skip this guard."
         else
             step_fail "the peer-pods mutating webhook is registered but NOT effective (see diagnostics above): empty caBundle or no ready endpoints, so the API server cannot call it and (with failurePolicy=Ignore) would SILENTLY admit this pod unmutated. Fix cert-manager CA injection then re-run, or set PEER_PODS_REQUIRE_WEBHOOK=false to bypass."
         fi
     fi
-    echo -e "${GREEN}✓${NC} Peer-pods mutating webhook is effective (kata-remote pods get rewritten to kata.peerpods.io/vm)"
+    log_ok "Peer-pods mutating webhook is effective (kata-remote pods get rewritten to kata.peerpods.io/vm)"
 fi
 
 # Pre-flight: the kata-remote shim dials /run/peerpod/hypervisor.sock per node;
@@ -345,18 +370,18 @@ if [[ "${PEER_PODS_REQUIRE_HYPERVISOR_SOCKET:-true}" == "true" ]]; then
         "${CAA_NAMESPACE:-confidential-containers-system}" \
         "${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}")"
     if [[ -z "${SMOKE_NODE}" ]]; then
-        echo -e "${YELLOW}--- CAA hypervisor socket diagnostics ---${NC}"
-        echo "  CAA pods NOT serving /run/peerpod/hypervisor.sock:"
+        log_info "--- CAA hypervisor socket diagnostics ---"
+        log_detail "CAA pods NOT serving /run/peerpod/hypervisor.sock:"
         caa_pods_missing_hypervisor_socket \
             "${CAA_NAMESPACE:-confidential-containers-system}" \
-            "${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" | sed 's/^/    /'
-        echo -e "${YELLOW}--- end diagnostics ---${NC}"
+            "${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" | indent
+        log_info "--- end diagnostics ---"
         step_fail "no CAA node currently serves /run/peerpod/hypervisor.sock, so the kata-remote shim
   cannot reach the hypervisor and the smoke pod would fail sandbox creation (stuck
   ContainerCreating). Re-run ./03-coco-operator.sh (it verifies and clean-restarts a CAA pod until
   one serves the socket), or set PEER_PODS_REQUIRE_HYPERVISOR_SOCKET=false to skip this guard."
     fi
-    echo -e "${GREEN}✓${NC} CAA node ${SMOKE_NODE} serves /run/peerpod/hypervisor.sock — pinning the smoke pod there"
+    log_ok "CAA node ${SMOKE_NODE} serves /run/peerpod/hypervisor.sock — pinning the smoke pod there"
     SMOKE_NODE_SELECTOR="  nodeSelector:
     kubernetes.io/hostname: ${SMOKE_NODE}"
 fi
@@ -377,7 +402,7 @@ if ! kata_remote_overhead_is_zero; then
     if [[ "${PEER_PODS_ZERO_RUNTIMECLASS_OVERHEAD:-true}" == "true" ]]; then
         if kubectl patch runtimeclass kata-remote --type=merge \
             -p '{"overhead":{"podFixed":{"cpu":"0","memory":"0"}}}' >/dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC} Zeroed kata-remote RuntimeClass overhead (was ${KR_OVERHEAD}; the scheduler would otherwise add it and the pod would go Unschedulable 'Insufficient cpu')"
+            log_ok "Zeroed kata-remote RuntimeClass overhead (was ${KR_OVERHEAD}; the scheduler would otherwise add it and the pod would go Unschedulable 'Insufficient cpu')"
         else
             step_fail "kata-remote RuntimeClass has non-zero overhead (${KR_OVERHEAD}) and it could not be patched to zero.
   The scheduler ADDS this overhead to the (otherwise 0-cpu) mutated pod, so it goes Unschedulable 'Insufficient cpu'.
@@ -392,11 +417,57 @@ if ! kata_remote_overhead_is_zero; then
     kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
     fi
 else
-    echo -e "${GREEN}✓${NC} kata-remote RuntimeClass overhead is zero (peer-pods schedules via kata.peerpods.io/vm)"
+    log_ok "kata-remote RuntimeClass overhead is zero (peer-pods schedules via kata.peerpods.io/vm)"
 fi
 
+#------------------------------------------------------------------------------
+# CoCo initdata: tell the in-guest attestation-agent + CDH where the KBS is.
+#
+# The guest components (AA/CDH) run on the pod VM and egress over the pod VM's
+# OWN VPC interface, NOT the cluster pod-network tunnel — so they CANNOT reach
+# the KBS ClusterIP (kube-proxy only exists on cluster nodes). They must be given
+# a VPC-routable KBS address. The KBS pod IP is a real VPC ENI address (AWS VPC
+# CNI), reachable from the pod VM's agent subnet (the node SG admits TCP 8080 from
+# the pod-VM SG), so discover it at run time and pass aa.toml/cdh.toml via the
+# kata initdata annotation (gzip|base64 of the initdata TOML). Without this the
+# CDH fetch fails fast with "[CDH] [ERROR]: Get Resource failed" and KBS never
+# logs an attestation request.
+KBS_POD_IP=$(kubectl get pod -n "${K8S_NAMESPACE_SYSTEM}" -l app=kbs \
+    -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+[[ -n "${KBS_POD_IP}" ]] \
+    || step_fail "could not determine the KBS pod IP (kubectl get pod -n ${K8S_NAMESPACE_SYSTEM} -l app=kbs); is the KBS running?"
+KBS_GUEST_URL="http://${KBS_POD_IP}:8080"
+log_info "In-guest attestation will target KBS at ${KBS_GUEST_URL} (pod VM reaches the KBS pod IP over the VPC)."
+
+INITDATA_TOML=$(mktemp)
+cat > "${INITDATA_TOML}" <<TOML
+algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"aa.toml" = '''
+[token_configs]
+[token_configs.coco_as]
+url = '${KBS_GUEST_URL}'
+
+[token_configs.kbs]
+url = '${KBS_GUEST_URL}'
+'''
+
+"cdh.toml" = '''
+socket = 'unix:///run/confidential-containers/cdh.sock'
+credentials = []
+
+[kbc]
+name = 'cc_kbc'
+url = '${KBS_GUEST_URL}'
+'''
+TOML
+SMOKE_INITDATA_B64=$(gzip -c "${INITDATA_TOML}" | base64 -w0)
+rm -f "${INITDATA_TOML}"
+
 echo ""
-echo "Launching throwaway pod on kata-remote (CAA pod-VM boot + attestation can take a few minutes)..."
+log_info "Launching throwaway pod on kata-remote (CAA pod-VM boot + attestation can take a few minutes)..."
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -405,6 +476,8 @@ metadata:
   namespace: ${K8S_NAMESPACE_SYSTEM}
   labels:
     app: peer-pods-smoke-test
+  annotations:
+    io.katacontainers.config.hypervisor.cc_init_data: "${SMOKE_INITDATA_B64}"
 spec:
   restartPolicy: Never
   runtimeClassName: kata-remote
@@ -418,11 +491,12 @@ ${SMOKE_NODE_SELECTOR}
         - |
           i=0
           while [ \$i -lt 60 ]; do
-            v=\$(curl -fsS --max-time 10 "${CDH_RESOURCE_URL}/${SMOKE_RESOURCE_PATH}" 2>/dev/null || true)
+            v=\$(curl -fsS --max-time 10 "${CDH_RESOURCE_URL}/${SMOKE_RESOURCE_PATH}" 2>/tmp/err) || true
             if [ -n "\$v" ]; then
               echo "CDH_VALUE:\$v"
               exit 0
             fi
+            echo "CDH_ATTEMPT \$i failed: \$(cat /tmp/err 2>/dev/null)"
             i=\$((i + 1))
             sleep 5
           done
@@ -459,6 +533,14 @@ CC_DIAG_INTERVAL="${PEER_PODS_CC_DIAG_INTERVAL_SECS:-120}"
 CC_GRACE="${PEER_PODS_CONTAINERCREATING_GRACE_SECS:-420}"
 CC_ELAPSED=0
 CC_LAST_DIAG=0
+# A pod that reaches Running has booted, attested, and started the container, so
+# the in-guest CDH fetch should release the DEK within seconds and the pod flips
+# to Succeeded. If it stays Running this long the fetch is failing every retry
+# (attestation/DEK release broken) and the container will only confirm it after
+# burning its full in-guest retry budget (~300s). Fast-fail with the container's
+# own CDH_ATTEMPT log instead of waiting it out.
+RUNNING_GRACE="${PEER_PODS_RUNNING_GRACE_SECS:-90}"
+RUNNING_ELAPSED=0
 # Previous values so we can log STATE TRANSITIONS (phase, pod-VM EC2 state, and
 # the latest pod Event) the moment they change, instead of silently reprinting.
 PREV_PHASE=""
@@ -467,12 +549,12 @@ PREV_EVENT=""
 
 # Echo the effective launch parameters so the run is self-describing: every knob
 # that decides when/why it fails, plus the worker<->pod-VM contract to check.
-echo "  pod:            ${SMOKE_POD} (ns ${K8S_NAMESPACE_SYSTEM}, runtimeClass kata-remote)"
-echo "  pod VM:         AMI ${PODVM_AMI_ID:-<unset>}, type ${PODVM_INSTANCE_TYPE:-<unset>}, name filter '${PODVM_NAME_FILTER}'"
-echo "  CDH resource:   ${CDH_RESOURCE_URL}/${SMOKE_RESOURCE_PATH}"
-echo "  worker<->podVM: forwarder :${CAA_FORWARDER_PORT:-15150}, vxlan :${CAA_VXLAN_PORT:-9000}"
-echo "  CAA:            ds ${CAA_DAEMONSET:-cloud-api-adaptor-daemonset} (ns ${CAA_NAMESPACE:-confidential-containers-system})"
-echo "  timeouts(s):    launch=${TIMEOUT} unsched-grace=${UNSCHED_GRACE} container-err-grace=${CWAIT_GRACE} containercreating-grace=${CC_GRACE} diag-interval=${CC_DIAG_INTERVAL} poll=${POLL}"
+log_kv "pod" "${SMOKE_POD} (ns ${K8S_NAMESPACE_SYSTEM}, runtimeClass kata-remote)"
+log_kv "pod VM" "AMI ${PODVM_AMI_ID:-<unset>}, type ${PODVM_INSTANCE_TYPE:-<unset>}, name filter '${PODVM_NAME_FILTER}'"
+log_kv "CDH resource" "${CDH_RESOURCE_URL}/${SMOKE_RESOURCE_PATH}"
+log_kv "worker<->podVM" "forwarder :${CAA_FORWARDER_PORT:-15150}, vxlan :${CAA_VXLAN_PORT:-9000}"
+log_kv "CAA" "ds ${CAA_DAEMONSET:-cloud-api-adaptor-daemonset} (ns ${CAA_NAMESPACE:-confidential-containers-system})"
+log_kv "timeouts(s)" "launch=${TIMEOUT} unsched-grace=${UNSCHED_GRACE} container-err-grace=${CWAIT_GRACE} containercreating-grace=${CC_GRACE} running-grace=${RUNNING_GRACE} diag-interval=${CC_DIAG_INTERVAL} poll=${POLL}"
 echo ""
 
 while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
@@ -494,7 +576,7 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     if [[ -z "${NEW_PODVM_ID}" ]]; then
         NEW_PODVM_ID="$(new_podvm_id || true)"
         if [[ -n "${NEW_PODVM_ID}" ]]; then
-            echo -e "  ${CYAN}↳ detected pod VM ${NEW_PODVM_ID}:${NC} $(podvm_describe_line "${NEW_PODVM_ID}")"
+            log_detail "${ICON_ARROW} detected pod VM ${NEW_PODVM_ID}: $(podvm_describe_line "${NEW_PODVM_ID}")"
         fi
     fi
     # Pod-VM EC2 state, logged on every transition (pending -> running -> ...).
@@ -502,29 +584,29 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
     if [[ -n "${NEW_PODVM_ID}" ]]; then
         PODVM_STATE="$(instance_state "${NEW_PODVM_ID}")"
         if [[ "${PODVM_STATE}" != "${PREV_PODVM_STATE}" ]]; then
-            echo -e "  ${CYAN}↳ pod VM ${NEW_PODVM_ID} state: ${PREV_PODVM_STATE:-<new>} -> ${PODVM_STATE}${NC}"
+            log_detail "${ICON_ARROW} pod VM ${NEW_PODVM_ID} state: ${PREV_PODVM_STATE:-<new>} -> ${PODVM_STATE}"
             PREV_PODVM_STATE="${PODVM_STATE}"
         fi
     fi
     # Log pod phase transitions explicitly (the per-poll line shows phase too).
     if [[ "${PHASE}" != "${PREV_PHASE}" ]]; then
-        [[ -n "${PREV_PHASE}" ]] && echo -e "  ${CYAN}↳ pod phase: ${PREV_PHASE} -> ${PHASE}${NC}"
+        [[ -n "${PREV_PHASE}" ]] && log_detail "${ICON_ARROW} pod phase: ${PREV_PHASE} -> ${PHASE}"
         PREV_PHASE="${PHASE}"
     fi
     # Surface the latest pod Event (where FailedCreatePodSandBox etc. appear),
     # but only when it CHANGES so the same warning is not reprinted every poll.
     EVENT="$(pod_latest_event)"
     if [[ -n "${EVENT}" && "${EVENT}" != "${PREV_EVENT}" ]]; then
-        echo -e "  ${YELLOW}↳ event:${NC} ${EVENT:0:200}"
+        log_detail "${ICON_ARROW} event: ${EVENT:0:200}"
         PREV_EVENT="${EVENT}"
     fi
 
     if [[ "${PHASE}" == "Succeeded" || "${PHASE}" == "Failed" ]]; then
-        echo "  [${ELAPSED}s] phase=${PHASE} ready=${READY}/${NCONT} restarts=${RESTARTS}${NODE:+ node=${NODE}}${POD_IP:+ ip=${POD_IP}}${NEW_PODVM_ID:+ podVM=${NEW_PODVM_ID}${PODVM_STATE:+(${PODVM_STATE})}}"
+        log_progress "[${ELAPSED}s] phase=${PHASE} ready=${READY}/${NCONT} restarts=${RESTARTS}${NODE:+ node=${NODE}}${POD_IP:+ ip=${POD_IP}}${NEW_PODVM_ID:+ podVM=${NEW_PODVM_ID}${PODVM_STATE:+(${PODVM_STATE})}}"
         break
     fi
 
-    echo "  [${ELAPSED}s] phase=${PHASE} ready=${READY}/${NCONT} restarts=${RESTARTS}${SCHED:+ sched=[${SCHED}]}${CWAIT:+ container=${CWAIT}}${NODE:+ node=${NODE}}${POD_IP:+ ip=${POD_IP}}${NEW_PODVM_ID:+ podVM=${NEW_PODVM_ID}${PODVM_STATE:+(${PODVM_STATE})}}"
+    log_progress "[${ELAPSED}s] phase=${PHASE} ready=${READY}/${NCONT} restarts=${RESTARTS}${SCHED:+ sched=[${SCHED}]}${CWAIT:+ container=${CWAIT}}${NODE:+ node=${NODE}}${POD_IP:+ ip=${POD_IP}}${NEW_PODVM_ID:+ podVM=${NEW_PODVM_ID}${PODVM_STATE:+(${PODVM_STATE})}}"
 
     # Detect a stuck-Unschedulable pod and bail with a precise diagnosis.
     if [[ "${SCHED}" == Unschedulable:* || "${SCHED}" == *"Unschedulable"* ]]; then
@@ -534,9 +616,9 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
         if [[ "${UNSCHED_HINTED:-0}" == "0" ]]; then
             UNSCHED_HINTED=1
             if [[ "${SCHED}" == *"Insufficient kata.peerpods.io/vm"* ]]; then
-                echo -e "  ${YELLOW}↳${NC} Unschedulable — the pod was likely mutated, but workers have no/free kata.peerpods.io/vm capacity. Full diagnostics in ${UNSCHED_GRACE}s."
+                log_detail "${ICON_ARROW} Unschedulable — the pod was likely mutated, but workers have no/free kata.peerpods.io/vm capacity. Full diagnostics in ${UNSCHED_GRACE}s."
             else
-                echo -e "  ${YELLOW}↳${NC} Unschedulable — if this is 'Insufficient cpu' either the webhook did NOT rewrite this pod (a mutated pod has NO cpu request and asks for kata.peerpods.io/vm:1) OR the kata-remote RuntimeClass still has non-zero overhead the scheduler adds. Full diagnostics in ${UNSCHED_GRACE}s."
+                log_detail "${ICON_ARROW} Unschedulable — if this is 'Insufficient cpu' either the webhook did NOT rewrite this pod (a mutated pod has NO cpu request and asks for kata.peerpods.io/vm:1) OR the kata-remote RuntimeClass still has non-zero overhead the scheduler adds. Full diagnostics in ${UNSCHED_GRACE}s."
             fi
         fi
         if [[ ${UNSCHED_ELAPSED} -ge ${UNSCHED_GRACE} ]]; then
@@ -544,20 +626,20 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
                 -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null || true)
             VM_RES=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
                 -o jsonpath='{.spec.containers[0].resources.requests.kata\.peerpods\.io/vm}' 2>/dev/null || true)
-            echo -e "${YELLOW}--- unschedulable diagnostics ---${NC}"
-            echo "  pod still requests cpu=${CPU_REQ:-<none>}, kata.peerpods.io/vm=${VM_RES:-<none>}"
-            echo "  (a webhook-mutated kata-remote pod has NO cpu request and kata.peerpods.io/vm=1)"
-            echo "  peer-pods webhook effectiveness (caBundle/failurePolicy/endpoints):"
-            peerpods_webhook_effective 2>/dev/null | sed 's/^/    /' || true
-            echo "  peer-pods-cm PEERPODS_LIMIT_PER_NODE:"
+            log_info "--- unschedulable diagnostics ---"
+            log_detail "pod still requests cpu=${CPU_REQ:-<none>}, kata.peerpods.io/vm=${VM_RES:-<none>}"
+            log_detail "(a webhook-mutated kata-remote pod has NO cpu request and kata.peerpods.io/vm=1)"
+            log_detail "peer-pods webhook effectiveness (caBundle/failurePolicy/endpoints):"
+            peerpods_webhook_effective 2>/dev/null | indent || true
+            log_detail "peer-pods-cm PEERPODS_LIMIT_PER_NODE:"
             kubectl -n "${CAA_NAMESPACE:-confidential-containers-system}" get configmap peer-pods-cm \
                 -o jsonpath='    {.data.PEERPODS_LIMIT_PER_NODE}{"\n"}' 2>/dev/null || true
-            echo "  node capacity/allocatable kata.peerpods.io/vm:"
+            log_detail "node capacity/allocatable kata.peerpods.io/vm:"
             peerpods_node_capacity_summary
             KR_OVERHEAD="$(kata_remote_overhead)"
-            echo "  kata-remote RuntimeClass overhead (podFixed): ${KR_OVERHEAD:-<none>}"
-            echo "  (the scheduler ADDS this to the pod; non-zero cpu here => 'Insufficient cpu' even though the pod requests 0 cpu)"
-            echo -e "${YELLOW}--- end diagnostics ---${NC}"
+            log_detail "kata-remote RuntimeClass overhead (podFixed): ${KR_OVERHEAD:-<none>}"
+            log_detail "(the scheduler ADDS this to the pod; non-zero cpu here => 'Insufficient cpu' even though the pod requests 0 cpu)"
+            log_info "--- end diagnostics ---"
             if [[ -n "${CPU_REQ:-}" ]]; then
                 step_fail "kata-remote smoke pod stayed Unschedulable for ${UNSCHED_ELAPSED}s (${SCHED}).
   It still carries a cpu request, so the peer-pods mutating webhook did NOT rewrite it
@@ -606,16 +688,16 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
             if [[ ${CWAIT_ELAPSED} -ge ${CWAIT_GRACE} ]]; then
                 CMSG=$(kubectl get pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
                     -o jsonpath='{.status.containerStatuses[0].state.waiting.message}' 2>/dev/null || true)
-                echo -e "${YELLOW}--- container-create diagnostics (${CWAIT}) ---${NC}"
-                echo "  container message: ${CMSG:-<none>}"
-                echo "  pod events:"
+                log_info "--- container-create diagnostics (${CWAIT}) ---"
+                log_detail "container message: ${CMSG:-<none>}"
+                log_detail "pod events:"
                 kubectl describe pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
-                    | sed -n '/Events:/,$p' | sed 's/^/    /' || true
-                echo "  CAA daemonset log (tail):"
+                    | sed -n '/Events:/,$p' | indent || true
+                log_detail "CAA daemonset log (tail):"
                 kubectl logs -n "${CAA_NAMESPACE:-confidential-containers-system}" \
                     ds/"${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" --tail=80 2>/dev/null \
-                    | sed 's/^/    /' || true
-                echo -e "${YELLOW}--- end diagnostics ---${NC}"
+                    | indent || true
+                log_info "--- end diagnostics ---"
                 step_fail "kata-remote smoke pod stuck in ${CWAIT} for ${CWAIT_ELAPSED}s:
   '${CMSG:0:200}'
   An 'error unpacking image ... content digest not found' here means the WORKLOAD image is being
@@ -637,7 +719,7 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
                 CC_ELAPSED=$((CC_ELAPSED + POLL))
                 if [[ $((CC_ELAPSED - CC_LAST_DIAG)) -ge ${CC_DIAG_INTERVAL} ]]; then
                     CC_LAST_DIAG=${CC_ELAPSED}
-                    echo -e "  ${YELLOW}↳${NC} still ContainerCreating after ${CC_ELAPSED}s (CAA pod-VM boot/sandbox) — live diagnostics:"
+                    log_detail "${ICON_ARROW} still ContainerCreating after ${CC_ELAPSED}s (CAA pod-VM boot/sandbox) — live diagnostics:"
                     dump_containercreating_diagnostics
                 fi
                 if [[ ${CC_ELAPSED} -ge ${CC_GRACE} ]]; then
@@ -657,6 +739,35 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
             ;;
     esac
 
+    # Fast-fail a pod that is Running but never Succeeds. The container started,
+    # so sandbox/boot/attestation-of-the-VM are fine; the only thing left is the
+    # in-guest CDH fetch, which on a healthy guest releases the DEK within
+    # seconds. Staying Running past the grace means every fetch is failing and
+    # the container would only surface CDH_FETCH_FAILED after its full ~300s
+    # retry budget. Bail now with its CDH_ATTEMPT log (the per-retry curl error).
+    if [[ "${PHASE}" == "Running" ]]; then
+        RUNNING_ELAPSED=$((RUNNING_ELAPSED + POLL))
+        if [[ ${RUNNING_ELAPSED} -ge ${RUNNING_GRACE} ]]; then
+            log_info "--- running-but-not-succeeded diagnostics ---"
+            log_detail "container has been up ${RUNNING_ELAPSED}s without fetching the DEK (a healthy"
+            log_detail "in-guest CDH fetch succeeds within seconds), so attestation/DEK release is failing."
+            log_detail "smoke container log (CDH_ATTEMPT lines carry the per-retry curl error):"
+            kubectl logs "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" --tail=40 2>/dev/null \
+                | indent || true
+            log_info "--- end diagnostics ---"
+            step_fail "kata-remote smoke pod stayed Running for ${RUNNING_ELAPSED}s without succeeding.
+  The pod VM booted and the smoke container started, so the only remaining step — the in-guest CDH
+  fetching the attestation-gated DEK — is failing on every retry. See the CDH_ATTEMPT errors above; the
+  usual causes, in order:
+    1. the pod VM's SG cannot reach the KBS pod IP on 8080 over the VPC (node SG must admit TCP 8080 from the pod-VM SG),
+    2. KBS/Trustee rejects the attestation (policy / SEV-SNP evidence), so the resource is never released, or
+    3. the scratch resource is not at the \\x2F-escaped LocalFs path KBS reads (attestation OK but resource 404s).
+  Raise PEER_PODS_RUNNING_GRACE_SECS if your guest legitimately needs longer to attest+fetch."
+        fi
+    else
+        RUNNING_ELAPSED=0
+    fi
+
     sleep "${POLL}"
     ELAPSED=$((ELAPSED + POLL))
 done
@@ -667,23 +778,23 @@ if [[ -z "${NEW_PODVM_ID}" ]]; then
 fi
 
 if [[ "${PHASE}" != "Succeeded" ]]; then
-    echo -e "${YELLOW}--- smoke pod post-mortem (ended phase ${PHASE}) ---${NC}"
-    echo "  pod events:"
+    log_info "--- smoke pod post-mortem (ended phase ${PHASE}) ---"
+    log_detail "pod events:"
     kubectl describe pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
-        | sed -n '/Events:/,$p' | sed 's/^/    /' || true
-    echo "  pod logs (CDH_VALUE: on success, CDH_FETCH_FAILED if the in-guest fetch timed out):"
-    kubectl logs "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null | sed 's/^/    /' || true
+        | sed -n '/Events:/,$p' | indent || true
+    log_detail "pod logs (CDH_VALUE: on success, CDH_FETCH_FAILED if the in-guest fetch timed out):"
+    kubectl logs "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null | indent || true
     if [[ -n "${NEW_PODVM_ID}" ]]; then
-        echo "  pod VM ${NEW_PODVM_ID}:"
+        log_detail "pod VM ${NEW_PODVM_ID}:"
         aws ec2 describe-instances --region "${AWS_REGION}" --instance-ids "${NEW_PODVM_ID}" \
             --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,type:InstanceType,ami:ImageId,launched:LaunchTime,reason:StateReason.Message}' \
-            --output table 2>&1 | sed 's/^/    /' || true
+            --output table 2>&1 | indent || true
     fi
-    echo "  CAA daemonset log (tail):"
+    log_detail "CAA daemonset log (tail):"
     kubectl logs -n "${CAA_NAMESPACE:-confidential-containers-system}" \
         ds/"${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}" --tail=80 2>/dev/null \
-        | sed 's/^/    /' || true
-    echo -e "${YELLOW}--- end post-mortem ---${NC}"
+        | indent || true
+    log_info "--- end post-mortem ---"
     step_fail "peer-pods smoke pod ended in phase '${PHASE}' — CAA pod-VM boot, attestation, or DEK release did not succeed"
 fi
 
@@ -694,27 +805,36 @@ fi
 if [[ -z "${NEW_PODVM_ID}" ]]; then
     step_fail "pod succeeded but no new EC2 pod VM matching '${PODVM_NAME_FILTER}' was observed — CAA did not launch a pod VM (or the tag filter is wrong; see PODVM_NAME_FILTER TODO)"
 fi
-echo -e "${GREEN}✓${NC} CAA launched a pod VM during the run (${NEW_PODVM_ID})"
+log_ok "CAA launched a pod VM during the run (${NEW_PODVM_ID})"
 
 #------------------------------------------------------------------------------
 # 3b. Verify the released value matches what we provisioned
 #------------------------------------------------------------------------------
 
-FETCHED=$(kubectl logs "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" \
-    | grep '^CDH_VALUE:' | head -1 | cut -d: -f2-)
+# The container prints the released DEK as a single `CDH_VALUE:<hex>` line; the
+# `^CDH_VALUE:` anchor deliberately ignores the per-retry `CDH_ATTEMPT ...`
+# diagnostics. Keep the `|| true` so a missing line falls through to the explicit
+# mismatch check below (a clear step_fail) instead of tripping `set -e`/pipefail
+# with no message.
+FETCHED=$(kubectl logs "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" 2>/dev/null \
+    | grep '^CDH_VALUE:' | head -1 | cut -d: -f2- || true)
 
 if [[ "${FETCHED}" != "${SMOKE_VALUE}" ]]; then
     step_fail "fetched DEK does not match the provisioned value (got '${FETCHED:0:16}...', wanted '${SMOKE_VALUE:0:16}...')"
 fi
-echo -e "${GREEN}✓${NC} Pod VM booted, attested, and fetched the scratch DEK via CDH"
-echo -e "${GREEN}✓${NC} Value matches the provisioned resource — end-to-end peer-pod attestation works"
+log_ok "Pod VM booted, attested, and fetched the scratch DEK via CDH"
+log_ok "Value matches the provisioned resource — end-to-end peer-pod attestation works"
 
 #------------------------------------------------------------------------------
-# 3c. Headline assertion: deleting the pod TERMINATES the pod VM (no leak)
+# 3c. Headline assertion: the pod VM does NOT leak. CAA reaps a peer pod's VM
+# when the pod goes away — in practice it starts as soon as the container exits
+# (a Succeeded pod's VM is often already shutting-down/terminated before the
+# delete below). We still delete explicitly and then REQUIRE the VM to reach
+# shutting-down/terminated, so a leaked instance (silent cost/quota drain) fails.
 #------------------------------------------------------------------------------
 
 echo ""
-echo "Deleting the smoke pod and asserting CAA terminates pod VM ${NEW_PODVM_ID}..."
+log_info "Deleting the smoke pod and asserting pod VM ${NEW_PODVM_ID} is reaped (CAA may already have started on container exit)..."
 kubectl delete pod "${SMOKE_POD}" -n "${K8S_NAMESPACE_SYSTEM}" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1 || true
 
 TERM_TIMEOUT="${PEER_PODS_TERMINATE_TIMEOUT_SECS:-300}"
@@ -725,26 +845,26 @@ PREV_TERM_STATE=""
 while [[ ${TERM_ELAPSED} -le ${TERM_TIMEOUT} ]]; do
     PODVM_STATE="$(instance_state "${NEW_PODVM_ID}")"
     if [[ "${PODVM_STATE}" != "${PREV_TERM_STATE}" ]]; then
-        echo -e "  ${CYAN}↳ pod VM ${NEW_PODVM_ID} state: ${PREV_TERM_STATE:-${PODVM_STATE}} -> ${PODVM_STATE}${NC}"
+        log_detail "${ICON_ARROW} pod VM ${NEW_PODVM_ID} state: ${PREV_TERM_STATE:-<new>} -> ${PODVM_STATE}"
         PREV_TERM_STATE="${PODVM_STATE}"
     fi
     if [[ "${PODVM_STATE}" == "shutting-down" || "${PODVM_STATE}" == "terminated" ]]; then
         break
     fi
-    echo "  [${TERM_ELAPSED}s] pod VM ${NEW_PODVM_ID}: ${PODVM_STATE}"
+    log_progress "[${TERM_ELAPSED}s] pod VM ${NEW_PODVM_ID}: ${PODVM_STATE}"
     sleep "${TERM_POLL}"
     TERM_ELAPSED=$((TERM_ELAPSED + TERM_POLL))
 done
 
 if [[ "${PODVM_STATE}" != "shutting-down" && "${PODVM_STATE}" != "terminated" ]]; then
-    echo -e "${YELLOW}--- leaked pod VM diagnostics ---${NC}"
+    log_info "--- leaked pod VM diagnostics ---"
     aws ec2 describe-instances --region "${AWS_REGION}" --instance-ids "${NEW_PODVM_ID}" \
         --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,type:InstanceType,launched:LaunchTime}' \
-        --output table 2>&1 | sed 's/^/  /' || true
-    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        --output table 2>&1 | indent || true
+    log_info "--- end diagnostics ---"
     step_fail "pod VM ${NEW_PODVM_ID} is still '${PODVM_STATE}' ${TERM_TIMEOUT}s after pod deletion — possible leaked instance (cost/quota); the cleanup trap will terminate it, but CAA should reap it automatically"
 fi
-echo -e "${GREEN}✓${NC} Pod VM ${NEW_PODVM_ID} is ${PODVM_STATE} after pod deletion — no leaked instances"
+log_ok "Pod VM ${NEW_PODVM_ID} is ${PODVM_STATE} after pod deletion — no leaked instances"
 # Already terminating/terminated, so the cleanup safety net has nothing to do.
 NEW_PODVM_ID=""
 

@@ -99,17 +99,17 @@ if ! aws iam get-role --role-name "${CAA_ROLE_NAME}" >/dev/null 2>&1; then
   cluster-aware re-run AFTER ./02-snp-node-group.sh. Re-run ./01-iam.sh (org-admin) before this step."
 fi
 
-echo "Installing Cloud API Adaptor (chart ${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) into ${CAA_NAMESPACE}..."
-echo "  pod-VM AMI:        ${PODVM_AMI_ID}"
-echo "  pod-VM type:       ${PODVM_INSTANCE_TYPE}"
-echo "  region:            ${AWS_REGION}"
-echo "  pod-VM subnet:     ${CAA_PODVM_SUBNET_ID}"
-echo "  node SG:           ${NODE_SG_ID}"
-echo "  vxlan/forwarder:   ${CAA_VXLAN_PORT} / ${CAA_FORWARDER_PORT}"
-echo "  peer-pod capacity: ${CAA_PEERPODS_LIMIT_PER_NODE} VMs per worker"
-echo "  webhook:           ${CAA_ENABLE_WEBHOOK} (cert-manager required when true)"
-echo "  CAA image:         ${CAA_IMAGE_NAME}:${CAA_IMAGE_TAG:-<chart default>}"
-echo "  IRSA role:         ${CAA_ROLE_ARN:-<none — using node role>}"
+log_info "Installing Cloud API Adaptor (chart ${CAA_CHART_REF} @ ${CAA_CHART_VERSION}) into ${CAA_NAMESPACE}..."
+log_kv "pod-VM AMI" "${PODVM_AMI_ID}"
+log_kv "pod-VM type" "${PODVM_INSTANCE_TYPE}"
+log_kv "region" "${AWS_REGION}"
+log_kv "pod-VM subnet" "${CAA_PODVM_SUBNET_ID}"
+log_kv "node SG" "${NODE_SG_ID}"
+log_kv "vxlan/forwarder" "${CAA_VXLAN_PORT} / ${CAA_FORWARDER_PORT}"
+log_kv "peer-pod capacity" "${CAA_PEERPODS_LIMIT_PER_NODE} VMs per worker"
+log_kv "webhook" "${CAA_ENABLE_WEBHOOK} (cert-manager required when true)"
+log_kv "CAA image" "${CAA_IMAGE_NAME}:${CAA_IMAGE_TAG:-<chart default>}"
+log_kv "IRSA role" "${CAA_ROLE_ARN:-<none — using node role>}"
 
 kubectl create namespace "${CAA_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -118,7 +118,7 @@ kubectl create namespace "${CAA_NAMESPACE}" --dry-run=client -o yaml | kubectl a
 # failing midway through a half-applied release.
 if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]]; then
     if kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} cert-manager present (peer-pods webhook prerequisite)"
+        log_ok "cert-manager present (peer-pods webhook prerequisite)"
     elif [[ "${CAA_AUTO_INSTALL_CERT_MANAGER:-true}" == "true" ]]; then
         ensure_cert_manager
     else
@@ -145,10 +145,10 @@ fi
 # workers must carry that label or it stays at 0 desired (and the readiness
 # check below never passes). Label them before installing.
 if [[ -n "${CAA_WORKER_NODE_SELECTOR}" ]]; then
-    echo "Labeling nodes (-l ${CAA_WORKER_NODE_SELECTOR}) with node.kubernetes.io/worker=..."
+    log_info "Labeling nodes (-l ${CAA_WORKER_NODE_SELECTOR}) with node.kubernetes.io/worker=..."
     kubectl label nodes -l "${CAA_WORKER_NODE_SELECTOR}" node.kubernetes.io/worker="" --overwrite >/dev/null
 else
-    echo "Labeling all nodes with node.kubernetes.io/worker= (CAA daemonset placement)..."
+    log_info "Labeling all nodes with node.kubernetes.io/worker= (CAA daemonset placement)..."
     kubectl label nodes --all node.kubernetes.io/worker="" --overwrite >/dev/null
 fi
 
@@ -175,6 +175,15 @@ CAA_SET_ARGS=(
     --set-string "providerConfigs.aws.VXLAN_PORT=${CAA_VXLAN_PORT}"
     --set-string "providerConfigs.aws.FORWARDER_PORT=${CAA_FORWARDER_PORT}"
     --set "webhook.enabled=${CAA_ENABLE_WEBHOOK}"
+    # The CAA DaemonSet runs hostNetwork with a startup probe on host :8000. The
+    # chart default rollout (maxSurge=1, maxUnavailable=0) starts the new pod on
+    # the SAME node before the old one frees the port, so the surge pod hits
+    # 'listen tcp :8000: bind: address already in use' and its one-time
+    # kata.peerpods.io/vm advertisement can be lost — leaving nodes Unschedulable
+    # ('Insufficient kata.peerpods.io/vm'). Replace in place instead (one node at
+    # a time, no surge) so every restart cleanly re-advertises.
+    --set "daemonset.updateStrategy.maxSurge=0"
+    --set "daemonset.updateStrategy.maxUnavailable=1"
 )
 
 # Wire the IRSA role onto the CAA service account AT INSTALL TIME via the chart
@@ -204,10 +213,10 @@ if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
         | jq '[.items[] | select(.spec.runtimeClassName=="kata-remote" and .status.phase=="Running")] | length' 2>/dev/null || echo 0)
     if [[ "${KR_RUNNING:-0}" -eq 0 ]]; then
         kubectl delete runtimeclass kata-remote --ignore-not-found >/dev/null 2>&1 || true
-        echo -e "${GREEN}✓${NC} Reset kata-remote RuntimeClass field ownership before upgrade (no running kata-remote pods)"
+        log_ok "Reset kata-remote RuntimeClass field ownership before upgrade (no running kata-remote pods)"
     else
-        echo -e "${YELLOW}⚠${NC} ${KR_RUNNING} kata-remote pod(s) Running — leaving the RuntimeClass in place."
-        echo "  If helm upgrade hits an overhead field-manager conflict, drain those pods and re-run."
+        log_warn "${KR_RUNNING} kata-remote pod(s) Running — leaving the RuntimeClass in place."
+        log_detail "If helm upgrade hits an overhead field-manager conflict, drain those pods and re-run."
     fi
 fi
 
@@ -223,7 +232,7 @@ fi
 # (helm recreates it in this same upgrade).
 if kubectl get configmap peer-pods-cm -n "${CAA_NAMESPACE}" >/dev/null 2>&1; then
     kubectl delete configmap peer-pods-cm -n "${CAA_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
-    echo -e "${GREEN}✓${NC} Reset peer-pods-cm field ownership before upgrade (deleted; helm recreates it from chart values)"
+    log_ok "Reset peer-pods-cm field ownership before upgrade (deleted; helm recreates it from chart values)"
 fi
 
 # NOTE: no `--wait` here on purpose — helm --wait would block the full timeout
@@ -238,32 +247,62 @@ if ! helm upgrade --install "${CAA_RELEASE}" "${CAA_CHART_REF}" \
   a manual kubectl patch owns that field. Clear the stale manager and re-run:
     kubectl patch <kind> <name> -n ${CAA_NAMESPACE} --type=json -p='[{\"op\":\"remove\",\"path\":\"/metadata/managedFields\"}]'"
 fi
-echo -e "${GREEN}✓${NC} Cloud API Adaptor Helm release ${CAA_RELEASE} applied"
+log_ok "Cloud API Adaptor Helm release ${CAA_RELEASE} applied"
 if [[ -n "${CAA_ROLE_ARN}" ]]; then
-    echo -e "${GREEN}✓${NC} CAA service account wired to IRSA role ${CAA_ROLE_ARN} (keyless; no static AWS keys)"
+    log_ok "CAA service account wired to IRSA role ${CAA_ROLE_ARN} (keyless; no static AWS keys)"
 fi
 echo ""
 
 # Verify: CAA daemonset Ready on the workers — fails fast on CrashLoopBackOff
 # (e.g. missing AWS creds / IRSA not injected) instead of waiting the full timeout.
-if ! wait_daemonset_ready "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}"; then
+# When only one healthy node is needed (CAA_HYPERVISOR_SOCKET_REQUIRE=one), accept
+# >=1 Ready instead of blocking on the full fleet: a CAA pod can be Running and
+# serving the hypervisor socket while its :8000 readiness probe is still failing,
+# and the socket check below validates a genuinely working node anyway.
+CAA_MIN_READY=0
+[[ "${CAA_HYPERVISOR_SOCKET_REQUIRE:-all}" == "one" ]] && CAA_MIN_READY=1
+if ! wait_daemonset_ready "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}" 10 3 "${CAA_MIN_READY}"; then
     step_fail "CAA daemonset ${CAA_DAEMONSET} did not become Ready (diagnostics above).
   If the logs show '\$AWS_ACCESS_KEY_ID is NOT set', the CAA image lacks the IRSA-aware
   entrypoint — set CAA_IMAGE_TAG to an image that has it (config.env).
   If they show 'At least one of these must be SET: AWS_SECRET_ACCESS_KEY AWS_ROLE_ARN',
   the IRSA env was not injected — check the SA annotation + the cluster's IAM OIDC provider."
 fi
-if ! wait_peerpods_node_capacity "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}"; then
-    step_fail "CAA daemonset is Ready but workers do not advertise kata.peerpods.io/vm.
+if ! ensure_peerpods_node_capacity "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" "${CAA_INSTALL_TIMEOUT}"; then
+    step_fail "CAA daemonset is Ready but workers do not advertise kata.peerpods.io/vm
+  even after a rollout restart$([[ "${CAA_SELF_ADVERTISE_VM_CAPACITY:-true}" == "true" ]] && echo " and a direct nodes/status patch").
   Mutated kata-remote pods will stay Pending with 'Insufficient kata.peerpods.io/vm'.
-  Check that peer-pods-cm has PEERPODS_LIMIT_PER_NODE=${CAA_PEERPODS_LIMIT_PER_NODE}
-  and that the cloud-api-adaptor service account can patch nodes/status."
+  CAA advertises this extended resource only once at pod startup; see the diagnostics
+  above. Check peer-pods-cm PEERPODS_LIMIT_PER_NODE=${CAA_PEERPODS_LIMIT_PER_NODE}, that the
+  cloud-api-adaptor SA can patch nodes/status, and the CAA log for the
+  '[util/k8sops] Successfully set extended resource' line."
+fi
+
+# Verify: every CAA node actually created the remote-hypervisor socket the
+# kata-remote shim dials (/run/peerpod/hypervisor.sock). This is SEPARATE from
+# readiness and from advertising kata.peerpods.io/vm: an adaptor can be Ready and
+# advertise capacity yet never have bound the socket (it logs "server started"
+# but came up half-initialized after a surging hostNetwork rollout). When that
+# happens, every kata-remote pod that lands on the node fails sandbox creation
+# instantly with 'hypervisor.sock: no such file or directory' and is stuck
+# ContainerCreating. Clean-restart (delete pod; maxSurge=0 => no collision) any
+# node missing it. Set CAA_REQUIRE_HYPERVISOR_SOCKET=false to skip.
+if [[ "${CAA_REQUIRE_HYPERVISOR_SOCKET:-true}" == "true" ]]; then
+    if ! ensure_caa_hypervisor_socket "${CAA_NAMESPACE}" "${CAA_DAEMONSET}"; then
+        step_fail "one or more CAA pods never created /run/peerpod/hypervisor.sock, so the kata-remote
+  shim on those nodes cannot reach the hypervisor and every kata-remote pod there fails sandbox
+  creation ('dial unix /run/peerpod/hypervisor.sock: connect: no such file or directory', stuck
+  ContainerCreating). They were clean-restarted but still did not bind it (diagnostics above).
+  Inspect the CAA log on a failing node:
+    kubectl -n ${CAA_NAMESPACE} logs <pod> | grep -iE 'hypervisor|socket|listen|bind|server started'
+  (or set CAA_REQUIRE_HYPERVISOR_SOCKET=false to skip this guard)."
+    fi
 fi
 
 # Verify: the kata-remote RuntimeClass exists.
 kubectl get runtimeclass kata-remote >/dev/null 2>&1 \
     || step_fail "RuntimeClass kata-remote does not exist after the CAA install"
-echo -e "${GREEN}✓${NC} RuntimeClass kata-remote exists"
+log_ok "RuntimeClass kata-remote exists"
 
 # Zero the kata-remote RuntimeClass pod overhead.
 #
@@ -280,14 +319,14 @@ CURRENT_OVERHEAD="$(kubectl get runtimeclass kata-remote -o jsonpath='{.overhead
 if [[ -n "${CURRENT_OVERHEAD}" && "${CURRENT_OVERHEAD}" != '{"cpu":"0","memory":"0"}' && "${CURRENT_OVERHEAD}" != "map[cpu:0 memory:0]" ]]; then
     if kubectl patch runtimeclass kata-remote --type=merge \
         -p '{"overhead":{"podFixed":{"cpu":"0","memory":"0"}}}' >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Zeroed kata-remote RuntimeClass overhead (was ${CURRENT_OVERHEAD}; peer-pods schedules via kata.peerpods.io/vm)"
+        log_ok "Zeroed kata-remote RuntimeClass overhead (was ${CURRENT_OVERHEAD}; peer-pods schedules via kata.peerpods.io/vm)"
     else
-        echo -e "${YELLOW}⚠${NC} Could not patch the kata-remote RuntimeClass overhead (${CURRENT_OVERHEAD})."
-        echo "  kata-remote pods may go Unschedulable 'Insufficient cpu' on a busy pool; add node CPU or"
-        echo "  patch it manually: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
+        log_warn "Could not patch the kata-remote RuntimeClass overhead (${CURRENT_OVERHEAD})."
+        log_detail "kata-remote pods may go Unschedulable 'Insufficient cpu' on a busy pool; add node CPU or"
+        log_detail "patch it manually: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
     fi
 else
-    echo -e "${GREEN}✓${NC} kata-remote RuntimeClass overhead already zero (scheduling via kata.peerpods.io/vm)"
+    log_ok "kata-remote RuntimeClass overhead already zero (scheduling via kata.peerpods.io/vm)"
 fi
 
 # Verify: when enabled, the peer-pods mutating webhook is actually registered.
@@ -308,12 +347,12 @@ if [[ "${CAA_ENABLE_WEBHOOK}" == "true" ]]; then
     WEBHOOK_RC=0
     WEBHOOK_DIAG=$(peerpods_webhook_effective) || WEBHOOK_RC=$?
     if [[ ${WEBHOOK_RC} -eq 0 ]]; then
-        echo -e "${GREEN}✓${NC} Peer-pods mutating webhook effective (kata-remote pods get kata.peerpods.io/vm; cpu/memory stripped)"
-        printf '%s\n' "${WEBHOOK_DIAG}" | sed 's/^/  /'
+        log_ok "Peer-pods mutating webhook effective (kata-remote pods get kata.peerpods.io/vm; cpu/memory stripped)"
+        printf '%s\n' "${WEBHOOK_DIAG}" | indent
     else
-        echo -e "${YELLOW}--- peer-pods webhook diagnostics ---${NC}"
-        printf '%s\n' "${WEBHOOK_DIAG}" | sed 's/^/  /'
-        echo -e "${YELLOW}--- end diagnostics ---${NC}"
+        log_section "peer-pods webhook diagnostics"
+        printf '%s\n' "${WEBHOOK_DIAG}" | indent
+        log_detail "--- end diagnostics ---"
         if [[ ${WEBHOOK_RC} -eq 2 ]]; then
             step_fail "CAA_ENABLE_WEBHOOK=true but no peer-pods MutatingWebhookConfiguration appeared after the install — kata-remote pods would keep their cpu/memory and go Unschedulable. Check the CAA release / cert-manager, or set CAA_ENABLE_WEBHOOK=false to opt out."
         else
@@ -334,7 +373,7 @@ fi
 # covers nodes added by later scale-ups).
 #------------------------------------------------------------------------------
 echo ""
-echo "Ensuring the kata-remote host prerequisite (fuse/mount.fuse) on workers..."
+log_info "Ensuring the kata-remote host prerequisite (fuse/mount.fuse) on workers..."
 FUSE_DS_MANIFEST="${DEPLOY_DIR}/k8s/coco-node-fuse-installer.yaml"
 [[ -f "${FUSE_DS_MANIFEST}" ]] || step_fail "missing fuse installer manifest: ${FUSE_DS_MANIFEST}"
 sed "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" "${FUSE_DS_MANIFEST}" | kubectl apply -f - >/dev/null
@@ -342,7 +381,7 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-fuse-installer" "${CAA
     step_fail "the fuse installer daemonset did not become Ready — workers still lack mount.fuse, which kata-remote needs.
   Inspect: kubectl -n ${CAA_NAMESPACE} logs ds/kata-remote-fuse-installer"
 fi
-echo -e "${GREEN}✓${NC} Worker fuse prerequisite ensured (mount.fuse present for nydus-overlayfs)"
+log_ok "Worker fuse prerequisite ensured (mount.fuse present for nydus-overlayfs)"
 
 #------------------------------------------------------------------------------
 # Worker host prerequisite: containerd guest-pull (nydus) snapshotter flags.
@@ -357,7 +396,7 @@ echo -e "${GREEN}✓${NC} Worker fuse prerequisite ensured (mount.fuse present f
 # containerd drop-in and restarts containerd only when it changed (idempotent).
 #------------------------------------------------------------------------------
 echo ""
-echo "Ensuring the kata-remote host prerequisite (containerd guest-pull flags) on workers..."
+log_info "Ensuring the kata-remote host prerequisite (containerd guest-pull flags) on workers..."
 GUESTPULL_DS_MANIFEST="${DEPLOY_DIR}/k8s/coco-node-containerd-guestpull.yaml"
 [[ -f "${GUESTPULL_DS_MANIFEST}" ]] || step_fail "missing guest-pull installer manifest: ${GUESTPULL_DS_MANIFEST}"
 sed "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" "${GUESTPULL_DS_MANIFEST}" | kubectl apply -f - >/dev/null
@@ -365,6 +404,6 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" 
     step_fail "the containerd guest-pull daemonset did not become Ready — kata-remote workload containers will be unpacked on the host and fail with 'content digest not found' (CreateContainerError).
   Inspect: kubectl -n ${CAA_NAMESPACE} logs ds/kata-remote-containerd-guestpull"
 fi
-echo -e "${GREEN}✓${NC} Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
+log_ok "Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
 
 step_ok "04 (./04-trustee-kbs.sh)"

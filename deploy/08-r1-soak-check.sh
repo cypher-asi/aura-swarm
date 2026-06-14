@@ -63,9 +63,9 @@ record() { # record <name> <PASS|FAIL|SKIP> <note>
     CHECK_RESULTS+=("$2")
     CHECK_NOTES+=("${3:-}")
     case "$2" in
-        PASS) echo -e "${GREEN}✓ $1${NC} ${3:-}" ;;
-        SKIP) echo -e "${YELLOW}⚠ $1 skipped${NC} ${3:-}" ;;
-        *)    echo -e "${RED}✗ $1${NC} ${3:-}" ;;
+        PASS) log_ok "$1 ${3:-}" ;;
+        SKIP) log_warn "$1 skipped ${3:-}" ;;
+        *)    log_err "$1 ${3:-}" ;;
     esac
 }
 
@@ -102,12 +102,12 @@ wait_test_agent_running() {
 # platform-health
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}[1/8] platform-health${NC}"
+log_section "[1/8] platform-health"
 HEALTH_OK=true
 for d in aura-swarm-gateway aura-swarm-control aura-swarm-scheduler; do
     READY=$(kubectl get deployment "${d}" -n "${K8S_NAMESPACE_SYSTEM}" \
         -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-    [[ "${READY:-0}" -ge 1 ]] || { HEALTH_OK=false; echo "  ${d}: not ready"; }
+    [[ "${READY:-0}" -ge 1 ]] || { HEALTH_OK=false; log_detail "${d}: not ready"; }
 done
 if gw_start_port_forward && [[ "$(gw_internal_get /internal/health | jq -r '.status')" == "ok" ]]; then
     :
@@ -124,8 +124,7 @@ fi
 # fleet-read-only (no mutations: records + pod runtime classes)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[2/8] fleet-read-only${NC}"
+log_section "[2/8] fleet-read-only"
 ALL_AGENTS=$(gw_internal_get "/internal/agents/all" 2>/dev/null || echo "[]")
 PODS_JSON=$(mktemp)
 snapshot_agent_pods "${PODS_JSON}"
@@ -134,8 +133,9 @@ TIERED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier != null)] | length'
 LEGACY=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier == null)] | length')
 ERRORED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.status == "error")] | length')
 BAD_PODS=$(jq '[.[] | select(.runtime_class != "kata-remote" and .runtime_class != "kata-fc")] | length' "${PODS_JSON}")
-echo "  Agents: ${TIERED} tiered (TEE), ${LEGACY} legacy, ${ERRORED} in error"
-jq -r 'group_by(.runtime_class) | .[] | "  pods on \(.[0].runtime_class): \(length)"' "${PODS_JSON}"
+log_detail "Agents: ${TIERED} tiered (TEE), ${LEGACY} legacy, ${ERRORED} in error"
+jq -r 'group_by(.runtime_class) | .[] | "pods on \(.[0].runtime_class): \(length)"' "${PODS_JSON}" \
+    | while IFS= read -r line; do log_detail "${line}"; done
 rm -f "${PODS_JSON}"
 if [[ "${ERRORED}" == "0" && "${BAD_PODS}" == "0" ]]; then
     record "fleet-read-only" PASS "${TIERED} tiered / ${LEGACY} legacy"
@@ -147,8 +147,7 @@ fi
 # test-agent (create on SNP, sealed)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[3/8] test-agent${NC}"
+log_section "[3/8] test-agent"
 if [[ -z "${TEST_AGENT_ID}" ]]; then
     CREATE_RESP=$(gw_user_api POST "/v1/agents" '{"name": "r1-soak-check", "tier": "standard"}' || echo "")
     TEST_AGENT_ID=$(echo "${CREATE_RESP}" | jq -r '.agent_id // .id // empty' 2>/dev/null || echo "")
@@ -174,8 +173,7 @@ fi
 # vault (secrets round-trip on the test agent only)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[4/8] vault${NC}"
+log_section "[4/8] vault"
 if [[ -n "${TEST_AGENT_ID}" ]]; then
     VAULT_OK=true
     SECRET_VAL="soak-$(date +%s)"
@@ -201,8 +199,7 @@ fi
 # tier-change (standard -> pro -> standard, pod recreate each way)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[5/8] tier-change${NC}"
+log_section "[5/8] tier-change"
 if [[ -n "${TEST_AGENT_ID}" ]]; then
     TIER_OK=true
     gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/tier" '{"tier": "pro"}' >/dev/null 2>&1 || TIER_OK=false
@@ -233,8 +230,7 @@ fi
 # and fire the trigger (cron "* * * * *").
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[6/8] cron-cycle${NC}"
+log_section "[6/8] cron-cycle"
 if [[ -n "${TEST_AGENT_ID}" ]] && [[ -n "$(test_agent_pod)" ]]; then
     CRON_OK=true
     POD=$(test_agent_pod)
@@ -295,8 +291,7 @@ fi
 # usage-api
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[7/8] usage-api${NC}"
+log_section "[7/8] usage-api"
 if [[ -n "${TEST_AGENT_ID}" ]]; then
     AGENT_USAGE=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/usage" 2>/dev/null || echo "")
     USER_USAGE=$(gw_user_api GET "/v1/usage" 2>/dev/null || echo "")
@@ -314,8 +309,7 @@ fi
 # logs-api
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}[8/8] logs-api${NC}"
+log_section "[8/8] logs-api"
 if [[ -n "${TEST_AGENT_ID}" ]]; then
     LOGS=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/logs?tail=50" 2>/dev/null || echo "")
     LOG_COUNT=$(echo "${LOGS}" | jq '[.. | objects | select(has("source") or has("line") or has("message"))] | length' 2>/dev/null || echo "0")
@@ -332,10 +326,7 @@ fi
 # Checklist + verdict
 #------------------------------------------------------------------------------
 
-echo ""
-echo "=============================================="
-echo "  R1 Soak Checklist"
-echo "=============================================="
+log_section "R1 Soak Checklist"
 FAILS=0
 for i in "${!CHECK_NAMES[@]}"; do
     case "${CHECK_RESULTS[$i]}" in
@@ -347,8 +338,8 @@ done
 echo ""
 
 if [[ "${KEEP_AGENT}" == "true" && -n "${TEST_AGENT_ID}" ]]; then
-    echo "Test agent kept for the soak window: ${TEST_AGENT_ID}"
-    echo "Re-run with: ./08-r1-soak-check.sh --agent-id ${TEST_AGENT_ID}"
+    log_info "Test agent kept for the soak window: ${TEST_AGENT_ID}"
+    log_detail "Re-run with: ./08-r1-soak-check.sh --agent-id ${TEST_AGENT_ID}"
     echo ""
 fi
 

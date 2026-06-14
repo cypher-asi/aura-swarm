@@ -14,7 +14,7 @@ step_banner "00" "Preflight (read-only)" "ops-admin"
 
 FAILURES=0
 fail_check() {
-    echo -e "${RED}✗${NC} $*"
+    log_err "$*"
     FAILURES=$((FAILURES + 1))
 }
 
@@ -22,103 +22,98 @@ fail_check() {
 # Required tools
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Tools${NC}"
+log_section "Tools"
 for cmd in aws terraform kubectl helm docker jq curl git openssl base64 sha256sum; do
     if command -v "${cmd}" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} ${cmd}"
+        log_ok "${cmd}"
     else
         fail_check "${cmd} is not installed"
     fi
 done
 if command -v shellcheck >/dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC} shellcheck (optional)"
+    log_ok "shellcheck (optional)"
 fi
-echo ""
 
 #------------------------------------------------------------------------------
 # AWS auth + region
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}AWS${NC}"
+log_section "AWS"
 if AWS_CALLER_ARN=$(aws sts get-caller-identity --output text --query Arn 2>&1); then
     AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     export AWS_CALLER_ARN AWS_ACCOUNT_ID
-    echo -e "${GREEN}✓${NC} Identity: ${AWS_CALLER_ARN}"
-    echo "  Account: ${AWS_ACCOUNT_ID}  Region: ${AWS_REGION}"
+    log_ok "Identity: ${AWS_CALLER_ARN}"
+    log_kv "Account" "${AWS_ACCOUNT_ID}"
+    log_kv "Region" "${AWS_REGION}"
 else
     fail_check "AWS authentication failed: ${AWS_CALLER_ARN}"
 fi
 
 if aws ec2 describe-availability-zones --region "${AWS_REGION}" >/dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC} Region ${AWS_REGION} accessible"
+    log_ok "Region ${AWS_REGION} accessible"
 else
     fail_check "region ${AWS_REGION} is not valid or not accessible"
 fi
-echo ""
 
 #------------------------------------------------------------------------------
 # Docker (needed for image builds in steps 06/07/10/12; warn only)
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Docker${NC}"
+log_section "Docker"
 DOCKER_INFO_TIMEOUT=15
 if docker_daemon_ok "${DOCKER_INFO_TIMEOUT}"; then
-    echo -e "${GREEN}✓${NC} Docker daemon is running"
+    log_ok "Docker daemon is running"
 else
-    echo -e "${YELLOW}⚠${NC} Docker daemon not running (or not responding within ${DOCKER_INFO_TIMEOUT}s) — required before steps 06/07/10/12 (image builds)"
+    log_warn "Docker daemon not running (or not responding within ${DOCKER_INFO_TIMEOUT}s) — required before steps 06/07/10/12 (image builds)"
 fi
-echo ""
 
 #------------------------------------------------------------------------------
 # Cluster reachability
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Cluster${NC}"
+log_section "Cluster"
 if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC} kubectl authenticated to ${EKS_CLUSTER_NAME}"
-    echo "  Nodes:"
+    log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME}"
+    log_detail "Nodes:"
     kubectl get nodes -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[-1].type,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type,CONFIDENTIAL:.metadata.labels.swarm\.io/confidential-node' --no-headers \
-        | sed 's/^/    /'
+        | indent
 else
     fail_check "kubectl cannot reach ${EKS_CLUSTER_NAME} (try: aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME})"
 fi
-echo ""
 
 #------------------------------------------------------------------------------
 # Fleet / state report (agent counts by runtime class, schema version)
 #------------------------------------------------------------------------------
 
 print_fleet_report
-echo ""
 
 #------------------------------------------------------------------------------
 # zbilling reachability (from the operator machine; the cluster path is
 # verified implicitly by billing events once deployed)
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}zbilling${NC}"
+log_section "zbilling"
 Z_BILLING_URL="${Z_BILLING_URL:-https://z-billing.onrender.com}"
 ZB_CODE=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
     "${Z_BILLING_URL}/health" 2>/dev/null || echo "000")
 if [[ "${ZB_CODE}" == "200" ]]; then
-    echo -e "${GREEN}✓${NC} ${Z_BILLING_URL}/health: 200 OK"
+    log_ok "${Z_BILLING_URL}/health: 200 OK"
 elif [[ "${ZB_CODE}" == "000" ]]; then
     fail_check "zbilling unreachable at ${Z_BILLING_URL}"
 else
-    echo -e "${YELLOW}⚠${NC} ${Z_BILLING_URL}/health returned HTTP ${ZB_CODE}"
+    log_warn "${Z_BILLING_URL}/health returned HTTP ${ZB_CODE}"
 fi
-echo ""
 
 #------------------------------------------------------------------------------
 # Secrets folder
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Secrets${NC}"
+log_section "Secrets"
 for secret in INTERNAL_TOKEN; do
     if [[ -n "$(load_secret "${secret}")" ]]; then
-        echo -e "${GREEN}✓${NC} .secrets/${secret} present"
+        log_ok ".secrets/${secret} present"
     else
-        echo -e "${YELLOW}⚠${NC} .secrets/${secret} missing (generated by step 04)"
+        log_warn ".secrets/${secret} missing (generated by step 04)"
     fi
 done
 
@@ -126,8 +121,7 @@ done
 # Confidential runtime config (read-only consistency check)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Confidential runtime${NC}"
+log_section "Confidential runtime"
 validate_confidential_runtime_config || true
 
 #------------------------------------------------------------------------------

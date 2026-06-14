@@ -35,10 +35,10 @@ ensure_kubectl_context
 
 confirm_or_abort() {
     echo ""
-    echo -e "${YELLOW}PAUSE POINT: $1${NC}"
+    log_warn "PAUSE POINT: $1"
     read -r -p "Type 'yes' to continue: " answer
     if [[ "${answer}" != "yes" ]]; then
-        echo "Aborted at pause point. This script is safe to re-run; completed phases are skipped."
+        log_info "Aborted at pause point. This script is safe to re-run; completed phases are skipped."
         exit 1
     fi
 }
@@ -51,7 +51,7 @@ RSYNC_POD_NS="${K8S_NAMESPACE_SYSTEM}"
 # Phase A: detect filesystems
 #------------------------------------------------------------------------------
 
-echo -e "${CYAN}Phase A: detect filesystems${NC}"
+log_section "Phase A: detect filesystems"
 
 OLD_FS_ID=$(tf_output efs_filesystem_id)
 [[ -n "${OLD_FS_ID}" ]] || step_fail "could not read the current EFS filesystem ID from terraform output"
@@ -61,9 +61,9 @@ OLD_ENCRYPTED=$(echo "${OLD_FS_JSON}" | jq -r '.Encrypted')
 OLD_PERF=$(echo "${OLD_FS_JSON}" | jq -r '.PerformanceMode')
 OLD_THROUGHPUT=$(echo "${OLD_FS_JSON}" | jq -r '.ThroughputMode')
 
-echo "  Current filesystem: ${OLD_FS_ID} (encrypted=${OLD_ENCRYPTED})"
+log_detail "Current filesystem: ${OLD_FS_ID} (encrypted=${OLD_ENCRYPTED})"
 if [[ "${OLD_ENCRYPTED}" == "true" ]]; then
-    echo -e "${GREEN}✓${NC} The live filesystem is already encrypted — no migration needed."
+    log_ok "The live filesystem is already encrypted — no migration needed."
     step_ok "02 (re-run ./02-snp-node-group.sh)"
     exit 0
 fi
@@ -76,13 +76,12 @@ OLD_DNS="${OLD_FS_ID}.efs.${AWS_REGION}.amazonaws.com"
 # Phase B: create the new encrypted filesystem + mount targets (idempotent)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Phase B: create encrypted filesystem${NC}"
+log_section "Phase B: create encrypted filesystem"
 
 NEW_FS_ID=$(aws efs describe-file-systems \
     --query "FileSystems[?CreationToken=='${NEW_FS_TOKEN}'].FileSystemId | [0]" --output text)
 if [[ -z "${NEW_FS_ID}" || "${NEW_FS_ID}" == "None" ]]; then
-    echo "  Creating encrypted filesystem (token ${NEW_FS_TOKEN})..."
+    log_info "Creating encrypted filesystem (token ${NEW_FS_TOKEN})..."
     NEW_FS_ID=$(aws efs create-file-system \
         --creation-token "${NEW_FS_TOKEN}" \
         --encrypted \
@@ -91,17 +90,17 @@ if [[ -z "${NEW_FS_ID}" || "${NEW_FS_ID}" == "None" ]]; then
         --tags "Key=Name,Value=${RESOURCE_PREFIX}-efs" "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
         --query 'FileSystemId' --output text)
 else
-    echo "  Reusing existing migration filesystem ${NEW_FS_ID}"
+    log_info "Reusing existing migration filesystem ${NEW_FS_ID}"
 fi
 
-echo "  Waiting for ${NEW_FS_ID} to become available..."
+log_info "Waiting for ${NEW_FS_ID} to become available..."
 while [[ "$(aws efs describe-file-systems --file-system-id "${NEW_FS_ID}" --query 'FileSystems[0].LifeCycleState' --output text)" != "available" ]]; do
     sleep 5
 done
-echo -e "${GREEN}✓${NC} New encrypted filesystem: ${NEW_FS_ID}"
+log_ok "New encrypted filesystem: ${NEW_FS_ID}"
 
 # Mirror the old filesystem's mount targets (subnet + security groups).
-echo "  Ensuring mount targets..."
+log_info "Ensuring mount targets..."
 NEW_MT_IDS=()
 declare -A NEW_MT_BY_SUBNET=()
 while IFS=$'\t' read -r subnet_id mt_id; do
@@ -114,29 +113,28 @@ while IFS=$'\t' read -r subnet_id mt_id; do
         existing=$(aws efs create-mount-target --file-system-id "${NEW_FS_ID}" \
             --subnet-id "${subnet_id}" --security-groups ${sgs} \
             --query 'MountTargetId' --output text)
-        echo "    Created mount target ${existing} in ${subnet_id}"
+        log_detail "Created mount target ${existing} in ${subnet_id}"
     else
-        echo "    Mount target already exists in ${subnet_id}: ${existing}"
+        log_detail "Mount target already exists in ${subnet_id}: ${existing}"
     fi
     NEW_MT_IDS+=("${existing}")
     NEW_MT_BY_SUBNET["${subnet_id}"]="${existing}"
 done < <(echo "${OLD_MTS}" | jq -r '.[] | [.SubnetId, .MountTargetId] | @tsv')
 
-echo "  Waiting for mount targets to become available..."
+log_info "Waiting for mount targets to become available..."
 for mt in "${NEW_MT_IDS[@]}"; do
     while [[ "$(aws efs describe-mount-targets --mount-target-id "${mt}" --query 'MountTargets[0].LifeCycleState' --output text)" != "available" ]]; do
         sleep 5
     done
 done
 NEW_DNS="${NEW_FS_ID}.efs.${AWS_REGION}.amazonaws.com"
-echo -e "${GREEN}✓${NC} Mount targets available (${NEW_DNS})"
+log_ok "Mount targets available (${NEW_DNS})"
 
 #------------------------------------------------------------------------------
 # Phase C: initial sync (workloads still running; rsync is restartable)
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Phase C: initial data sync${NC}"
+log_section "Phase C: initial data sync"
 
 ensure_rsync_pod() {
     if kubectl get pod "${RSYNC_POD}" -n "${RSYNC_POD_NS}" >/dev/null 2>&1; then
@@ -177,9 +175,9 @@ run_rsync() {
 }
 
 ensure_rsync_pod
-echo "  Running initial rsync (incremental; safe to interrupt and re-run)..."
+log_info "Running initial rsync (incremental; safe to interrupt and re-run)..."
 run_rsync
-echo -e "${GREEN}✓${NC} Initial sync complete"
+log_ok "Initial sync complete"
 
 #------------------------------------------------------------------------------
 # Phase D: quiesce writers
@@ -187,20 +185,19 @@ echo -e "${GREEN}✓${NC} Initial sync complete"
 
 confirm_or_abort "about to QUIESCE the platform: scale gateway/control/scheduler to 0 and delete all agent pods. Agents will be unavailable until the next deploy step."
 
-echo -e "${CYAN}Phase D: quiesce writers${NC}"
+log_section "Phase D: quiesce writers"
 for d in aura-swarm-scheduler aura-swarm-gateway aura-swarm-control; do
     kubectl scale "deployment/${d}" -n "${K8S_NAMESPACE_SYSTEM}" --replicas=0 2>/dev/null || true
 done
 kubectl delete pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent --ignore-not-found --wait=true
 kubectl scale deployment/kbs -n "${K8S_NAMESPACE_SYSTEM}" --replicas=0 2>/dev/null || true
-echo -e "${GREEN}✓${NC} Writers quiesced"
+log_ok "Writers quiesced"
 
 #------------------------------------------------------------------------------
 # Phase E: final sync + verification
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Phase E: final sync + verification${NC}"
+log_section "Phase E: final sync + verification"
 run_rsync "--delete"
 
 OLD_COUNT=$(kubectl exec -n "${RSYNC_POD_NS}" "${RSYNC_POD}" -- sh -c "find /old -type f | wc -l" | tr -d '[:space:]')
@@ -208,12 +205,12 @@ NEW_COUNT=$(kubectl exec -n "${RSYNC_POD_NS}" "${RSYNC_POD}" -- sh -c "find /new
 OLD_BYTES=$(kubectl exec -n "${RSYNC_POD_NS}" "${RSYNC_POD}" -- sh -c "du -sb /old | cut -f1" | tr -d '[:space:]')
 NEW_BYTES=$(kubectl exec -n "${RSYNC_POD_NS}" "${RSYNC_POD}" -- sh -c "du -sb /new | cut -f1" | tr -d '[:space:]')
 
-echo "  old: ${OLD_COUNT} files, ${OLD_BYTES} bytes"
-echo "  new: ${NEW_COUNT} files, ${NEW_BYTES} bytes"
+log_detail "old: ${OLD_COUNT} files, ${OLD_BYTES} bytes"
+log_detail "new: ${NEW_COUNT} files, ${NEW_BYTES} bytes"
 if [[ "${OLD_COUNT}" != "${NEW_COUNT}" ]]; then
     step_fail "file count mismatch after final sync (old=${OLD_COUNT} new=${NEW_COUNT})"
 fi
-echo -e "${GREEN}✓${NC} Data verified on the encrypted filesystem"
+log_ok "Data verified on the encrypted filesystem"
 
 confirm_or_abort "data verified. Next: recreate access points + PVs/PVCs against ${NEW_FS_ID} and repoint terraform state."
 
@@ -226,8 +223,7 @@ confirm_or_abort "data verified. Next: recreate access points + PVs/PVCs against
 # static PV pointing at the same directory.
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Phase F: rebind EFS-backed PVCs${NC}"
+log_section "Phase F: rebind EFS-backed PVCs"
 
 PV_LIST=$(kubectl get pv -o json | jq -c '
     [.items[]
@@ -249,7 +245,7 @@ echo "${PV_LIST}" | jq -c '.[]' | while IFS= read -r pv_row; do
 
     old_ap="${handle##*::}"
     if [[ "${old_ap}" == "${handle}" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} ${pv}: no access point in volumeHandle; skipping (verify manually)"
+        log_warn "${pv}: no access point in volumeHandle; skipping (verify manually)"
         continue
     fi
 
@@ -266,10 +262,10 @@ echo "${PV_LIST}" | jq -c '.[]' | while IFS= read -r pv_row; do
             --root-directory "Path=${root_path}" \
             --tags "Key=Name,Value=migrated-${old_ap}" \
             --query 'AccessPointId' --output text)
-        echo "  Created access point ${new_ap} for ${root_path}"
+        log_detail "Created access point ${new_ap} for ${root_path}"
     fi
 
-    echo "  Rebinding ${claim_ns}/${claim_name} to ${NEW_FS_ID}::${new_ap}..."
+    log_info "Rebinding ${claim_ns}/${claim_name} to ${NEW_FS_ID}::${new_ap}..."
     kubectl patch pv "${pv}" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null
     kubectl delete pvc "${claim_name}" -n "${claim_ns}" --ignore-not-found --wait=true
     kubectl delete pv "${pv}" --ignore-not-found --wait=true
@@ -304,14 +300,13 @@ spec:
       storage: ${capacity}
 EOF
 done
-echo -e "${GREEN}✓${NC} EFS-backed PVCs rebound to the encrypted filesystem"
+log_ok "EFS-backed PVCs rebound to the encrypted filesystem"
 
 #------------------------------------------------------------------------------
 # Phase G: repoint terraform state
 #------------------------------------------------------------------------------
 
-echo ""
-echo -e "${CYAN}Phase G: repoint terraform state${NC}"
+log_section "Phase G: repoint terraform state"
 
 cd "${SCRIPT_DIR}/terraform"
 
@@ -343,7 +338,7 @@ while IFS= read -r subnet_id; do
     [[ -z "${subnet_id}" ]] && continue
     mt="${NEW_MT_BY_SUBNET[${subnet_id}]:-}"
     if [[ -z "${mt}" ]]; then
-        echo -e "  ${YELLOW}⚠${NC} No new mount target for subnet ${subnet_id} (state index ${idx}); terraform will create it on the ./02 re-run"
+        log_warn "No new mount target for subnet ${subnet_id} (state index ${idx}); terraform will create it on the ./02 re-run"
         idx=$((idx + 1))
         continue
     fi
@@ -351,15 +346,15 @@ while IFS= read -r subnet_id; do
     idx=$((idx + 1))
 done < <(terraform output -json 2>/dev/null | jq -r '.storage_subnet_ids.value[]?')
 
-echo "  Verifying the plan no longer REPLACES the filesystem..."
+log_info "Verifying the plan no longer REPLACES the filesystem..."
 terraform plan -out=efs-migration-check.tfplan >/dev/null
 if plan_replaces_efs "efs-migration-check.tfplan"; then
     step_fail "terraform STILL plans an EFS replacement after the import — inspect 'terraform plan' manually"
 fi
-echo -e "${GREEN}✓${NC} Terraform state repointed; the filesystem is no longer replaced."
-echo "  Note: the next 'terraform plan' will still CREATE the /state access point and"
-echo "  the backup policy on the new filesystem (deliberately left out of state here)."
-echo "  That is expected and is applied when you re-run ./02-snp-node-group.sh."
+log_ok "Terraform state repointed; the filesystem is no longer replaced."
+log_detail "Note: the next 'terraform plan' will still CREATE the /state access point and"
+log_detail "the backup policy on the new filesystem (deliberately left out of state here)."
+log_detail "That is expected and is applied when you re-run ./02-snp-node-group.sh."
 
 #------------------------------------------------------------------------------
 # Cleanup + handoff
@@ -368,12 +363,12 @@ echo "  That is expected and is applied when you re-run ./02-snp-node-group.sh."
 kubectl delete pod "${RSYNC_POD}" -n "${RSYNC_POD_NS}" --ignore-not-found >/dev/null
 
 echo ""
-echo "Old (unencrypted) filesystem ${OLD_FS_ID} was kept as a fallback."
-echo "Delete it manually once the migration has soaked:"
-echo "    aws efs delete-file-system --file-system-id ${OLD_FS_ID}   # after deleting its mount targets"
+log_info "Old (unencrypted) filesystem ${OLD_FS_ID} was kept as a fallback."
+log_info "Delete it manually once the migration has soaked:"
+log_cmd "aws efs delete-file-system --file-system-id ${OLD_FS_ID}   # after deleting its mount targets"
 echo ""
-echo "Platform deployments are still scaled to 0. The next deploy step"
-echo "(./07-deploy-r1.sh) re-applies manifests and scales everything back up;"
-echo "to restore service sooner: kubectl scale deployment/aura-swarm-{gateway,control,scheduler} -n ${K8S_NAMESPACE_SYSTEM} --replicas=1"
+log_info "Platform deployments are still scaled to 0. The next deploy step"
+log_detail "(./07-deploy-r1.sh) re-applies manifests and scales everything back up;"
+log_detail "to restore service sooner: kubectl scale deployment/aura-swarm-{gateway,control,scheduler} -n ${K8S_NAMESPACE_SYSTEM} --replicas=1"
 
 step_ok "02 (re-run ./02-snp-node-group.sh — the plan should now be clean)"

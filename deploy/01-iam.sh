@@ -33,48 +33,43 @@ step_banner "01" "All deploy IAM (permission sets, cluster/node roles, IRSA)" "o
 require_cmds aws jq openssl
 require_aws_auth
 
-echo -e "${CYAN}org-admin policy / permission set${NC}  ${ORG_IAM_POLICY} → ${ORG_SSO_PERMISSION_SET}"
-echo -e "${CYAN}ops-admin policy / permission set${NC}  ${OPS_IAM_POLICY} → ${OPS_SSO_PERMISSION_SET}"
-echo ""
+log_kv "org-admin policy → permission set" "${ORG_IAM_POLICY} → ${ORG_SSO_PERMISSION_SET}"
+log_kv "ops-admin policy → permission set" "${OPS_IAM_POLICY} → ${OPS_SSO_PERMISSION_SET}"
 
 #------------------------------------------------------------------------------
 # 1. Customer-managed policies + permission-set attachments (both users).
 #------------------------------------------------------------------------------
-echo -e "${CYAN}== Permission sets ==${NC}"
+log_section "Permission sets"
 ensure_iam_policy "${ORG_IAM_POLICY}" "${DEPLOY_DIR}/iam/org-admin-policy.json"
 ensure_iam_policy "${OPS_IAM_POLICY}" "${DEPLOY_DIR}/iam/ops-admin-policy.json"
 echo ""
 ensure_policy_on_permission_set "${ORG_IAM_POLICY}" "${ORG_SSO_PERMISSION_SET}"
 echo ""
 ensure_policy_on_permission_set "${OPS_IAM_POLICY}" "${OPS_SSO_PERMISSION_SET}"
-echo ""
 
 #------------------------------------------------------------------------------
 # 2. EKS cluster + node service roles (pre-cluster; terraform reads/passes them).
 #------------------------------------------------------------------------------
-echo -e "${CYAN}== Cluster service roles ==${NC}"
+log_section "Cluster service roles"
 ensure_cluster_service_roles
-echo ""
 
 #------------------------------------------------------------------------------
 # 3. IRSA OIDC provider + CAA role (cluster-aware; deferred pre-cluster).
 #------------------------------------------------------------------------------
-echo -e "${CYAN}== IRSA OIDC provider + CAA role ==${NC}"
+log_section "IRSA OIDC provider + CAA role"
 CAA_DEFERRED=0
 ensure_oidc_provider_and_caa_role || CAA_DEFERRED=$?
-echo ""
 
 #------------------------------------------------------------------------------
 # Best-effort verification of the ops-admin permission set's terraform polling.
 #------------------------------------------------------------------------------
-echo -e "${CYAN}== Verify ==${NC}"
+log_section "Verify"
 verify_sso_role_action "${OPS_IAM_SSO_ROLE_PREFIX}" eks:DescribeUpdate eks:ListUpdates
-echo ""
 
 if [[ "${CAA_DEFERRED}" -eq 2 ]]; then
-    echo -e "${YELLOW}ℹ${NC} CAA IRSA role deferred — the cluster does not exist yet."
+    log_info "CAA IRSA role deferred — the cluster does not exist yet."
     step_ok "02 (ops-admin: ./02-snp-node-group.sh), then RE-RUN ./01-iam.sh (org-admin) to provision the CAA role"
 else
-    echo -e "${GREEN}✓${NC} CAA IRSA role provisioned — ops-admin can proceed to the CAA install."
+    log_ok "CAA IRSA role provisioned — ops-admin can proceed to the CAA install."
     step_ok "03 (ops-admin: ./03-coco-operator.sh)"
 fi

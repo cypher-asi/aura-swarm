@@ -17,6 +17,9 @@ deploy/.last-harness-image.env
 # Cached owner login session for steps 07/08 (zOS JWT — NEVER commit)
 deploy/.smoke-session.jwt
 
+# Deploy run logs (per-run tee'd output)
+deploy/.logs/
+
 # IDE
 .idea/
 .vscode/
