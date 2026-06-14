@@ -18,12 +18,24 @@
 #   content digest sha256:...: not found
 # -> the kata-remote pod is stuck CreateContainerError.
 #
-# This privileged DaemonSet idempotently ensures both flags are false in a
-# containerd drop-in (correct table for the detected config version), restarts
+# This privileged DaemonSet idempotently ensures both flags are false, restarts
 # containerd ONLY when it changed, and is a no-op once correct. As a DaemonSet it
 # also covers nodes added by future scale-ups. It targets the same workers as the
 # CAA daemonset (node.kubernetes.io/worker=""). Applied by ./03-coco-operator.sh
 # (namespace templated as __CAA_NAMESPACE__).
+#
+# IMPORTANT — how the flags are applied depends on the containerd config version:
+#   * v3 (containerd 2.x): the flags live under the SPLIT images plugin
+#     (io.containerd.cri.v1.images), a different plugin from the runtimes, so a
+#     standalone import drop-in is safe.
+#   * v2 (containerd 1.7.x, the pinned AMI): the flags AND the kata runtimes share
+#     [plugins."io.containerd.grpc.v1.cri".containerd]. containerd OVERRIDE-merges
+#     a plugin's entire subtree across `imports` (it does NOT deep-merge), so a
+#     drop-in that re-declares that table silently WIPES runtimes.kata-remote and
+#     every kata-remote pod then fails with "no runtime for kata-remote is
+#     configured". So on v2 we edit the two flags IN PLACE in the main config that
+#     kata-deploy manages (and remove any legacy clobbering drop-in), keeping the
+#     runtimes intact. A guard verifies kata-remote survives in the merged config.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -81,59 +93,118 @@ spec:
               # Source of truth for the *effective* (merged) config + version.
               DUMP="$(host containerd config dump 2>/dev/null || true)"
 
-              # Are both flags already effective? Then nothing to do.
-              if printf '%s' "$DUMP" | grep -qE 'disable_snapshot_annotations[[:space:]]*=[[:space:]]*false' \
-                 && printf '%s' "$DUMP" | grep -qE 'discard_unpacked_layers[[:space:]]*=[[:space:]]*false'; then
-                echo "containerd guest-pull flags already effective (disable_snapshot_annotations=false, discard_unpacked_layers=false) - nothing to do"
-                touch /tmp/guestpull-ready
-                exec sleep infinity
-              fi
-
-              # Pick the right CRI table for the containerd config version. The
-              # split images plugin (io.containerd.cri.v1.images) only exists on
-              # containerd 2.x / config v3; older builds use the v2 grpc cri table.
+              # Detect the containerd config version. On v3 (containerd 2.x) the
+              # guest-pull flags live under the SPLIT images plugin, a different
+              # plugin from the runtimes — so an import drop-in there is safe. On
+              # v2 (containerd 1.7.x, what we pin) the flags AND the kata runtimes
+              # share [plugins."io.containerd.grpc.v1.cri".containerd], and
+              # containerd OVERRIDE-merges a plugin's whole subtree across imports
+              # (it does NOT deep-merge), so a drop-in re-declaring that table
+              # silently WIPES runtimes.kata-remote from the effective config
+              # ("no runtime for kata-remote is configured"). Edit the flags in
+              # place in that case instead of via a clobbering import.
               if printf '%s' "$DUMP" | grep -q 'io.containerd.cri.v1.images'; then
+                # ---- containerd 2.x / config v3: images plugin is separate ----
                 VERSION=3
                 TABLE="[plugins.'io.containerd.cri.v1.images']"
+                echo "containerd config version detected: ${VERSION}; writing drop-in under ${TABLE}"
+                host mkdir -p "$DROPIN_DIR"
+                printf 'version = %s\n%s\n  disable_snapshot_annotations = false\n  discard_unpacked_layers = false\n' \
+                  "$VERSION" "$TABLE" | host tee "$DROPIN" >/dev/null
+                echo "wrote ${DROPIN}:"
+                host cat "$DROPIN" | sed 's/^/  /'
+                if ! host grep -qF "$DROPIN" "$CONF"; then
+                  host cp -n "$CONF" "${CONF}.coco-guestpull.bak" || true
+                  if host grep -qE '^[[:space:]]*imports[[:space:]]*=[[:space:]]*\[' "$CONF"; then
+                    host sed -i "s#^\([[:space:]]*imports[[:space:]]*=[[:space:]]*\[\)#\1\n  \"${DROPIN}\",#" "$CONF"
+                  else
+                    host sed -i "1i imports = [\"${DROPIN}\"]" "$CONF"
+                  fi
+                  echo "added ${DROPIN} to imports in ${CONF}"
+                fi
+                CHANGED=1
               else
+                # ---- containerd 1.7.x / config v2: flags share the runtime plugin ----
                 VERSION=2
                 TABLE='[plugins."io.containerd.grpc.v1.cri".containerd]'
-              fi
-              echo "containerd config version detected: ${VERSION}; writing drop-in under ${TABLE}"
-
-              # Write the drop-in (containerd merges imports, so a separate file
-              # with just these keys is safe even though the table also appears
-              # in the base config).
-              host mkdir -p "$DROPIN_DIR"
-              printf 'version = %s\n%s\n  disable_snapshot_annotations = false\n  discard_unpacked_layers = false\n' \
-                "$VERSION" "$TABLE" | host tee "$DROPIN" >/dev/null
-              echo "wrote ${DROPIN}:"
-              host cat "$DROPIN" | sed 's/^/  /'
-
-              # Ensure the main config imports our drop-in (back it up first).
-              if ! host grep -qF "$DROPIN" "$CONF"; then
-                host cp -n "$CONF" "${CONF}.coco-guestpull.bak" || true
-                if host grep -qE '^[[:space:]]*imports[[:space:]]*=[[:space:]]*\[' "$CONF"; then
-                  host sed -i "s#^\([[:space:]]*imports[[:space:]]*=[[:space:]]*\[\)#\1\n  \"${DROPIN}\",#" "$CONF"
-                else
-                  host sed -i "1i imports = [\"${DROPIN}\"]" "$CONF"
+                echo "containerd config version detected: ${VERSION}; setting flags in place under ${TABLE}"
+                CHANGED=0
+                ORIG="$(host cat "$CONF")"
+                WORK="$ORIG"
+                # Undo any legacy clobbering import: drop the line referencing our
+                # drop-in and delete the file, so the runtimes the import wiped
+                # come back. grep -v drops the import-array element line (or the
+                # whole single-entry imports line).
+                if printf '%s' "$WORK" | grep -qF "$DROPIN"; then
+                  echo "removing legacy guest-pull import (it clobbered the kata-remote runtime)"
+                  WORK="$(printf '%s\n' "$WORK" | grep -vF "$DROPIN" || true)"
                 fi
-                echo "added ${DROPIN} to imports in ${CONF}"
+                host rm -f "$DROPIN" 2>/dev/null || true
+                # Set both flags to false WITHIN the existing CRI containerd table
+                # (leaving the runtimes.* sub-tables, incl. kata-remote, untouched):
+                # replace the keys if present, else append them to that table.
+                WORK="$(printf '%s\n' "$WORK" | awk -v hdr="$TABLE" '
+                  function emit_missing(){ if(!dsa)print "disable_snapshot_annotations = false"; if(!dul)print "discard_unpacked_layers = false" }
+                  BEGIN{in_t=0;dsa=0;dul=0;seen=0}
+                  {
+                    t=$0; sub(/^[ \t]+/,"",t); sub(/[ \t]+$/,"",t)
+                    if (t ~ /^\[/){
+                      if(in_t){emit_missing();in_t=0}
+                      if(t==hdr){in_t=1;seen=1;dsa=0;dul=0}
+                      print; next
+                    }
+                    if(in_t){
+                      k=$0; sub(/^[ \t]+/,"",k)
+                      if(k ~ /^disable_snapshot_annotations[ \t]*=/){print "disable_snapshot_annotations = false";dsa=1;next}
+                      if(k ~ /^discard_unpacked_layers[ \t]*=/){print "discard_unpacked_layers = false";dul=1;next}
+                    }
+                    print
+                  }
+                  END{
+                    if(in_t){emit_missing()}
+                    else if(!seen){print hdr; print "disable_snapshot_annotations = false"; print "discard_unpacked_layers = false"}
+                  }
+                ')"
+                if [ "$WORK" != "$ORIG" ]; then
+                  host cp -n "$CONF" "${CONF}.coco-guestpull.bak" 2>/dev/null || true
+                  printf '%s\n' "$WORK" | host tee "$CONF" >/dev/null
+                  echo "updated ${CONF} (guest-pull flags set in place; kata runtimes preserved)"
+                  CHANGED=1
+                fi
               fi
 
-              echo "restarting containerd to apply guest-pull flags..."
-              host systemctl restart containerd
-              sleep 5
+              if [ "${CHANGED:-0}" -eq 1 ]; then
+                echo "restarting containerd to apply guest-pull config..."
+                host systemctl restart containerd
+                sleep 5
+              else
+                echo "containerd guest-pull config already correct - no restart needed"
+              fi
 
               # Verify the merged config now has both flags false.
               VERIFY="$(host containerd config dump 2>/dev/null || true)"
-              if printf '%s' "$VERIFY" | grep -qE 'disable_snapshot_annotations[[:space:]]*=[[:space:]]*false' \
-                 && printf '%s' "$VERIFY" | grep -qE 'discard_unpacked_layers[[:space:]]*=[[:space:]]*false'; then
-                echo "containerd guest-pull flags now effective"
-              else
+              if ! { printf '%s' "$VERIFY" | grep -qE 'disable_snapshot_annotations[[:space:]]*=[[:space:]]*false' \
+                 && printf '%s' "$VERIFY" | grep -qE 'discard_unpacked_layers[[:space:]]*=[[:space:]]*false'; }; then
                 echo "ERROR: guest-pull flags still not effective after restart; dumping cri image config:"
                 printf '%s' "$VERIFY" | grep -E 'disable_snapshot_annotations|discard_unpacked_layers|cri.v1.images|grpc.v1.cri' | sed 's/^/  /' || true
                 exit 1
+              fi
+              echo "containerd guest-pull flags now effective"
+
+              # Regression guard for the import-clobber bug: if kata-deploy has
+              # defined the kata-remote runtime in the main config, it MUST also
+              # survive in the EFFECTIVE (merged) config. If it does not, an import
+              # is overriding the CRI plugin subtree again — fail loudly instead of
+              # letting step 05 hit "no runtime for kata-remote is configured".
+              if host grep -q 'kata-remote' "$CONF"; then
+                if ! printf '%s' "$VERIFY" | grep -q 'kata-remote'; then
+                  echo "ERROR: kata-remote runtime is in ${CONF} but MISSING from the effective"
+                  echo "       containerd config — a config import is clobbering the CRI plugin subtree."
+                  exit 1
+                fi
+                echo "verified: kata-remote runtime present in the effective containerd config"
+              else
+                echo "note: kata-remote runtime not in ${CONF} yet (kata-deploy may not have run on this node)"
               fi
 
               # Stay Ready; the readiness probe re-checks the marker.
