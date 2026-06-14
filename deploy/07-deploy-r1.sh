@@ -8,7 +8,7 @@
 # test agent lands on kata-remote with a sealed env and a billing sku.
 #
 # Usage:
-#   ./07-deploy-r1.sh                 # deploys SWARM_R1_REF (default fa93895)
+#   ./07-deploy-r1.sh                 # deploys SWARM_R1_REF (default master)
 #   ./07-deploy-r1.sh --ref <git-ref>
 #   ./07-deploy-r1.sh --skip-test-agent
 #   ./07-deploy-r1.sh --relogin       # force a fresh zOS login (ignore cache)

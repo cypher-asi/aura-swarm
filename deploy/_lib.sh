@@ -149,11 +149,18 @@ SMOKE_AGENT_TIER="${SMOKE_AGENT_TIER:-standard}"
 CAA_NAMESPACE="${CAA_NAMESPACE:-confidential-containers-system}"
 CAA_DAEMONSET="${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}"
 
-# Staged rollout refs (overridable from the environment / CLI):
-#   R1 (dual-mode)  default fa93895
-#   R2 (migration)  default af9e034
+# Staged rollout refs (overridable from the environment / CLI).
+# R1 defaults to `master` (current code): the old fa93895 pin predates the
+# Peer Pods refactor (commit 1d9dbcf, "make Peer Pods the sole confidential
+# runtime") and still emits the swarm.io/confidential-node nodeSelector +
+# toleration, so on a Peer Pods cluster (no labeled metal pool) every
+# confidential agent is Unschedulable. Deploying master gets the selector
+# removal while still leaving legacy kata-fc agents untouched (re-tiering them
+# is the explicit R2 migration in ./10-deploy-r2-migrate.sh, not automatic).
+#   R1 (dual-mode: new agents kata-remote, legacy untouched)  default master
+#   R2 (migration)  default af9e034  (pre-Peer-Pods; revisit before R2)
 #   R3 (cleanup)    default master
-R1_DEFAULT_REF="fa93895"
+R1_DEFAULT_REF="master"
 R2_DEFAULT_REF="af9e034"
 R3_DEFAULT_REF="master"
 
@@ -1040,11 +1047,28 @@ find_owner_agent_by_name() {
             | sort_by(.created_at) | last | .agent_id // empty' 2>/dev/null
 }
 
-# Echo the running pod name for an agent id (empty if none).
+# Echo the pod name for an agent id (empty if none). The pod's
+# `swarm.io/agent-id` label is the NO-HYPHEN hex form of the UUID
+# (AgentId::to_hex = hex::encode(uuid bytes)), while the user API returns the
+# hyphenated UUID — so strip hyphens before matching or it never finds the pod.
 agent_pod_name() {
+    local hex="${1//-/}"
     kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" \
-        -l "app=swarm-agent,swarm.io/agent-id=$1" \
+        -l "app=swarm-agent,swarm.io/agent-id=${hex}" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+}
+
+# Echo the most recent event on a pod as "Reason: message" (single line,
+# truncated for a progress line), or empty. Surfaces FailedScheduling /
+# FailedCreatePodSandBox / Pulling / etc. so the wait loop shows live cause.
+pod_latest_event() {
+    local pod="$1" line
+    line=$(kubectl get events -n "${K8S_NAMESPACE_AGENTS}" \
+        --field-selector "involvedObject.name=${pod}" \
+        --sort-by=.lastTimestamp \
+        -o jsonpath='{range .items[*]}{.reason}: {.message}{"\n"}{end}' 2>/dev/null \
+        | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -1)
+    printf '%s' "${line:0:160}"
 }
 
 # Echo an agent's status string from the user API (e.g. running/provisioning/error).
@@ -1058,20 +1082,31 @@ agent_status() {
 # burning the whole timeout. Returns 0 Running, 1 timeout, 2 agent errored.
 # Args: agent_id [timeout=600] [poll=15]
 wait_agent_running() {
-    local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase status
+    local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase status detail waiting ev
     while [[ ${elapsed} -le ${timeout} ]]; do
         pod="$(agent_pod_name "${agent_id}")"
+        phase=""
+        detail=""
         if [[ -n "${pod}" ]]; then
             phase=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
                 -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            [[ "${phase}" == "Running" ]] && return 0
+            if [[ "${phase}" == "Running" ]]; then
+                log_ok "Agent ${agent_id} pod ${pod} reached Running (after ${elapsed}s)"
+                return 0
+            fi
+            # Live cause: the container's waiting reason + the pod's latest event
+            # (FailedScheduling / FailedCreatePodSandBox / Pulling / ...).
+            waiting=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
+                -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+            ev="$(pod_latest_event "${pod}")"
+            detail="${waiting:+ ${waiting}}${ev:+ — ${ev}}"
         fi
         status="$(agent_status "${agent_id}")"
         if [[ "${status}" == "error" ]]; then
             log_warn "Agent ${agent_id} entered error state after ${elapsed}s"
             return 2
         fi
-        log_progress "[${elapsed}s] waiting for agent ${agent_id} pod (pod=${pod:-none} phase=${phase:-none} status=${status:-?})"
+        log_progress "[${elapsed}s] agent ${agent_id} status=${status:-?} pod=${pod:-none} phase=${phase:-none}${detail}"
         sleep "${poll}"
         elapsed=$((elapsed + poll))
     done
@@ -1130,7 +1165,20 @@ ensure_owner_test_agent() {
     local id rc
     id="$(find_owner_agent_by_name "${SMOKE_AGENT_NAME}")"
     if [[ -n "${id}" ]]; then
-        log_ok "Reusing designated owner agent '${SMOKE_AGENT_NAME}' (${id})"
+        local st
+        st="$(agent_status "${id}")"
+        if [[ "${st}" == "error" ]]; then
+            # An errored agent has been dropped from the scheduler's active set,
+            # so it never gets a new pod on its own. Restart it to move it back
+            # to provisioning and re-trigger scheduling (no need to delete +
+            # recreate, which would churn its id/DEK).
+            log_warn "Designated agent '${SMOKE_AGENT_NAME}' (${id}) is in error — restarting to re-trigger scheduling"
+            gw_user_api POST "/v1/agents/${id}/restart" >/dev/null 2>&1 \
+                || log_warn "restart request failed; will wait and diagnose"
+            sleep 5
+        else
+            log_ok "Reusing designated owner agent '${SMOKE_AGENT_NAME}' (${id}, status=${st:-?})"
+        fi
     else
         log_info "Creating designated owner agent '${SMOKE_AGENT_NAME}' (tier ${SMOKE_AGENT_TIER})..."
         local resp
@@ -1828,12 +1876,30 @@ _caa_running_pod_count() {
 # churns the daemonset. Genuinely stuck pods (e.g. left bare by an earlier
 # surging rollout) never bind it within the grace and are then clean-restarted;
 # their fresh replacements bind it in the next round.
+# Echo seconds since a pod's main container entered Running (0 if not Running
+# or unknown). Used to tell a still-starting CAA pod from a genuinely stuck one.
+_pod_running_secs() {
+    local ns="$1" pod="$2" started s now
+    started=$(kubectl -n "${ns}" get pod "${pod}" \
+        -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null || echo "")
+    [[ -z "${started}" ]] && { echo 0; return; }
+    s=$(date -d "${started}" +%s 2>/dev/null || echo 0)
+    now=$(date +%s)
+    (( s > 0 )) && echo $(( now - s )) || echo 0
+}
+
 # Args: ns ds
 ensure_caa_hypervisor_socket() {
     local ns="$1" ds="$2"
     local sock="/run/peerpod/hypervisor.sock"
-    local grace="${CAA_HYPERVISOR_SOCKET_GRACE_SECS:-90}"
-    local rounds="${CAA_HYPERVISOR_SOCKET_RESTART_ROUNDS:-2}"
+    local grace="${CAA_HYPERVISOR_SOCKET_GRACE_SECS:-180}"
+    local rounds="${CAA_HYPERVISOR_SOCKET_RESTART_ROUNDS:-3}"
+    # A missing pod is only "stuck" (eligible for delete) once its container has
+    # been Running this long without binding the socket. Younger pods are still
+    # inside their start->bind window (~3 min: schedule + image pull + bind);
+    # deleting them resets that clock and churns the daemonset forever — that is
+    # the bug that made this never converge.
+    local stuck_secs="${CAA_HYPERVISOR_SOCKET_STUCK_SECS:-120}"
     # require=one => stop as soon as ONE node serves the socket (fast; enough to
     # run/pin a single kata-remote pod). require=all => every node must serve it.
     local require="${CAA_HYPERVISOR_SOCKET_REQUIRE:-all}"
@@ -1867,15 +1933,32 @@ ensure_caa_hypervisor_socket() {
         # miss), loop and keep waiting rather than restart blindly.
         [[ -z "${missing}" ]] && continue
         (( round == rounds )) && break
-        # In require=one mode, only restart if NOTHING serves it yet (one bad
-        # node does not matter when another is healthy — that early-returns above).
-        n=$(printf '%s\n' "${missing}" | grep -c .)
-        log_warn "${n} pod(s) still missing ${sock} after ${grace}s; clean-restarting them (delete, no surge):"
+        # Only restart pods that are genuinely STUCK: Running >= stuck_secs but
+        # still no socket. A pod that just went Running is still binding — leave
+        # it (deleting it resets its start->bind clock). If every missing pod is
+        # still young, delete NOTHING and re-check next round.
+        local stuck="" young=0 age
+        while IFS= read -r pod; do
+            [[ -z "${pod}" ]] && continue
+            age=$(_pod_running_secs "${ns}" "${pod}")
+            if (( age >= stuck_secs )); then
+                stuck+="${pod}"$'\n'
+            else
+                young=$((young + 1))
+            fi
+        done <<< "${missing}"
+        stuck="$(printf '%s' "${stuck}" | sed '/^[[:space:]]*$/d')"
+        if [[ -z "${stuck}" ]]; then
+            log_progress "${young} CAA pod(s) still starting (no socket yet, Running < ${stuck_secs}s) — waiting"
+            continue
+        fi
+        n=$(printf '%s\n' "${stuck}" | grep -c .)
+        log_warn "${n} CAA pod(s) stuck without ${sock} (Running >= ${stuck_secs}s); clean-restarting (delete, no surge):"
         while IFS= read -r pod; do
             [[ -z "${pod}" ]] && continue
             log_detail "deleting ${pod}"
             kubectl -n "${ns}" delete pod "${pod}" --wait=false >/dev/null 2>&1 || true
-        done <<< "${missing}"
+        done <<< "${stuck}"
         sleep "${poll}"
     done
     log_err "no ${ds} pod serves ${sock} (require=${require}); still missing:"
