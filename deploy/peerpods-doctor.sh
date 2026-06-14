@@ -306,21 +306,29 @@ for node in "${NODES[@]}"; do
         record "${short}/nydus-daemon" SKIP "guest-pull pod not Ready or no nydus snapshotter configured"
     fi
 
-    # host-image-cache: the harness workload image must NOT be cached on the
-    # worker (it should be guest-pulled inside the pod VM). A host-cached copy is
-    # what makes containerd reuse an incomplete host snapshot -> 'content digest
-    # not found' even after the snapshotter binds.
+    # host-image-content: the harness image, IF present on the host, must have
+    # COMPLETE content. An image pulled while discard_unpacked_layers was still
+    # true (EKS default, before the guest-pull DaemonSet flips it to false) has
+    # its compressed layers discarded after the host unpack; the nydus snapshotter
+    # then cannot unpack them and every kata-remote pod fails CreateContainer with
+    # "content digest ...: not found" -- while the kubelet reports the image
+    # "already present on machine" and never re-pulls. Mere PRESENCE is NOT a
+    # failure (the kubelet legitimately registers the image); only INCOMPLETE
+    # content is the bug. Flipping the flag cannot restore already-discarded
+    # layers, and containerd auto-refetch (PR #10703) is not in 1.7.x.
     if [[ "${CAN_EXEC}" != "true" ]]; then
-        record "${short}/host-image-cache" SKIP "guest-pull pod not Ready; cannot inspect host content store"
+        record "${short}/host-image-content" SKIP "guest-pull pod not Ready; cannot inspect host content store"
     elif [[ -z "${HARNESS_REF}" ]]; then
-        record "${short}/host-image-cache" SKIP "no pinned harness image resolved (AURA_HARNESS_IMAGE / .last-harness-image.env)"
+        record "${short}/host-image-content" SKIP "no pinned harness image resolved (AURA_HARNESS_IMAGE / .last-harness-image.env)"
     else
-        IMAGES="$(host_exec "${GP_POD}" ctr -n k8s.io -a /run/containerd/containerd.sock images ls -q || true)"
-        if printf '%s' "${IMAGES}" | grep -qF "${HARNESS_DIGEST}" \
-           || { [[ -n "${HARNESS_REPO}" ]] && printf '%s' "${IMAGES}" | grep -qF "${HARNESS_REPO}"; }; then
-            record "${short}/host-image-cache" FAIL "harness image is HOST-cached on ${short} (should guest-pull). Remove it so the next pod guest-pulls: nsenter -t 1 -- ctr -n k8s.io images rm \$(ctr -n k8s.io images ls -q | grep ${HARNESS_REPO:-harness})"
+        CHECK="$(host_exec "${GP_POD}" ctr -n k8s.io -a /run/containerd/containerd.sock images check || true)"
+        ROW="$(printf '%s\n' "${CHECK}" | grep -F "${HARNESS_REPO:-aura-swarm-dev-harness}" | head -1)"
+        if [[ -z "${ROW}" ]]; then
+            record "${short}/host-image-content" PASS "harness image not on host (kubelet pulls it complete when needed)"
+        elif printf '%s' "${ROW}" | grep -qi 'incomplete'; then
+            record "${short}/host-image-content" FAIL "harness image present but content INCOMPLETE on ${short} (discarded layers -> nydus unpack fails 'content digest not found'). Purge so the kubelet re-pulls it complete: ctr -n k8s.io images ls -q | grep ${HARNESS_REPO:-aura-swarm-dev-harness} | xargs -r ctr -n k8s.io images rm"
         else
-            record "${short}/host-image-cache" PASS "harness image not host-cached (guest-pull path clear)"
+            record "${short}/host-image-content" PASS "harness image content complete on host"
         fi
     fi
 done

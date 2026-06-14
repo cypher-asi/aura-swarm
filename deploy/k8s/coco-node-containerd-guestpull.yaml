@@ -265,6 +265,37 @@ spec:
                 echo "note: kata-remote runtime not in ${CONF} yet (kata-deploy may not have run on this node)"
               fi
 
+              # Self-heal images whose layers were discarded BEFORE we flipped the
+              # flag. An image pulled while discard_unpacked_layers was still true
+              # (the EKS default) had its compressed layers discarded after the
+              # host overlayfs unpack. The nydus guest-pull snapshotter cannot
+              # unpack from those missing layers, so every kata-remote pod using
+              # such an image fails CreateContainer with "content digest ...: not
+              # found" — and because the kubelet sees the image "already present"
+              # it NEVER re-pulls, so the node is stuck. Setting the flag false
+              # (above) cannot restore already-discarded layers, and containerd's
+              # auto-refetch (PR #10703) is not in 1.7.x. So evict any image whose
+              # content is now INCOMPLETE; the kubelet then re-pulls it COMPLETE on
+              # next use (layers kept now). One-time and safe: a re-pulled image
+              # stays complete, so this never loops, and removing an image record
+              # does not disrupt already-running containers (they keep their
+              # snapshots). Set COCO_GUESTPULL_HEAL_INCOMPLETE=0 to skip.
+              if [ "${COCO_GUESTPULL_HEAL_INCOMPLETE:-1}" = "1" ]; then
+                CTRK="ctr -n k8s.io -a /run/containerd/containerd.sock"
+                INCOMPLETE="$(host $CTRK images check 2>/dev/null | awk '/incomplete/{print $1}' || true)"
+                if [ -n "$INCOMPLETE" ]; then
+                  echo "evicting host images with discarded/incomplete content so the kubelet re-pulls them complete:"
+                  printf '%s\n' "$INCOMPLETE" | sed 's/^/  /'
+                  printf '%s\n' "$INCOMPLETE" | while IFS= read -r ref; do
+                    [ -n "$ref" ] || continue
+                    host $CTRK images rm "$ref" >/dev/null 2>&1 || true
+                  done
+                  echo "incomplete host images evicted"
+                else
+                  echo "no host images with incomplete content (no discarded-layer images to heal)"
+                fi
+              fi
+
               # Stay Ready; the readiness probe re-checks the marker.
               touch /tmp/guestpull-ready
               exec sleep infinity
