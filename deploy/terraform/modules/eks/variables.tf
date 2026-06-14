@@ -58,6 +58,31 @@ variable "node_disk_size" {
   default     = 100
 }
 
+# Pin the AL2023 EKS-optimized AMI to a release that still ships containerd 1.7.x.
+#
+# WHY: kata-remote (Peer Pods) guest image pull needs containerd to pass per-layer
+# snapshot annotations (cri.image-ref / cri.layer-digest / ...) to the nydus
+# "guest pull" snapshotter so the WORKLOAD image is pulled INSIDE the guest VM.
+# containerd 2.x on AL2023 (the default for EKS 1.31 AMIs from release v20251108
+# onward, e.g. containerd 2.2.1) does NOT attach those labels in the
+# CreateContainer unpack path, so nydus gets empty labels, falls back to
+# "dummy-image-reference", and the host then tries to unpack the image itself and
+# fails with `content digest ...: not found` (CreateContainerError). The upstream
+# fix is containerd PR #12835, which is not yet in any released 2.x AMI.
+#
+# v20251103 is the last EKS 1.31 AL2023 release on containerd 1.7.27 (k8s 1.31.13),
+# where guest pull works (cri_handler="cc" path). Empty string = use the latest
+# EKS-optimized AMI (do this only once an AMI ships a containerd with PR #12835).
+#
+# NOTE: this string is Kubernetes-version specific. If eks_version changes, update
+# this to the matching last-containerd-1.7.x release for that minor (see
+# awslabs/amazon-eks-ami issue #2470 for the per-version cutover dates).
+variable "node_ami_release_version" {
+  description = "EKS AL2023 node AMI release_version to pin (containerd 1.7.x for kata-remote guest pull); empty = latest"
+  type        = string
+  default     = "1.31.13-20251103"
+}
+
 variable "tags" {
   description = "Common tags for all resources"
   type        = map(string)

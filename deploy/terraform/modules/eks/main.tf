@@ -208,6 +208,11 @@ resource "aws_eks_node_group" "main" {
   instance_types = [var.node_instance_type]
   capacity_type  = "ON_DEMAND"
 
+  # Pin the AL2023 AMI to a containerd-1.7.x release so kata-remote guest image
+  # pull works (containerd 2.x breaks it — see var.node_ami_release_version).
+  # null => let EKS pick the latest AMI for ami_type/eks_version.
+  release_version = var.node_ami_release_version != "" ? var.node_ami_release_version : null
+
   disk_size = var.node_disk_size
 
   scaling_config {
