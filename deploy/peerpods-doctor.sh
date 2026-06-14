@@ -403,19 +403,25 @@ for node in "${NODES[@]}"; do
         record "${short}/incomplete-images" SKIP "guest-pull pod not Ready; cannot inspect host content store"
     else
         CHECK="$(host_exec "${GP_POD}" ctr -n k8s.io -a /run/containerd/containerd.sock images check || true)"
-        # Every image whose content is incomplete: a kata-remote pod using it (or
-        # the sandbox/pause image) fails CreateContainer with "content digest not
-        # found". Includes the harness image but also the pause image and any
-        # other workload pulled while discard_unpacked_layers was still true.
+        # An incomplete image only BREAKS a kata-remote pod, because only those
+        # are unpacked via the nydus snapshotter (which needs the layer content).
+        # System images (CNI/coredns/efs-csi/...) run on the default overlayfs
+        # snapshotter and are perfectly fine incomplete — they already have their
+        # snapshots and never read the discarded blob again. So FAIL only on
+        # incomplete WORKLOAD images (matched by the harness repo / resource
+        # prefix); report the rest as a harmless informational count.
+        WL_FILTER="${HARNESS_REPO:-${RESOURCE_PREFIX:-aura-swarm}}"
         INCOMPLETE_IMGS="$(printf '%s\n' "${CHECK}" | awk 'tolower($0) ~ /incomplete/{print $1}')"
         INCN="$(printf '%s' "${INCOMPLETE_IMGS}" | grep -c . || true)"
-        if [[ "${INCN:-0}" -eq 0 ]]; then
-            record "${short}/incomplete-images" PASS "no host images with incomplete (discarded-layer) content"
+        RELEVANT="$(printf '%s\n' "${INCOMPLETE_IMGS}" | grep -E "${WL_FILTER}" || true)"
+        RELN="$(printf '%s' "${RELEVANT}" | grep -c . || true)"
+        if [[ "${RELN:-0}" -gt 0 ]]; then
+            record "${short}/incomplete-images" FAIL "${RELN} kata-remote workload image(s) have INCOMPLETE content (discarded layers -> nydus unpack fails 'content digest not found'). Purge so the kubelet re-pulls them complete (flag is false now): ctr -n k8s.io images ls -q | grep ${WL_FILTER} | xargs -r ctr -n k8s.io images rm"
+            printf '%s\n' "${RELEVANT}" | head -10 | sed 's/^/    /'
+        elif [[ "${INCN:-0}" -gt 0 ]]; then
+            record "${short}/incomplete-images" PASS "no incomplete kata-remote workload images (${INCN} non-workload image(s) incomplete — harmless; they run on overlayfs, not nydus)"
         else
-            HARNESS_HIT=""
-            [[ -n "${HARNESS_REPO}" ]] && HARNESS_HIT="$(printf '%s\n' "${INCOMPLETE_IMGS}" | grep -F "${HARNESS_REPO}" | head -1 || true)"
-            record "${short}/incomplete-images" FAIL "${INCN} host image(s) have INCOMPLETE content (discarded layers -> 'content digest not found')${HARNESS_HIT:+ incl. the harness image}. Purge so the kubelet re-pulls them complete (flag is false now): for r in <refs>; do ctr -n k8s.io images rm \$r; done"
-            printf '%s\n' "${INCOMPLETE_IMGS}" | head -10 | sed 's/^/    /'
+            record "${short}/incomplete-images" PASS "no host images with incomplete content"
         fi
     fi
 
