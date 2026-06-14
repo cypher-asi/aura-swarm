@@ -138,6 +138,16 @@ SMOKE_TEST_TOKEN="${SMOKE_TEST_TOKEN:-}"
 AUTH_BASE_URL="${AUTH_BASE_URL:-https://zosapi.zero.tech}"
 # Cached owner session (gitignored). One zOS login is reused until it expires.
 SMOKE_SESSION_FILE="${SMOKE_SESSION_FILE:-${DEPLOY_DIR}/.smoke-session.jwt}"
+# Persistent designated owner test agent shared by steps 07/08: step 07 creates
+# and KEEPS it (confirmed Running), step 08 reuses it by name. Every tier is a
+# confidential SEV-SNP Peer Pod (kata-remote), so this is a real per-agent pod-VM
+# cost that lives for the soak window.
+SMOKE_AGENT_NAME="${SMOKE_AGENT_NAME:-r1-owner-soak}"
+SMOKE_AGENT_TIER="${SMOKE_AGENT_TIER:-standard}"
+# Peer Pods / CAA install targets (mirror deploy/03-coco-operator.sh defaults) so
+# the test-agent failure diagnostics can inspect Peer Pods health.
+CAA_NAMESPACE="${CAA_NAMESPACE:-confidential-containers-system}"
+CAA_DAEMONSET="${CAA_DAEMONSET:-cloud-api-adaptor-daemonset}"
 
 # Staged rollout refs (overridable from the environment / CLI):
 #   R1 (dual-mode)  default fa93895
@@ -1004,6 +1014,142 @@ ensure_smoke_test_token() {
         log_info "Cached owner session expired/invalid — logging in again."
     fi
     smoke_login
+}
+
+#------------------------------------------------------------------------------
+# Designated owner test agent (steps 07/08)
+#
+# Steps 07/08 verify that a brand-new confidential agent actually spawns. Rather
+# than each step creating and destroying a throwaway, step 07 creates a single
+# persistent agent (SMOKE_AGENT_NAME) and step 08 reuses it by name, so there is
+# a stable agent to observe across the soak window. Confirmation requires the pod
+# to reach Running; if it does not, diagnose_test_agent surfaces the root cause
+# (the scheduler escalates a stuck pod to Error after ~120s — see
+# crates/aura-swarm-scheduler/src/k8s.rs POD_STUCK_TIMEOUT).
+#------------------------------------------------------------------------------
+
+# Echo the owner's agent id whose name == $1 (newest if several), empty if none.
+# Uses the authenticated user API (SMOKE_TEST_TOKEN); requires an active
+# gateway port-forward.
+find_owner_agent_by_name() {
+    local name="$1"
+    gw_user_api GET "/v1/agents" 2>/dev/null \
+        | jq -r --arg n "${name}" '
+            (.agents // [])
+            | map(select(.name == $n))
+            | sort_by(.created_at) | last | .agent_id // empty' 2>/dev/null
+}
+
+# Echo the running pod name for an agent id (empty if none).
+agent_pod_name() {
+    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" \
+        -l "app=swarm-agent,swarm.io/agent-id=$1" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+}
+
+# Echo an agent's status string from the user API (e.g. running/provisioning/error).
+agent_status() {
+    gw_user_api GET "/v1/agents/$1" 2>/dev/null | jq -r '.status // empty' 2>/dev/null
+}
+
+# Wait for an agent's pod to reach Running. Logs progress each poll (no more
+# silent hang) AND bails early (return 2) the moment the agent record flips to
+# `error`, so the caller surfaces the recorded reason at ~120s instead of
+# burning the whole timeout. Returns 0 Running, 1 timeout, 2 agent errored.
+# Args: agent_id [timeout=600] [poll=15]
+wait_agent_running() {
+    local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase status
+    while [[ ${elapsed} -le ${timeout} ]]; do
+        pod="$(agent_pod_name "${agent_id}")"
+        if [[ -n "${pod}" ]]; then
+            phase=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            [[ "${phase}" == "Running" ]] && return 0
+        fi
+        status="$(agent_status "${agent_id}")"
+        if [[ "${status}" == "error" ]]; then
+            log_warn "Agent ${agent_id} entered error state after ${elapsed}s"
+            return 2
+        fi
+        log_progress "[${elapsed}s] waiting for agent ${agent_id} pod (pod=${pod:-none} phase=${phase:-none} status=${status:-?})"
+        sleep "${poll}"
+        elapsed=$((elapsed + poll))
+    done
+    return 1
+}
+
+# Dump everything needed to root-cause a test agent that never reached Running:
+# whether a pod was created + its phase/waiting reasons + describe Events, the
+# scheduler's recorded status/error_message, and Peer Pods (CAA) health. All
+# read-only. Args: agent_id
+diagnose_test_agent() {
+    local agent_id="$1" pod rec status emsg
+    echo -e "${YELLOW}--- test-agent diagnostics (${agent_id}) ---${NC}"
+
+    # 1) Scheduler-recorded reason (the single most useful line).
+    rec="$(gw_user_api GET "/v1/agents/${agent_id}" 2>/dev/null || echo "")"
+    status="$(echo "${rec}" | jq -r '.status // "?"' 2>/dev/null || echo "?")"
+    emsg="$(echo "${rec}" | jq -r '.error_message // empty' 2>/dev/null || echo "")"
+    log_kv "agent status" "${status}"
+    [[ -n "${emsg}" ]] && log_kv "error_message" "${emsg}"
+
+    # 2) Was a pod created, and what state is it stuck in?
+    pod="$(agent_pod_name "${agent_id}")"
+    if [[ -z "${pod}" ]]; then
+        log_warn "No pod exists for the agent (scheduler never created it, or it was removed after Error)."
+    else
+        kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
+            -o "custom-columns=POD:.metadata.name,PHASE:.status.phase,RC:.spec.runtimeClassName,NODE:.spec.nodeName" 2>&1 | sed 's/^/    /' || true
+        echo "  Waiting/terminated container reasons:"
+        kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" -o json 2>/dev/null \
+            | jq -r '(.status.containerStatuses // [])[]? | "    \(.name): \(.state | keys[0]) \((.state.waiting.reason // .state.terminated.reason) // "") \((.state.waiting.message // "") )"' 2>/dev/null || true
+        echo "  Events:"
+        kubectl describe pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" 2>/dev/null \
+            | sed -n '/Events:/,$p' | sed 's/^/    /' || true
+    fi
+
+    # 3) Peer Pods health (a kata-remote pod needs all of these).
+    echo "  Peer Pods (CAA) health:"
+    peerpods_webhook_effective 2>&1 | sed 's/^/    webhook: /' || true
+    peerpods_node_capacity_summary 2>&1 || true
+    local missing
+    missing="$(caa_pods_missing_hypervisor_socket "${CAA_NAMESPACE}" "${CAA_DAEMONSET}" 2>/dev/null || true)"
+    if [[ -n "${missing}" ]]; then
+        echo "    hypervisor-socket MISSING on CAA pod(s):"; printf '%s\n' "${missing}" | sed 's/^/      /'
+    else
+        echo "    hypervisor-socket: served by all running CAA pods"
+    fi
+    echo -e "${YELLOW}--- end diagnostics ---${NC}"
+}
+
+# Ensure the persistent designated owner agent exists, is the right tier, and
+# reaches Running; otherwise diagnose and fail. Sets + echoes TEST_AGENT_ID.
+# Never deletes the agent (it persists for reuse across steps / the soak window).
+# Requires an active gateway port-forward. Returns 0 Running, non-zero otherwise.
+ensure_owner_test_agent() {
+    local id rc
+    id="$(find_owner_agent_by_name "${SMOKE_AGENT_NAME}")"
+    if [[ -n "${id}" ]]; then
+        log_ok "Reusing designated owner agent '${SMOKE_AGENT_NAME}' (${id})"
+    else
+        log_info "Creating designated owner agent '${SMOKE_AGENT_NAME}' (tier ${SMOKE_AGENT_TIER})..."
+        local resp
+        resp="$(gw_user_api POST "/v1/agents" \
+            "{\"name\": \"${SMOKE_AGENT_NAME}\", \"tier\": \"${SMOKE_AGENT_TIER}\"}" || echo "")"
+        id="$(echo "${resp}" | jq -r '.agent_id // .id // empty' 2>/dev/null || echo "")"
+        [[ -n "${id}" ]] || { log_err "agent creation failed (response: ${resp:0:200})"; return 1; }
+        log_ok "Created agent ${id}"
+    fi
+    TEST_AGENT_ID="${id}"
+    export TEST_AGENT_ID
+
+    wait_agent_running "${id}" "${SMOKE_AGENT_WAIT_SECS:-600}"
+    rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        diagnose_test_agent "${id}"
+        return 1
+    fi
+    return 0
 }
 
 # Trustee KBS admin keypair: private half stays in .secrets/kbs-admin.key,

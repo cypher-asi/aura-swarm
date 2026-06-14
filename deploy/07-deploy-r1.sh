@@ -49,10 +49,9 @@ fi
 
 TMP_DIR=$(mktemp -d)
 TEST_AGENT_ID=""
+# The designated owner agent is intentionally PERSISTENT (step 08 reuses it), so
+# cleanup never deletes it — it only tears down the port-forward + temp dir.
 cleanup() {
-    if [[ -n "${TEST_AGENT_ID}" ]]; then
-        gw_user_api DELETE "/v1/agents/${TEST_AGENT_ID}" >/dev/null 2>&1 || true
-    fi
     gw_stop_port_forward
     rm -rf "${TMP_DIR}"
 }
@@ -115,41 +114,24 @@ fi
 log_ok "All ${LEGACY_COUNT} legacy kata-fc pod(s) untouched (same pods, runtime class, spec hash)"
 
 #------------------------------------------------------------------------------
-# Verify: one new test agent lands on SNP with sealed env + billing sku
+# Verify: a confidential agent lands on kata-remote with sealed env + billing sku
+#
+# Creates (or reuses) the PERSISTENT designated owner agent and confirms it
+# reaches Running. It is intentionally kept afterwards so step 08 can reuse it
+# (continuity across the soak window). If it cannot spawn, ensure_owner_test_agent
+# dumps root-cause diagnostics (pod events + scheduler error_message + CAA health).
 #------------------------------------------------------------------------------
 
 if [[ "${SKIP_TEST_AGENT}" == "true" ]]; then
     log_warn "Skipping test-agent verification (--skip-test-agent)"
 else
     echo ""
-    log_info "Creating R1 test agent..."
     gw_start_port_forward || step_fail "gateway port-forward failed"
 
-    CREATE_RESP=$(gw_user_api POST "/v1/agents" \
-        '{"name": "r1-deploy-smoke", "tier": "standard"}') \
-        || step_fail "test agent creation failed (check SMOKE_TEST_TOKEN)"
-    TEST_AGENT_ID=$(echo "${CREATE_RESP}" | jq -r '.agent_id // .id // empty')
-    [[ -n "${TEST_AGENT_ID}" ]] || step_fail "could not parse agent id from create response: ${CREATE_RESP}"
-    log_detail "Test agent: ${TEST_AGENT_ID}"
+    ensure_owner_test_agent \
+        || step_fail "designated owner agent '${SMOKE_AGENT_NAME}' never reached Running (root-cause diagnostics above)"
 
-    # Wait for its pod and inspect runtime class + sealed-env injection.
-    POD_NAME=""
-    ELAPSED=0
-    while [[ ${ELAPSED} -le 600 ]]; do
-        POD_NAME=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" \
-            -l "app=swarm-agent,swarm.io/agent-id=${TEST_AGENT_ID}" \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-        if [[ -n "${POD_NAME}" ]]; then
-            PHASE=$(kubectl get pod "${POD_NAME}" -n "${K8S_NAMESPACE_AGENTS}" \
-                -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            [[ "${PHASE}" == "Running" ]] && break
-        fi
-        log_progress "[${ELAPSED}s] waiting for test agent pod (pod=${POD_NAME:-none})"
-        sleep 15
-        ELAPSED=$((ELAPSED + 15))
-    done
-    [[ -n "${POD_NAME}" ]] || step_fail "test agent pod never appeared"
-
+    POD_NAME=$(agent_pod_name "${TEST_AGENT_ID}")
     POD_JSON=$(kubectl get pod "${POD_NAME}" -n "${K8S_NAMESPACE_AGENTS}" -o json)
     RUNTIME_CLASS=$(echo "${POD_JSON}" | jq -r '.spec.runtimeClassName // "<none>"')
     [[ "${RUNTIME_CLASS}" == "kata-remote" ]] \
@@ -170,11 +152,8 @@ else
     fi
     log_ok "Billing sku/tier visible in the usage API"
 
-    log_info "Destroying test agent..."
-    gw_user_api DELETE "/v1/agents/${TEST_AGENT_ID}" >/dev/null \
-        && TEST_AGENT_ID=""
     gw_stop_port_forward
-    log_ok "Test agent cleaned up"
+    log_ok "Designated owner agent ${TEST_AGENT_ID} kept (step 08 reuses '${SMOKE_AGENT_NAME}')"
 fi
 
 step_ok "08 (./08-r1-soak-check.sh — run repeatedly during the soak window)"

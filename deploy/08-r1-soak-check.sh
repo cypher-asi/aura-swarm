@@ -1,13 +1,15 @@
 #!/bin/bash
 # 08-r1-soak-check.sh - Repeatable R1 soak verification. Run this as often as
 # you like during the R1 prod soak window; it is READ-ONLY against production
-# agents and mutates only the throwaway test agent it creates (and destroys).
+# agents and mutates only the designated owner test agent (persistent: created
+# and kept by step 07, reused here by name; deleted only with --ephemeral).
 #
 # Checks (printed as a pass/fail checklist at the end):
 #   platform-health   deployments ready + /internal/health ok
 #   fleet-read-only   tiered agents on kata-remote, legacy agents on
 #                     kata-fc, no error-state regressions
-#   test-agent        new agent lands on kata-remote with sealed env
+#   test-agent        designated owner agent lands on kata-remote with sealed
+#                     env; on failure, root-cause diagnostics are dumped
 #   vault             PUT / GET(reveal) / LIST / DELETE secrets round-trip
 #   tier-change       standard -> pro -> standard with pod recreate
 #   cron-cycle        process registration + hibernate -> cron/wake -> run
@@ -15,10 +17,10 @@
 #   logs-api          live log tail returns entries
 #
 # Usage:
-#   ./08-r1-soak-check.sh                  # full run (creates + destroys test agent)
-#   ./08-r1-soak-check.sh --agent-id ID    # reuse an existing designated test agent
-#   ./08-r1-soak-check.sh --keep-agent     # leave the test agent running for the
-#                                          # soak window (reuse with --agent-id)
+#   ./08-r1-soak-check.sh                  # reuse/create the designated owner agent (kept)
+#   ./08-r1-soak-check.sh --agent-id ID    # target a specific agent instead
+#   ./08-r1-soak-check.sh --keep-agent     # (default behavior) keep the agent running
+#   ./08-r1-soak-check.sh --ephemeral      # delete the agent on exit (old throwaway mode)
 #   ./08-r1-soak-check.sh --relogin        # force a fresh zOS login (ignore cache)
 #
 # Requires an owner session. The script logs in to zOS with an email/password
@@ -35,12 +37,14 @@ source "${SCRIPT_DIR}/_lib.sh"
 
 TEST_AGENT_ID=""
 KEEP_AGENT=false
+EPHEMERAL=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent-id) TEST_AGENT_ID="$2"; KEEP_AGENT=true; shift 2 ;;
         --keep-agent) KEEP_AGENT=true; shift ;;
+        --ephemeral) EPHEMERAL=true; shift ;;
         --relogin) export SMOKE_FORCE_LOGIN=1; shift ;;
-        *) echo "Unknown option: $1"; echo "Usage: $0 [--agent-id ID] [--keep-agent] [--relogin]"; exit 1 ;;
+        *) echo "Unknown option: $1"; echo "Usage: $0 [--agent-id ID] [--keep-agent] [--ephemeral] [--relogin]"; exit 1 ;;
     esac
 done
 
@@ -53,7 +57,6 @@ ensure_kubectl_context
 ensure_smoke_test_token \
     || step_fail "owner session required: log in when prompted, set SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD, or provide SMOKE_TEST_TOKEN / .secrets/SMOKE_TEST_TOKEN"
 
-CREATED_AGENT=false
 declare -a CHECK_NAMES=()
 declare -a CHECK_RESULTS=()
 declare -a CHECK_NOTES=()
@@ -69,34 +72,21 @@ record() { # record <name> <PASS|FAIL|SKIP> <note>
     esac
 }
 
+# The designated owner agent persists by default (it is reused across runs and
+# was created/kept by step 07). Only --ephemeral deletes it on exit.
 cleanup() {
-    if [[ "${CREATED_AGENT}" == "true" && "${KEEP_AGENT}" != "true" && -n "${TEST_AGENT_ID}" ]]; then
+    if [[ "${EPHEMERAL}" == "true" && -n "${TEST_AGENT_ID}" ]]; then
         gw_user_api DELETE "/v1/agents/${TEST_AGENT_ID}" >/dev/null 2>&1 || true
     fi
     gw_stop_port_forward
 }
 trap cleanup EXIT
 
-test_agent_pod() {
-    kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" \
-        -l "app=swarm-agent,swarm.io/agent-id=${TEST_AGENT_ID}" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
-}
-
-wait_test_agent_running() {
-    local timeout="${1:-600}" elapsed=0 pod phase
-    while [[ ${elapsed} -le ${timeout} ]]; do
-        pod=$(test_agent_pod)
-        if [[ -n "${pod}" ]]; then
-            phase=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
-                -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            [[ "${phase}" == "Running" ]] && return 0
-        fi
-        sleep 15
-        elapsed=$((elapsed + 15))
-    done
-    return 1
-}
+# Thin wrappers over the shared _lib.sh helpers, bound to this run's
+# TEST_AGENT_ID. wait_test_agent_running now logs progress and bails early when
+# the agent flips to error (see wait_agent_running in _lib.sh).
+test_agent_pod() { agent_pod_name "${TEST_AGENT_ID}"; }
+wait_test_agent_running() { wait_agent_running "${TEST_AGENT_ID}" "${1:-600}"; }
 
 #------------------------------------------------------------------------------
 # platform-health
@@ -148,14 +138,25 @@ fi
 #------------------------------------------------------------------------------
 
 log_section "[3/8] test-agent"
-if [[ -z "${TEST_AGENT_ID}" ]]; then
-    CREATE_RESP=$(gw_user_api POST "/v1/agents" '{"name": "r1-soak-check", "tier": "standard"}' || echo "")
-    TEST_AGENT_ID=$(echo "${CREATE_RESP}" | jq -r '.agent_id // .id // empty' 2>/dev/null || echo "")
-    [[ -n "${TEST_AGENT_ID}" ]] && CREATED_AGENT=true
+# Reuse the designated owner agent by default (step 07 creates+keeps it); an
+# explicit --agent-id overrides. ensure_owner_test_agent discovers it by name,
+# creates+keeps one if missing, waits for Running, and on failure dumps
+# root-cause diagnostics (pod events + scheduler error_message + CAA health).
+# The gateway port-forward from [1/8] is still up for the user-API calls.
+AGENT_UP=false
+if [[ -n "${TEST_AGENT_ID}" ]]; then
+    if wait_agent_running "${TEST_AGENT_ID}" 600; then
+        AGENT_UP=true
+    else
+        diagnose_test_agent "${TEST_AGENT_ID}"
+    fi
+elif ensure_owner_test_agent; then
+    AGENT_UP=true
 fi
+
 if [[ -z "${TEST_AGENT_ID}" ]]; then
     record "test-agent" FAIL "agent creation failed"
-elif wait_test_agent_running 600; then
+elif [[ "${AGENT_UP}" == "true" ]]; then
     POD=$(test_agent_pod)
     RC=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o jsonpath='{.spec.runtimeClassName}')
     SEALED=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o json \
@@ -166,7 +167,7 @@ elif wait_test_agent_running 600; then
         record "test-agent" FAIL "runtime_class=${RC} sealed=${SEALED}"
     fi
 else
-    record "test-agent" FAIL "agent ${TEST_AGENT_ID} pod never reached Running"
+    record "test-agent" FAIL "agent ${TEST_AGENT_ID} never reached Running (diagnostics above)"
 fi
 
 #------------------------------------------------------------------------------
@@ -337,9 +338,9 @@ for i in "${!CHECK_NAMES[@]}"; do
 done
 echo ""
 
-if [[ "${KEEP_AGENT}" == "true" && -n "${TEST_AGENT_ID}" ]]; then
-    log_info "Test agent kept for the soak window: ${TEST_AGENT_ID}"
-    log_detail "Re-run with: ./08-r1-soak-check.sh --agent-id ${TEST_AGENT_ID}"
+if [[ "${EPHEMERAL}" != "true" && -n "${TEST_AGENT_ID}" ]]; then
+    log_info "Designated owner agent kept: ${TEST_AGENT_ID} (name '${SMOKE_AGENT_NAME}')"
+    log_detail "Reused automatically next run; target explicitly with --agent-id ${TEST_AGENT_ID}, or --ephemeral to delete on exit."
     echo ""
 fi
 
