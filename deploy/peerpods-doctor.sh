@@ -294,6 +294,38 @@ else
     printf '%s\n' "${KR_MISSING_LIST}" | head -10 | sed 's/^/    /'
 fi
 
+# guest-pull-user-ids: every kata-remote (Peer Pods, guest-pull) pod MUST pin
+# BOTH a numeric runAsUser AND runAsGroup on each container — directly or via the
+# pod securityContext. With guest pull the workload rootfs is materialized INSIDE
+# the pod VM, so the host snapshot is empty; if a container leaves runAsUser OR
+# runAsGroup unset, containerd host-mounts that empty snapshot to resolve the
+# user/GID from /etc/passwd at create time and fails CreateContainer with
+# "mount callback failed ... /etc/passwd: no such file or directory" (or
+# "no users found"). A pod missing either id was built by a scheduler without the
+# numeric-gid fix (stale) -> redeploy the scheduler. This is a STATIC lint so the
+# read-only doctor catches the bug as soon as an agent pod exists — before a
+# pod VM even boots — instead of only reactively via fleet-failures once pods
+# have already failed. (Effective id = container securityContext, else pod.)
+KR_BADUSER_LIST="$(printf '%s' "${ALL_PODS_JSON}" | jq -r '
+    [.items[] | select(.spec.runtimeClassName=="kata-remote")
+       | .metadata.namespace as $ns | .metadata.name as $n
+       | (.spec.securityContext // {}) as $psc
+       | [ (.spec.containers // [])[]
+           | { uid: (.securityContext.runAsUser // $psc.runAsUser),
+               gid: (.securityContext.runAsGroup // $psc.runAsGroup) }
+           | select(.uid == null or .gid == null) ] as $bad
+       | select(($bad | length) > 0)
+       | "\($ns)/\($n)"] | .[]' 2>/dev/null || true)"
+KR_BADUSER_N="$(printf '%s' "${KR_BADUSER_LIST}" | grep -c . || true)"
+if [[ "${KR_TOTAL:-0}" -eq 0 ]]; then
+    record "guest-pull-user-ids" SKIP "no kata-remote pods present to inspect"
+elif [[ "${KR_BADUSER_N:-0}" -eq 0 ]]; then
+    record "guest-pull-user-ids" PASS "${KR_TOTAL} kata-remote pod(s) pin numeric runAsUser+runAsGroup (guest-pull user resolution stays off the host)"
+else
+    record "guest-pull-user-ids" FAIL "${KR_BADUSER_N}/${KR_TOTAL} kata-remote pod(s) miss a numeric runAsUser+runAsGroup -> containerd resolves the user from /etc/passwd on the (empty) guest-pull host snapshot and fails CreateContainer ('mount callback failed ... /etc/passwd: no such file or directory'). Redeploy the scheduler (./07-deploy-r1.sh) so new pods pin both."
+    printf '%s\n' "${KR_BADUSER_LIST}" | head -10 | sed 's/^/    /'
+fi
+
 # fleet-failures: kata-remote pods stuck in a create/pull error, grouped by
 # message, so the blast radius is visible at a glance.
 FLEET_FAILS="$(printf '%s' "${ALL_PODS_JSON}" | jq -r '
