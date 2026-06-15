@@ -16,7 +16,7 @@ mod ui;
 mod watch;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -55,10 +55,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let deploy_dir = args
-        .deploy_dir
-        .canonicalize()
-        .with_context(|| format!("deploy dir not found: {}", args.deploy_dir.display()))?;
+    let deploy_dir = resolve_deploy_dir(&args.deploy_dir)?;
     let scripts = scripts::discover(&deploy_dir)
         .with_context(|| format!("failed to scan {}", deploy_dir.display()))?;
     if scripts.is_empty() {
@@ -153,6 +150,37 @@ async fn run_loop(
         h.cancel();
     }
     Ok(())
+}
+
+/// Resolve the deploy-scripts directory.
+///
+/// Tries the path as given (absolute, or relative to the current dir) and, for
+/// a relative path, walks up the ancestors of the working directory so the TUI
+/// can be launched from anywhere inside the repo, not just its root.
+fn resolve_deploy_dir(requested: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(p) = requested.canonicalize() {
+        if p.is_dir() {
+            return Ok(p);
+        }
+    }
+    if requested.is_relative() {
+        let cwd = std::env::current_dir().context("cannot read the current directory")?;
+        for base in cwd.ancestors() {
+            if let Ok(p) = base.join(requested).canonicalize() {
+                if p.is_dir() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    anyhow::bail!(
+        "deploy dir '{}' not found (searched from cwd: {cwd}). \
+         Pass --deploy-dir <path> or run from inside the repo.",
+        requested.display()
+    )
 }
 
 /// Await the next runner event, or pend forever when nothing is running.
