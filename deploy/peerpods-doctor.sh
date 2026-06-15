@@ -8,20 +8,32 @@
 # It is strictly READ-ONLY: it never patches, restarts, or deletes anything, and
 # it never launches a pod VM. Remediation commands are PRINTED, not run.
 #
-# Layers:
+# Layers (probed in dependency order; the EARLIEST failing one is the root cause):
 #   Cluster (one-shot):
-#     platform        gateway/control/scheduler deployments Ready
-#     runtimeclass    kata-remote RuntimeClass exists + overhead zero
-#     caa-daemonset   cloud-api-adaptor-daemonset Ready N/N
-#     webhook         peer-pods mutating webhook effective (caBundle + endpoints)
-#     vm-capacity     workers advertise kata.peerpods.io/vm
+#     platform              gateway/control/scheduler deployments Ready
+#     runtimeclass          kata-remote RuntimeClass exists (prerequisite)
+#     caa-daemonset         cloud-api-adaptor-daemonset Ready N/N
+#     runtimeclass-overhead overhead zero (checked AFTER caa-daemonset: ./03 zeros
+#                           it only once CAA is Ready, so a non-zero value is
+#                           usually downstream of an unhealthy caa-daemonset)
+#     agent-pull-secret     ECR pull secret present in the agent ns + linked to the
+#                           default SA (the in-guest guest-pull needs it)
+#     webhook               peer-pods mutating webhook effective (caBundle + endpoints)
+#     vm-capacity           workers advertise kata.peerpods.io/vm
+#     vm-headroom           a kata.peerpods.io/vm slot is actually FREE (not just advertised)
+#     worker-labels         every node-group node carries node.kubernetes.io/worker
+#   Application (pod-level, cluster-wide):
+#     runtime-handler-annotation  kata-remote pods carry io.containerd.cri.runtime-handler
+#     fleet-failures              no kata-remote pods stuck in CreateContainer/ImagePull error
 #   Per node (via the privileged guest-pull DaemonSet pod's host namespaces):
 #     hypervisor-socket  /run/peerpod/hypervisor.sock present
 #     fuse               mount.fuse present (nydus-overlayfs)
 #     guest-pull-flags   disable_snapshot_annotations=false + discard_unpacked_layers=false
 #     nydus-bound        kata-remote snapshotter is a containerd plugin loaded "ok"
+#     runtime-config     runtimes.kata-remote complete (runtime_type + nydus snapshotter)
 #     nydus-daemon       nydus guest-pull daemon socket present + process running
-#     host-image-cache   harness workload image NOT host-cached (must guest-pull)
+#     incomplete-images  no kata-remote WORKLOAD image with discarded layers
+#     caa-log            no fatal signatures in the CAA log (time-windowed; DOCTOR_CAA_LOG_SINCE)
 #
 # Usage:
 #   ./peerpods-doctor.sh                 # all worker nodes
@@ -507,23 +519,32 @@ for node in "${NODES[@]}"; do
     if [[ -z "${CAA_POD}" ]]; then
         record "${short}/caa-log" SKIP "no CAA pod found on node"
     else
-        # Scan BOTH the current and the previous (pre-restart) logs: a CAA pod
-        # that CrashLooped or was clean-restarted moves the real fatal line (e.g.
-        # an InsufficientFreeAddressesInSubnet from a failed RunInstances, or the
-        # in-guest CDH ECR auth failure forwarded by the proxy) into --previous,
-        # where a current-only scan would miss it and falsely report "no
-        # signatures". The signature set covers pod-VM launch (RunInstances /
-        # capacity / address exhaustion), IAM/auth (UnauthorizedOperation /
-        # AccessDenied), the in-guest image guest-pull (Image Pull error / Not
-        # authorized / image_guest_pull), attestation/CDH (Get Resource failed),
-        # and host wiring (port bind / missing socket).
-        CAA_LOG="$(kubectl -n "${CAA_NS}" logs "${CAA_POD}" --tail=200 2>/dev/null; \
-                   kubectl -n "${CAA_NS}" logs "${CAA_POD}" --previous --tail=200 2>/dev/null || true)"
-        SIGS="$(printf '%s\n' "${CAA_LOG}" | grep -iE 'RunInstances|UnauthorizedOperation|AccessDenied|InsufficientInstanceCapacity|InsufficientFreeAddressesInSubnet|Image Pull error|Not authorized|image_guest_pull|Get Resource failed|attestation .*fail|failed to create|bind: address already in use|no such file or directory' | grep -ivE 'level=(debug|info)' | sort -u | tail -8 || true)"
+        # Scan the CAA pod log for known fatal signatures so a problem that only
+        # shows in logs is surfaced here. Two things keep this HONEST instead of
+        # crying wolf over already-remediated history:
+        #
+        #  1. TIME-WINDOWED (--since, default 15m, DOCTOR_CAA_LOG_SINCE). Without a
+        #     window the scan resurfaces hours-old errors that a later fix already
+        #     resolved (e.g. an ECR "Not authorized" from before the pull secret
+        #     was seeded), so the doctor would FAIL even on a now-healthy node. The
+        #     window is also applied to --previous, which is still scanned so a CAA
+        #     pod that JUST crashlooped/restarted (root cause in the prior
+        #     container) is caught — but only while it is recent.
+        #  2. SIGNATURES ARE ERRORS ONLY. We match the real failure lines
+        #     (RunInstances/capacity/address exhaustion, IAM auth, the in-guest
+        #     "Image Pull error"/"Not authorized", attestation/CDH "Get Resource
+        #     failed", host port-bind/missing-socket). We deliberately do NOT match
+        #     "image_guest_pull": every HEALTHY kata-remote CreateContainer logs
+        #     "driver:image_guest_pull" in its mount list, so matching it flagged
+        #     normal operation as a fault.
+        CAA_LOG_SINCE="${DOCTOR_CAA_LOG_SINCE:-15m}"
+        CAA_LOG="$(kubectl -n "${CAA_NS}" logs "${CAA_POD}" --since="${CAA_LOG_SINCE}" --tail=200 2>/dev/null; \
+                   kubectl -n "${CAA_NS}" logs "${CAA_POD}" --previous --since="${CAA_LOG_SINCE}" --tail=200 2>/dev/null || true)"
+        SIGS="$(printf '%s\n' "${CAA_LOG}" | grep -iE 'RunInstances|UnauthorizedOperation|AccessDenied|InsufficientInstanceCapacity|InsufficientFreeAddressesInSubnet|Image Pull error|Not authorized|Get Resource failed|attestation .*fail|failed to create|bind: address already in use|no such file or directory' | grep -ivE 'level=(debug|info)' | sort -u | tail -8 || true)"
         if [[ -z "${SIGS}" ]]; then
-            record "${short}/caa-log" PASS "no known fatal signatures in the CAA log (current + previous, last 200 lines each)"
+            record "${short}/caa-log" PASS "no fatal signatures in the CAA log (last ${CAA_LOG_SINCE}, current + previous)"
         else
-            record "${short}/caa-log" FAIL "CAA log on ${short} shows error signature(s) (current + previous; lines below)"
+            record "${short}/caa-log" FAIL "CAA log on ${short} shows error signature(s) in the last ${CAA_LOG_SINCE} (lines below). If these predate a fix you just applied, clear them with: kubectl -n ${CAA_NS} rollout restart ds/${CAA_DS}"
             printf '%s\n' "${SIGS}" | sed 's/^/    /'
         fi
     fi
