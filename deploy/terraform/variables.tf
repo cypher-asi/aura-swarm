@@ -106,6 +106,37 @@ variable "node_disk_size" {
   default     = 100
 }
 
+# Dedicated TEE (peer-pods) worker pool — see modules/eks for details.
+variable "tee_node_group_name" {
+  description = "Name of the dedicated TEE (peer-pods) worker node group"
+  type        = string
+  default     = "aura-swarm-tee-hosts"
+}
+
+variable "tee_node_instance_type" {
+  description = "EC2 instance type for the dedicated TEE worker nodes"
+  type        = string
+  default     = "m5.2xlarge"
+}
+
+variable "tee_node_desired_count" {
+  description = "Desired number of TEE worker nodes"
+  type        = number
+  default     = 2
+}
+
+variable "tee_node_min_count" {
+  description = "Minimum number of TEE worker nodes"
+  type        = number
+  default     = 1
+}
+
+variable "tee_node_max_count" {
+  description = "Maximum number of TEE worker nodes"
+  type        = number
+  default     = 5
+}
+
 #------------------------------------------------------------------------------
 # ECR Configuration
 #------------------------------------------------------------------------------

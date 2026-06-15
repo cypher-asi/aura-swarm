@@ -90,6 +90,12 @@ module "eks" {
   node_max_count     = var.node_max_count
   node_disk_size     = var.node_disk_size
 
+  tee_node_group_name    = var.tee_node_group_name
+  tee_node_instance_type = var.tee_node_instance_type
+  tee_node_desired_count = var.tee_node_desired_count
+  tee_node_min_count     = var.tee_node_min_count
+  tee_node_max_count     = var.tee_node_max_count
+
   tags = local.common_tags
 }
 

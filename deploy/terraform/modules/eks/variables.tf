@@ -58,6 +58,41 @@ variable "node_disk_size" {
   default     = 100
 }
 
+#------------------------------------------------------------------------------
+# Dedicated TEE worker pool (aura-swarm-tee-hosts): a second managed node group
+# that hosts NEW confidential (kata-remote) agents on a clean pool with its own
+# kata.peerpods.io/vm headroom and image cache, isolated from the shared pool.
+#------------------------------------------------------------------------------
+variable "tee_node_group_name" {
+  description = "Name of the dedicated TEE (peer-pods) worker node group"
+  type        = string
+  default     = "aura-swarm-tee-hosts"
+}
+
+variable "tee_node_instance_type" {
+  description = "EC2 instance type for the dedicated TEE worker nodes"
+  type        = string
+  default     = "m5.2xlarge"
+}
+
+variable "tee_node_desired_count" {
+  description = "Desired number of TEE worker nodes"
+  type        = number
+  default     = 2
+}
+
+variable "tee_node_min_count" {
+  description = "Minimum number of TEE worker nodes"
+  type        = number
+  default     = 1
+}
+
+variable "tee_node_max_count" {
+  description = "Maximum number of TEE worker nodes"
+  type        = number
+  default     = 5
+}
+
 # Pin the AL2023 EKS-optimized AMI to a release that still ships containerd 1.7.x.
 #
 # WHY: kata-remote (Peer Pods) guest image pull needs containerd to pass per-layer

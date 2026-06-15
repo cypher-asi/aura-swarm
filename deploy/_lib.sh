@@ -833,7 +833,7 @@ nodegroup_status() {
 # NOT DescribeUpdate). Returns 0 on convergence, 1 on timeout.
 wait_nodegroups_active() {
     local timeout="${1:-1800}" poll=30 elapsed=0
-    local groups=("${RESOURCE_PREFIX}-node-group")
+    local groups=("${RESOURCE_PREFIX}-node-group" "${TEE_NODE_GROUP_NAME:-aura-swarm-tee-hosts}")
     while [[ ${elapsed} -le ${timeout} ]]; do
         local all_ok=true g status
         for g in "${groups[@]}"; do
@@ -1123,6 +1123,11 @@ agent_status() {
 # Args: agent_id [timeout=600] [poll=15]
 wait_agent_running() {
     local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase status detail waiting ev
+    # Bail early when the pod is Unschedulable for lack of kata.peerpods.io/vm:
+    # that is resource exhaustion, NOT a transient condition, so it will never
+    # self-heal within the timeout. Fail after a short grace instead of burning
+    # the full ~2min until the scheduler flips the agent to error. Returns 3.
+    local unsched_secs=0 unsched_grace="${PEERPODS_UNSCHED_GRACE_SECS:-30}"
     while [[ ${elapsed} -le ${timeout} ]]; do
         pod="$(agent_pod_name "${agent_id}")"
         phase=""
@@ -1145,6 +1150,15 @@ wait_agent_running() {
         if [[ "${status}" == "error" ]]; then
             log_warn "Agent ${agent_id} entered error state after ${elapsed}s"
             return 2
+        fi
+        if [[ "${detail}" == *"Insufficient kata.peerpods.io/vm"* ]]; then
+            unsched_secs=$((unsched_secs + poll))
+            if [[ ${unsched_secs} -ge ${unsched_grace} ]]; then
+                log_warn "Agent ${agent_id} pod Unschedulable for ${unsched_secs}s: no kata.peerpods.io/vm capacity (will not self-heal) — failing fast"
+                return 3
+            fi
+        else
+            unsched_secs=0
         fi
         log_progress "[${elapsed}s] agent ${agent_id} status=${status:-?} pod=${pod:-none} phase=${phase:-none}${detail}"
         sleep "${poll}"
@@ -1197,6 +1211,29 @@ diagnose_test_agent() {
     echo -e "${YELLOW}--- end diagnostics ---${NC}"
 }
 
+# Delete every pod for the designated owner agent (matched by its sanitized name
+# prefix). Deleting an errored agent via the API does not always reap its pod, so
+# stale r1-owner-soak-* pods pile up — each one bound to a node and squatting a
+# kata.peerpods.io/vm slot it will never use, which (over repeated failed runs)
+# exhausts the pool. Only ever called on the error/recreate path, where reaping
+# ALL owner-soak pods is safe (a fresh one is created next). Best-effort.
+reap_owner_test_pods() {
+    local prefix pods
+    prefix="$(printf '%s' "${SMOKE_AGENT_NAME}" | tr '[:upper:]' '[:lower:]' \
+        | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+    [[ -z "${prefix}" ]] && return 0
+    pods=$(kubectl get pods -n "${K8S_NAMESPACE_AGENTS}" -l app=swarm-agent \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+        | tr -d '\r' | grep -E "^${prefix}-" || true)
+    [[ -z "${pods}" ]] && return 0
+    log_detail "Reaping ${prefix}-* pod(s) so they stop holding kata.peerpods.io/vm slots:"
+    printf '%s\n' "${pods}" | sed 's/^/      /'
+    printf '%s\n' "${pods}" | while read -r p; do
+        [[ -n "${p}" ]] && kubectl delete pod "${p}" -n "${K8S_NAMESPACE_AGENTS}" \
+            --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done
+}
+
 # Ensure the persistent designated owner agent exists, is the right tier, and
 # reaches Running; otherwise diagnose and fail. Sets + echoes TEST_AGENT_ID.
 # Never deletes the agent (it persists for reuse across steps / the soak window).
@@ -1206,9 +1243,10 @@ ensure_owner_test_agent() {
     id="$(find_owner_agent_by_name "${SMOKE_AGENT_NAME}")"
     # If an existing agent is in error, delete it so a fresh one is created: it
     # has been dropped from the scheduler's active set and may carry a stale pod
-    # from an older scheduler (e.g. a kata-qemu-snp pod pinned to the removed
-    # confidential-node pool). Restart proved unreliable, so delete + recreate —
-    # the new pod is built by the current scheduler (kata-remote, no selector).
+    # from an older scheduler. Restart proved unreliable, so delete + recreate —
+    # the new pod is built by the current scheduler (kata-remote, pinned to the
+    # dedicated TEE pool via AGENT_NODE_SELECTOR). Also reap any leftover
+    # owner-soak pods so they stop squatting kata.peerpods.io/vm slots.
     if [[ -n "${id}" ]]; then
         st="$(agent_status "${id}")"
         if [[ "${st}" == "error" ]]; then
@@ -1216,6 +1254,7 @@ ensure_owner_test_agent() {
             gw_user_api DELETE "/v1/agents/${id}" >/dev/null 2>&1 \
                 || log_warn "delete request failed; will try to create a fresh agent anyway"
             sleep 5
+            reap_owner_test_pods
             id=""
         else
             log_ok "Reusing designated owner agent '${SMOKE_AGENT_NAME}' (${id}, status=${st:-?})"
@@ -1750,6 +1789,93 @@ peerpods_node_capacity_summary() {
         | jq -r '.items[] | "    \(.metadata.name): capacity=\(.status.capacity["kata.peerpods.io/vm"] // "<none>") allocatable=\(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
 }
 
+# Idempotently label worker nodes with node.kubernetes.io/worker="" so the CAA /
+# guest-pull / fuse DaemonSets (which select that label) schedule on EVERY
+# worker — including the dedicated TEE pool and any node that joined AFTER
+# ./03-coco-operator.sh ran its one-time labeling. EKS rolls and scales nodes,
+# and a late-joiner that never got the label gets no CAA pod, so it advertises
+# zero kata.peerpods.io/vm and silently wastes a scheduling slot (the original
+# root cause of the stuck R1 rollout). Safe to call repeatedly; honours
+# CAA_WORKER_NODE_SELECTOR (empty = all nodes). Best-effort: never fails a step.
+ensure_worker_labels() {
+    local selector="${CAA_WORKER_NODE_SELECTOR:-}"
+    if [[ -n "${selector}" ]]; then
+        kubectl label nodes -l "${selector}" node.kubernetes.io/worker="" --overwrite >/dev/null 2>&1 || true
+    else
+        kubectl label nodes --all node.kubernetes.io/worker="" --overwrite >/dev/null 2>&1 || true
+    fi
+}
+
+# Echo the names of nodes that belong to a managed node group (carry the
+# eks.amazonaws.com/nodegroup label) but are MISSING node.kubernetes.io/worker,
+# i.e. late-joiners CAA never advertised capacity on. Empty = none. Read-only.
+peerpods_unlabeled_workers() {
+    kubectl get nodes -o json 2>/dev/null | jq -r '
+        .items[]
+        | select((.metadata.labels["eks.amazonaws.com/nodegroup"] // "") != "")
+        | select((.metadata.labels["node.kubernetes.io/worker"] // null) == null)
+        | .metadata.name' 2>/dev/null || true
+}
+
+# Compute kata.peerpods.io/vm headroom per node and a cluster total, classifying
+# consumed slots as healthy (Running pods) vs failed/stuck (bound but not
+# Running — e.g. CreateContainerError pods squatting a slot they will never use).
+# Prints indented per-node + TOTAL lines. Args: [node_label_selector]
+# (default node.kubernetes.io/worker). Returns:
+#   0 = at least one free slot across matching nodes
+#   1 = zero free slots (exhausted)
+#   2 = no matching nodes advertise capacity
+peerpods_vm_headroom() {
+    local selector="${1:-node.kubernetes.io/worker}"
+    local nodes_f pods_f out
+    nodes_f=$(mktemp); pods_f=$(mktemp)
+    kubectl get nodes -l "${selector}" -o json 2>/dev/null > "${nodes_f}" || echo '{}' > "${nodes_f}"
+    kubectl get pods -A -o json 2>/dev/null > "${pods_f}" || echo '{}' > "${pods_f}"
+
+    out=$(jq -n --slurpfile nodes "${nodes_f}" --slurpfile pods "${pods_f}" '
+        ([ ($pods[0].items // [])[]
+           | select(.spec.nodeName != null)
+           | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+           | { node: .spec.nodeName,
+               running: (.status.phase == "Running"),
+               vm: ([ (.spec.containers // [])[].resources.requests["kata.peerpods.io/vm"] // "0"
+                      | tonumber ] | add // 0) }
+           | select(.vm > 0) ]) as $u
+        | [ ($nodes[0].items // [])[]
+            | .metadata.name as $name
+            | (((.status.allocatable["kata.peerpods.io/vm"] // "0") | tonumber? // 0)) as $cap
+            | ([ $u[] | select(.node == $name) ]) as $on
+            | (([ $on[] | .vm ] | add) // 0) as $used
+            | { name: $name, cap: $cap, used: $used,
+                healthy: (([ $on[] | select(.running) | .vm ] | add) // 0),
+                failed:  (([ $on[] | select(.running | not) | .vm ] | add) // 0),
+                free: ($cap - $used) } ]
+        | { nodes: .,
+            total_cap:    ([ .[].cap ]    | add // 0),
+            total_used:   ([ .[].used ]   | add // 0),
+            total_free:   ([ .[].free ]   | add // 0),
+            total_failed: ([ .[].failed ] | add // 0),
+            node_count:   length }
+    ' 2>/dev/null || echo '{}')
+    rm -f "${nodes_f}" "${pods_f}"
+
+    local ncount tfree tcap tused tfailed
+    ncount=$(printf '%s' "${out}" | jq -r '.node_count // 0')
+    tfree=$(printf '%s' "${out}" | jq -r '.total_free // 0')
+    tcap=$(printf '%s' "${out}" | jq -r '.total_cap // 0')
+    tused=$(printf '%s' "${out}" | jq -r '.total_used // 0')
+    tfailed=$(printf '%s' "${out}" | jq -r '.total_failed // 0')
+
+    printf '%s' "${out}" | jq -r '.nodes[]
+        | "    \(.name): used=\(.used)/\(.cap) free=\(.free) (healthy=\(.healthy) failed/stuck=\(.failed))"' 2>/dev/null || true
+    printf '    TOTAL free=%s/%s (failed/stuck slots=%s) across %s node(s) [selector: %s]\n' \
+        "${tfree}" "${tcap}" "${tfailed}" "${ncount}" "${selector}"
+
+    [[ "${ncount:-0}" -ge 1 ]] || return 2
+    [[ "${tfree:-0}" -ge 1 ]] || return 1
+    return 0
+}
+
 # Echo the kata-remote RuntimeClass pod overhead (.overhead.podFixed), e.g.
 # '{"cpu":"250m","memory":"160Mi"}', or empty when the RuntimeClass / overhead
 # is unset. kata-deploy stamps a DEFAULT (non-zero) overhead onto this
@@ -2153,6 +2279,14 @@ node_desired_count  = ${NODE_DESIRED_COUNT}
 node_min_count      = ${NODE_MIN_COUNT}
 node_max_count      = ${NODE_MAX_COUNT}
 
+# Dedicated TEE (peer-pods) worker pool — hosts NEW confidential agents on a
+# clean pool isolated from the shared/legacy pool (left untouched).
+tee_node_group_name    = "${TEE_NODE_GROUP_NAME}"
+tee_node_instance_type = "${TEE_NODE_INSTANCE_TYPE}"
+tee_node_desired_count = ${TEE_NODE_DESIRED_COUNT}
+tee_node_min_count     = ${TEE_NODE_MIN_COUNT}
+tee_node_max_count     = ${TEE_NODE_MAX_COUNT}
+
 # Feature flags — preserved from previous state
 enable_network = ${existing_network}
 enable_storage = ${existing_storage}
@@ -2395,6 +2529,7 @@ render_k8s_manifests() {
     sed -i "s|__Z_BILLING_API_KEY__|${zbilling:-}|g" "${secrets_yaml}"
     sed -i "s|__INTERNAL_TOKEN__|${token}|g" "${secrets_yaml}"
     sed -i "s|__DEFAULT_ISOLATION__|${DEFAULT_ISOLATION}|g" "${secrets_yaml}"
+    sed -i "s|__AGENT_NODE_SELECTOR__|${AGENT_NODE_SELECTOR:-}|g" "${secrets_yaml}"
 
     local manifest
     for manifest in "${tmp_dir}"/05-*.yaml "${tmp_dir}"/06-*.yaml "${tmp_dir}"/07-*.yaml; do

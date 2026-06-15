@@ -53,6 +53,16 @@ spec:
                   name: aura-swarm-config
                   key: DEFAULT_ISOLATION
                   optional: true
+            # Pin confidential (kata-remote) agent pods onto the dedicated,
+            # clean peer-pods worker pool (the aura-swarm-tee-hosts node group)
+            # so new agents get their own kata.peerpods.io/vm headroom and a
+            # clean guest-pull image cache. Container (dev-mode) pods ignore it.
+            - name: AGENT_NODE_SELECTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: AGENT_NODE_SELECTOR
+                  optional: true
             # Gateway URL for status callbacks
             - name: GATEWAY_URL
               valueFrom:

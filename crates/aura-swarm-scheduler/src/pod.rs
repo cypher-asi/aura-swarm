@@ -176,13 +176,25 @@ fn build_pod_spec(
     let isolation = spec.isolation.unwrap_or(config.default_isolation);
     // Confidential pods run as Peer Pods (CAA `kata-remote`): the per-agent
     // SEV-SNP pod VM is launched off-cluster, the kata shim runs on an
-    // ordinary worker, and attestation happens via the in-guest CDH. The pod
-    // carries no node selector/toleration (there is no on-node metal pool).
-    // Container (dev-mode) pods get the default runtime.
+    // ordinary worker, and attestation happens via the in-guest CDH. There is
+    // no on-node metal pool, so the only placement constraint is an OPTIONAL
+    // node selector (`config.agent_node_selector`) used to pin the kata shim
+    // onto a dedicated peer-pods worker pool (the clean `aura-swarm-tee-hosts`
+    // node group) so new agents get their own kata.peerpods.io/vm headroom and
+    // a clean guest-pull image cache. Container (dev-mode) pods get the default
+    // runtime and never receive the selector.
     let runtime_class_name = isolation.runtime_class().map(str::to_string);
+    let node_selector = if isolation == IsolationLevel::ConfidentialVM
+        && !config.agent_node_selector.is_empty()
+    {
+        Some(config.agent_node_selector.clone())
+    } else {
+        None
+    };
 
     PodSpec {
         runtime_class_name,
+        node_selector,
         containers: vec![build_container(
             agent_id_hex,
             user_id_hex,
@@ -808,6 +820,52 @@ mod tests {
         // Base env vars are still all present
         assert!(env.iter().any(|e| e.name == "AGENT_ID"));
         assert!(env.iter().any(|e| e.name == "CONTROL_PLANE_URL"));
+    }
+
+    #[test]
+    fn confidential_pod_gets_agent_node_selector_when_configured() {
+        let agent_id = test_agent_id();
+        let key_id = format!("swarm/agents/{agent_id}/state-key");
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            storage_encryption: StorageEncryption::Sealed { key_id },
+            ..test_spec(&agent_id)
+        };
+        let mut config = SchedulerConfig::default();
+        config
+            .agent_node_selector
+            .insert("aura.swarm/pool".to_string(), "tee".to_string());
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        // The kata shim is pinned to the dedicated peer-pods pool.
+        let sel = pod_spec
+            .node_selector
+            .as_ref()
+            .expect("confidential pod should carry the configured node selector");
+        assert_eq!(sel.get("aura.swarm/pool"), Some(&"tee".to_string()));
+    }
+
+    #[test]
+    fn container_pod_never_gets_agent_node_selector() {
+        let agent_id = test_agent_id();
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::Container),
+            ..test_spec(&agent_id)
+        };
+        let mut config = SchedulerConfig::default();
+        config
+            .agent_node_selector
+            .insert("aura.swarm/pool".to_string(), "tee".to_string());
+
+        let pod = build_pod(&agent_id, "user-hex", "dev-agent", &spec, &config);
+        let pod_spec = pod.spec.as_ref().unwrap();
+
+        // Dev-mode (container) pods run on the default runtime and must not be
+        // pinned to the confidential pool.
+        assert!(pod_spec.runtime_class_name.is_none());
+        assert!(pod_spec.node_selector.is_none());
     }
 
     #[test]

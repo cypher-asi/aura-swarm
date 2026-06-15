@@ -145,12 +145,12 @@ fi
 # workers must carry that label or it stays at 0 desired (and the readiness
 # check below never passes). Label them before installing.
 if [[ -n "${CAA_WORKER_NODE_SELECTOR}" ]]; then
-    log_info "Labeling nodes (-l ${CAA_WORKER_NODE_SELECTOR}) with node.kubernetes.io/worker=..."
-    kubectl label nodes -l "${CAA_WORKER_NODE_SELECTOR}" node.kubernetes.io/worker="" --overwrite >/dev/null
+    log_info "Labeling nodes (-l ${CAA_WORKER_NODE_SELECTOR}) with node.kubernetes.io/worker= (CAA daemonset placement)..."
 else
     log_info "Labeling all nodes with node.kubernetes.io/worker= (CAA daemonset placement)..."
-    kubectl label nodes --all node.kubernetes.io/worker="" --overwrite >/dev/null
 fi
+# Idempotent reconcile (covers the dedicated TEE pool + any late-joiner node).
+ensure_worker_labels
 
 # peerpods chart value keys: provider + env-style providerConfigs.aws.* (mirrors
 # the chart's providers/aws.yaml). --set-string keeps AMI ids / ports / bools as

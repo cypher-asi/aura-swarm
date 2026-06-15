@@ -274,6 +274,57 @@ resource "aws_eks_node_group" "main" {
 }
 
 #------------------------------------------------------------------------------
+# EKS Managed Node Group - Dedicated TEE (Peer Pods) pool
+#
+# A second, clean pool that hosts NEW confidential agents (kata-remote shim +
+# agent-protocol-forwarder; the SEV-SNP workload runs off-cluster in a pod VM).
+# The scheduler pins confidential pods here via AGENT_NODE_SELECTOR
+# (aura.swarm/pool=tee), so new agents get their own kata.peerpods.io/vm
+# headroom and a clean guest-pull image cache, isolated from the shared
+# `${resource_prefix}-node-group` pool (which is left untouched). The
+# `aura.swarm/pool=tee` label is EKS-applied to EVERY node in this group,
+# including replacements/scale-ups, so placement never depends on the one-time
+# imperative labeling that left late-joiners blind. CAA/guest-pull/fuse still
+# land here via the `node.kubernetes.io/worker` label applied by
+# ./03-coco-operator.sh (which labels all worker nodes).
+#------------------------------------------------------------------------------
+
+resource "aws_eks_node_group" "tee" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = var.tee_node_group_name
+  node_role_arn   = data.aws_iam_role.node_group.arn
+  subnet_ids      = var.agent_subnet_ids
+
+  instance_types = [var.tee_node_instance_type]
+  capacity_type  = "ON_DEMAND"
+
+  # Same containerd-1.7.x pin as the system pool — required for kata-remote
+  # guest pull (see var.node_ami_release_version).
+  release_version = var.node_ami_release_version != "" ? var.node_ami_release_version : null
+
+  disk_size = var.node_disk_size
+
+  scaling_config {
+    desired_size = var.tee_node_desired_count
+    min_size     = var.tee_node_min_count
+    max_size     = var.tee_node_max_count
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  labels = {
+    role              = "tee"
+    "aura.swarm/pool" = "tee"
+  }
+
+  tags = merge(var.tags, {
+    Name = var.tee_node_group_name
+  })
+}
+
+#------------------------------------------------------------------------------
 # EKS Addons
 #------------------------------------------------------------------------------
 

@@ -4,6 +4,7 @@ use aura_swarm_core::AgentId;
 use aura_swarm_store::IsolationLevel;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Status of a pod in Kubernetes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +148,14 @@ pub struct SchedulerConfig {
     /// receive this variable.
     #[serde(default = "default_kbs_url")]
     pub kbs_url: String,
+    /// Node selector applied to confidential (`kata-remote`) agent pods so
+    /// they land on a dedicated peer-pods worker pool (e.g. the clean
+    /// `aura-swarm-tee-hosts` node group) instead of competing for VM slots
+    /// on the shared pool. Empty (the default) means no selector, preserving
+    /// the prior "land on any worker" behaviour. Container (dev-mode) pods
+    /// never receive it.
+    #[serde(default)]
+    pub agent_node_selector: BTreeMap<String, String>,
 }
 
 fn default_kbs_url() -> String {
@@ -172,8 +181,26 @@ impl Default for SchedulerConfig {
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
             kbs_url: default_kbs_url(),
+            agent_node_selector: BTreeMap::new(),
         }
     }
+}
+
+/// Parse a `key=value[,key2=value2...]` selector string into a map.
+///
+/// Whitespace around keys/values is trimmed; entries without a `=` or with an
+/// empty key are skipped. Used for the `AGENT_NODE_SELECTOR` env var.
+fn parse_node_selector(raw: &str) -> BTreeMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
 }
 
 impl SchedulerConfig {
@@ -207,6 +234,9 @@ impl SchedulerConfig {
     /// - `GATEWAY_TOKEN`: legacy name for `INTERNAL_TOKEN`
     /// - `KBS_URL`: Trustee KBS URL injected into confidential agent pods
     ///   as `AURA_KBS_URL`
+    /// - `AGENT_NODE_SELECTOR`: `key=value[,key2=value2]` node selector applied
+    ///   to confidential (`kata-remote`) pods so they land on a dedicated
+    ///   peer-pods pool (e.g. `aura.swarm/pool=tee`)
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -275,6 +305,9 @@ impl SchedulerConfig {
         }
         if let Ok(val) = std::env::var("KBS_URL") {
             config.kbs_url = val;
+        }
+        if let Ok(val) = std::env::var("AGENT_NODE_SELECTOR") {
+            config.agent_node_selector = parse_node_selector(&val);
         }
 
         config
@@ -346,6 +379,27 @@ mod tests {
             config.kbs_url,
             "http://kbs.swarm-system.svc.cluster.local:8080"
         );
+    }
+
+    #[test]
+    fn parse_node_selector_handles_pairs_and_garbage() {
+        let m = parse_node_selector("aura.swarm/pool=tee");
+        assert_eq!(m.get("aura.swarm/pool"), Some(&"tee".to_string()));
+        assert_eq!(m.len(), 1);
+
+        let m = parse_node_selector(" a = 1 , b=2 ,,nope, c=");
+        assert_eq!(m.get("a"), Some(&"1".to_string()));
+        assert_eq!(m.get("b"), Some(&"2".to_string()));
+        assert_eq!(m.get("c"), Some(&String::new()));
+        assert!(!m.contains_key("nope"));
+        assert_eq!(m.len(), 3);
+
+        assert!(parse_node_selector("").is_empty());
+    }
+
+    #[test]
+    fn scheduler_config_default_has_no_agent_node_selector() {
+        assert!(SchedulerConfig::default().agent_node_selector.is_empty());
     }
 
     #[test]

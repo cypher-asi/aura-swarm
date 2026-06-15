@@ -42,6 +42,17 @@ require_cmds aws kubectl jq curl docker git openssl
 require_aws_auth
 ensure_kubectl_context
 
+# Reconcile worker labels up front so the CAA/guest-pull/fuse DaemonSets land on
+# EVERY worker — the dedicated TEE pool and any late-joiner node that the
+# one-time ./03 labeling missed — and advertise kata.peerpods.io/vm before the
+# headroom gate below runs. Best-effort, read-mostly (idempotent label).
+ensure_worker_labels
+UNLABELED_WORKERS="$(peerpods_unlabeled_workers || true)"
+if [[ -n "${UNLABELED_WORKERS}" ]]; then
+    log_warn "Node(s) in a managed node group still missing node.kubernetes.io/worker after reconcile (no CAA / 0 VM capacity):"
+    printf '%s\n' "${UNLABELED_WORKERS}" | sed 's/^/    /'
+fi
+
 if [[ "${SKIP_TEST_AGENT}" != "true" ]]; then
     ensure_smoke_test_token \
         || step_fail "test-agent verification needs an owner session: log in when prompted, set SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD, provide SMOKE_TEST_TOKEN, or pass --skip-test-agent"
@@ -126,6 +137,23 @@ if [[ "${SKIP_TEST_AGENT}" == "true" ]]; then
     log_warn "Skipping test-agent verification (--skip-test-agent)"
 else
     echo ""
+
+    # Fail fast: if the confidential pool has no kata.peerpods.io/vm headroom, a
+    # new agent can NEVER be scheduled — so bail now (read-only, instant) instead
+    # of creating a billable agent and waiting ~2min for the scheduler to give
+    # up. New agents are pinned to the pool by AGENT_NODE_SELECTOR, so check that
+    # exact pool. (Set AGENT_NODE_SELECTOR="" to check all workers.)
+    HEADROOM_SELECTOR="${AGENT_NODE_SELECTOR:-node.kubernetes.io/worker}"
+    [[ -z "${HEADROOM_SELECTOR}" ]] && HEADROOM_SELECTOR="node.kubernetes.io/worker"
+    log_info "Checking kata.peerpods.io/vm headroom (pool selector: ${HEADROOM_SELECTOR})..."
+    HEADROOM_OUT="$(peerpods_vm_headroom "${HEADROOM_SELECTOR}")"; HEADROOM_RC=$?
+    printf '%s\n' "${HEADROOM_OUT}"
+    case "${HEADROOM_RC}" in
+        0) log_ok "Confidential pool has free kata.peerpods.io/vm slot(s)" ;;
+        2) step_fail "no nodes match the confidential pool selector '${HEADROOM_SELECTOR}'. Is the ${TEE_NODE_GROUP_NAME:-aura-swarm-tee-hosts} node group up and labelled node.kubernetes.io/worker? Run ./02-snp-node-group.sh then ./03-coco-operator.sh." ;;
+        *) step_fail "confidential pool has 0 free kata.peerpods.io/vm slot(s) — a new agent cannot schedule (the failed/stuck count above is reclaimable). Reclaim slots (delete stuck/failed kata-remote pods) or grow the pool (TEE_NODE_DESIRED_COUNT / CAA_PEERPODS_LIMIT_PER_NODE), then re-run. Diagnose with ./peerpods-doctor.sh (vm-headroom)." ;;
+    esac
+
     gw_start_port_forward || step_fail "gateway port-forward failed"
 
     ensure_owner_test_agent \

@@ -109,7 +109,13 @@ pod_is_ready() { # <pod>
 
 host_exec() { # <pod> <cmd...>
     local pod="$1"; shift
-    MSYS_NO_PATHCONV=1 kubectl -n "${CAA_NS}" exec "${pod}" -- \
+    # Hard-bound the exec: a node whose containerd is wedged (e.g. mid
+    # CreateContainerError storm) makes `containerd config dump` / `ctr` block
+    # forever, which used to hang the whole read-only doctor (and survive
+    # Ctrl-C in Git-Bash). `timeout -k` force-kills the client so the layer
+    # degrades to SKIP/FAIL instead of hanging. Tune via DOCTOR_EXEC_TIMEOUT_SECS.
+    MSYS_NO_PATHCONV=1 timeout -k 5 "${DOCTOR_EXEC_TIMEOUT_SECS:-25}" \
+        kubectl -n "${CAA_NS}" exec "${pod}" -- \
         nsenter -t 1 -m -u -i -n -p -- "$@" 2>/dev/null
 }
 
@@ -175,6 +181,31 @@ if [[ "${CAP_TOTAL:-0}" -ge 1 && "${CAP_OK:-0}" -eq "${CAP_TOTAL:-0}" ]]; then
 else
     record "vm-capacity" FAIL "${CAP_OK:-0}/${CAP_TOTAL:-0} workers advertise kata.peerpods.io/vm; re-run ./03-coco-operator.sh"
     peerpods_node_capacity_summary
+fi
+
+# vm-headroom: vm-capacity only proves nodes ADVERTISE slots; this proves a slot
+# is actually FREE. A pool can advertise 10/node yet be 100% consumed — often by
+# failed/stuck pods squatting slots they will never use — so new agents go
+# Unschedulable "Insufficient kata.peerpods.io/vm". This is the false-green the
+# plain capacity check missed.
+HEADROOM_TXT="$(peerpods_vm_headroom node.kubernetes.io/worker)"; HEADROOM_RC=$?
+case "${HEADROOM_RC}" in
+    0) record "vm-headroom" PASS "$(printf '%s' "${HEADROOM_TXT}" | awk '/TOTAL/{sub(/^[[:space:]]+/,"");print;exit}')" ;;
+    2) record "vm-headroom" SKIP "no workers advertise kata.peerpods.io/vm" ;;
+    *) record "vm-headroom" FAIL "0 free kata.peerpods.io/vm slots — new agents cannot schedule. Reclaim failed/stuck pods (below) or grow the pool (TEE_NODE_DESIRED_COUNT / CAA_PEERPODS_LIMIT_PER_NODE)"
+       printf '%s\n' "${HEADROOM_TXT}" | indent ;;
+esac
+
+# worker-labels: nodes that belong to a managed node group but never got the
+# node.kubernetes.io/worker label (late-joiners after ./03's one-time labeling)
+# get no CAA pod and advertise zero capacity — invisible dead weight the plain
+# capacity check (which filters on that very label) cannot see.
+UNLABELED_NODES="$(peerpods_unlabeled_workers || true)"
+if [[ -z "${UNLABELED_NODES}" ]]; then
+    record "worker-labels" PASS "all node-group nodes carry node.kubernetes.io/worker"
+else
+    record "worker-labels" FAIL "node(s) in a node group missing node.kubernetes.io/worker (no CAA -> 0 VM capacity). Re-run ./03-coco-operator.sh (or ./07 self-heals via ensure_worker_labels)"
+    printf '%s\n' "${UNLABELED_NODES}" | sed 's/^/    /'
 fi
 
 #------------------------------------------------------------------------------
