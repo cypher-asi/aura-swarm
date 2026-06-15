@@ -1144,13 +1144,16 @@ agent_status() {
     gw_user_api GET "/v1/agents/$1" 2>/dev/null | jq -r '.status // empty' 2>/dev/null
 }
 
-# Wait for an agent's pod to reach Running. Logs progress each poll (no more
-# silent hang) AND bails early (return 2) the moment the agent record flips to
-# `error`, so the caller surfaces the recorded reason at ~120s instead of
-# burning the whole timeout. Returns 0 Running, 1 timeout, 2 agent errored.
+# Wait for an agent's pod to reach Running AND Ready (the in-guest harness is
+# serving its /health readiness probe — not merely phase=Running, which a
+# peer-pod hits as soon as the VM/sandbox boots, before the harness can pull,
+# attest, and unseal state). Logs progress each poll (no more silent hang) AND
+# bails early (return 2) the moment the agent record flips to `error`, so the
+# caller surfaces the recorded reason at ~120s instead of burning the whole
+# timeout. Returns 0 Running+Ready, 1 timeout, 2 agent errored.
 # Args: agent_id [timeout=600] [poll=15]
 wait_agent_running() {
-    local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase status detail waiting ev
+    local agent_id="$1" timeout="${2:-600}" poll="${3:-15}" elapsed=0 pod phase ready status detail waiting ev
     # Bail early when the pod is Unschedulable for lack of kata.peerpods.io/vm:
     # that is resource exhaustion, NOT a transient condition, so it will never
     # self-heal within the timeout. Fail after a short grace instead of burning
@@ -1159,16 +1162,26 @@ wait_agent_running() {
     while [[ ${elapsed} -le ${timeout} ]]; do
         pod="$(agent_pod_name "${agent_id}")"
         phase=""
+        ready=""
         detail=""
         if [[ -n "${pod}" ]]; then
             phase=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
                 -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            if [[ "${phase}" == "Running" ]]; then
-                log_ok "Agent ${agent_id} pod ${pod} reached Running (after ${elapsed}s)"
+            # Require the container to be Ready, not just the pod phase Running.
+            # A peer-pod reaches phase=Running once the VM/sandbox is up, but the
+            # in-guest harness only passes its /health readiness probe once it has
+            # pulled its image, attested, and fetched the sealed-state DEK. Gating
+            # solely on phase reports a non-serving agent as "Running" and masks
+            # the failure for every harness-proxied check (secrets/logs/processes).
+            ready=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
+                -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+            if [[ "${phase}" == "Running" && "${ready}" == "true" ]]; then
+                log_ok "Agent ${agent_id} pod ${pod} reached Running+Ready (after ${elapsed}s)"
                 return 0
             fi
             # Live cause: the container's waiting reason + the pod's latest event
-            # (FailedScheduling / FailedCreatePodSandBox / Pulling / ...).
+            # (FailedScheduling / FailedCreatePodSandBox / Pulling / readiness
+            # probe failures while phase=Running but not yet Ready / ...).
             waiting=$(kubectl get pod "${pod}" -n "${K8S_NAMESPACE_AGENTS}" \
                 -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
             ev="$(pod_latest_event "${pod}")"
@@ -1188,7 +1201,7 @@ wait_agent_running() {
         else
             unsched_secs=0
         fi
-        log_progress "[${elapsed}s] agent ${agent_id} status=${status:-?} pod=${pod:-none} phase=${phase:-none}${detail}"
+        log_progress "[${elapsed}s] agent ${agent_id} status=${status:-?} pod=${pod:-none} phase=${phase:-none} ready=${ready:-?}${detail}"
         sleep "${poll}"
         elapsed=$((elapsed + poll))
     done

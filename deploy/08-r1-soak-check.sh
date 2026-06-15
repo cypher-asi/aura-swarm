@@ -9,7 +9,8 @@
 #   fleet-read-only   tiered agents on kata-remote, legacy agents on
 #                     kata-fc, no error-state regressions
 #   test-agent        designated owner agent lands on kata-remote with sealed
-#                     env; on failure, root-cause diagnostics are dumped
+#                     env and a Ready (serving) harness; on failure, root-cause
+#                     diagnostics are dumped
 #   vault             PUT / GET(reveal) / LIST / DELETE secrets round-trip
 #   tier-change       standard -> pro -> standard with pod recreate
 #   cron-cycle        process registration + hibernate -> cron/wake -> run
@@ -140,8 +141,9 @@ fi
 log_section "[3/8] test-agent"
 # Reuse the designated owner agent by default (step 07 creates+keeps it); an
 # explicit --agent-id overrides. ensure_owner_test_agent discovers it by name,
-# creates+keeps one if missing, waits for Running, and on failure dumps
-# root-cause diagnostics (pod events + scheduler error_message + CAA health).
+# creates+keeps one if missing, waits for Running+Ready (harness serving
+# /health), and on failure dumps root-cause diagnostics (pod events +
+# scheduler error_message + CAA health).
 # The gateway port-forward from [1/8] is still up for the user-API calls.
 AGENT_UP=false
 if [[ -n "${TEST_AGENT_ID}" ]]; then
@@ -161,13 +163,20 @@ elif [[ "${AGENT_UP}" == "true" ]]; then
     RC=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o jsonpath='{.spec.runtimeClassName}')
     SEALED=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" -o json \
         | jq -r '[.spec.containers[0].env[]? | select(.name=="AURA_STATE_ENCRYPTION") | .value] | first // ""')
-    if [[ "${RC}" == "kata-remote" && "${SEALED}" == "sealed" ]]; then
-        record "test-agent" PASS "agent ${TEST_AGENT_ID} on kata-remote, sealed"
+    # The harness must be serving (container Ready / readiness probe passing on
+    # /health), not just the pod phase Running — otherwise every harness-proxied
+    # check below (vault/logs/cron) fails against a pod that only looks alive.
+    # wait_agent_running already gates on this; assert it here so the verdict is
+    # explicit even when an externally-supplied --agent-id is reused.
+    READY=$(kubectl get pod "${POD}" -n "${K8S_NAMESPACE_AGENTS}" \
+        -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+    if [[ "${RC}" == "kata-remote" && "${SEALED}" == "sealed" && "${READY}" == "true" ]]; then
+        record "test-agent" PASS "agent ${TEST_AGENT_ID} on kata-remote, sealed, harness Ready"
     else
-        record "test-agent" FAIL "runtime_class=${RC} sealed=${SEALED}"
+        record "test-agent" FAIL "runtime_class=${RC} sealed=${SEALED} ready=${READY:-?}"
     fi
 else
-    record "test-agent" FAIL "agent ${TEST_AGENT_ID} never reached Running (diagnostics above)"
+    record "test-agent" FAIL "agent ${TEST_AGENT_ID} never reached Running+Ready (diagnostics above)"
 fi
 
 #------------------------------------------------------------------------------
