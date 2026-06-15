@@ -138,13 +138,14 @@ else
     record "platform" FAIL "not ready: ${PLAT_BAD}"
 fi
 
-# runtimeclass: kata-remote exists + overhead zero.
+# runtimeclass: kata-remote EXISTS. This is a genuine prerequisite, so it stays
+# early in the dependency order. The OVERHEAD-zero sub-check is a DOWNSTREAM
+# scheduling concern (it is only zeroed by ./03 AFTER the CAA daemonset is Ready),
+# so it is probed as a separate `runtimeclass-overhead` layer AFTER caa-daemonset
+# below — otherwise a non-zero overhead (the normal state when ./03 aborted at the
+# CAA gate) is mis-ranked as the earliest/root failing layer.
 if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
-    if kata_remote_overhead_is_zero; then
-        record "runtimeclass" PASS "kata-remote exists, overhead zero"
-    else
-        record "runtimeclass" FAIL "non-zero overhead $(kata_remote_overhead) (scheduler adds it -> 'Insufficient cpu'); re-run ./03-coco-operator.sh"
-    fi
+    record "runtimeclass" PASS "kata-remote RuntimeClass exists"
 else
     record "runtimeclass" FAIL "RuntimeClass kata-remote missing; run ./03-coco-operator.sh"
 fi
@@ -158,6 +159,26 @@ if [[ "${DS_DESIRED:-0}" -ge 1 && "${DS_READY:-0}" -eq "${DS_DESIRED:-0}" ]]; th
 else
     record "caa-daemonset" FAIL "${DS_READY:-0}/${DS_DESIRED:-0} Ready"
     dump_daemonset_diagnostics "${CAA_NS}" "${CAA_DS}"
+fi
+
+# runtimeclass-overhead: the kata-remote RuntimeClass must carry ZERO pod
+# overhead. The scheduler ADDS .overhead.podFixed to every kata-remote pod's
+# effective requests, so a non-zero overhead makes (otherwise 0-cpu) peer-pod
+# agents go Unschedulable "Insufficient cpu". This is checked AFTER caa-daemonset
+# on purpose: ./03 only zeros the overhead once the CAA daemonset is Ready (it
+# step_fails at the readiness gate before reaching the zeroing step), so a
+# non-zero overhead is almost always a SYMPTOM of an unhealthy caa-daemonset, not
+# the root cause — fix caa-daemonset first.
+if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
+    if kata_remote_overhead_is_zero; then
+        record "runtimeclass-overhead" PASS "overhead zero (peer-pods schedules via kata.peerpods.io/vm)"
+    elif [[ "${DS_DESIRED:-0}" -ge 1 && "${DS_READY:-0}" -ne "${DS_DESIRED:-0}" ]]; then
+        record "runtimeclass-overhead" FAIL "non-zero overhead $(kata_remote_overhead) (scheduler adds it -> 'Insufficient cpu'). This is downstream of the failing caa-daemonset (./03 zeros it only AFTER CAA is Ready) — fix caa-daemonset first."
+    else
+        record "runtimeclass-overhead" FAIL "non-zero overhead $(kata_remote_overhead) (scheduler adds it -> 'Insufficient cpu'). Re-run ./03-coco-operator.sh, or patch it directly: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
+    fi
+else
+    record "runtimeclass-overhead" SKIP "RuntimeClass kata-remote missing (see runtimeclass)"
 fi
 
 # webhook: peer-pods mutating webhook effective.
@@ -463,12 +484,23 @@ for node in "${NODES[@]}"; do
     if [[ -z "${CAA_POD}" ]]; then
         record "${short}/caa-log" SKIP "no CAA pod found on node"
     else
-        CAA_LOG="$(kubectl -n "${CAA_NS}" logs "${CAA_POD}" --tail=200 2>/dev/null || true)"
-        SIGS="$(printf '%s\n' "${CAA_LOG}" | grep -iE 'RunInstances|UnauthorizedOperation|AccessDenied|InsufficientInstanceCapacity|attestation .*fail|failed to create|bind: address already in use|no such file or directory' | grep -ivE 'level=(debug|info)' | tail -5 || true)"
+        # Scan BOTH the current and the previous (pre-restart) logs: a CAA pod
+        # that CrashLooped or was clean-restarted moves the real fatal line (e.g.
+        # an InsufficientFreeAddressesInSubnet from a failed RunInstances, or the
+        # in-guest CDH ECR auth failure forwarded by the proxy) into --previous,
+        # where a current-only scan would miss it and falsely report "no
+        # signatures". The signature set covers pod-VM launch (RunInstances /
+        # capacity / address exhaustion), IAM/auth (UnauthorizedOperation /
+        # AccessDenied), the in-guest image guest-pull (Image Pull error / Not
+        # authorized / image_guest_pull), attestation/CDH (Get Resource failed),
+        # and host wiring (port bind / missing socket).
+        CAA_LOG="$(kubectl -n "${CAA_NS}" logs "${CAA_POD}" --tail=200 2>/dev/null; \
+                   kubectl -n "${CAA_NS}" logs "${CAA_POD}" --previous --tail=200 2>/dev/null || true)"
+        SIGS="$(printf '%s\n' "${CAA_LOG}" | grep -iE 'RunInstances|UnauthorizedOperation|AccessDenied|InsufficientInstanceCapacity|InsufficientFreeAddressesInSubnet|Image Pull error|Not authorized|image_guest_pull|Get Resource failed|attestation .*fail|failed to create|bind: address already in use|no such file or directory' | grep -ivE 'level=(debug|info)' | sort -u | tail -8 || true)"
         if [[ -z "${SIGS}" ]]; then
-            record "${short}/caa-log" PASS "no known fatal signatures in the CAA log (last 200 lines)"
+            record "${short}/caa-log" PASS "no known fatal signatures in the CAA log (current + previous, last 200 lines each)"
         else
-            record "${short}/caa-log" FAIL "CAA log on ${short} shows error signature(s) (last lines below)"
+            record "${short}/caa-log" FAIL "CAA log on ${short} shows error signature(s) (current + previous; lines below)"
             printf '%s\n' "${SIGS}" | sed 's/^/    /'
         fi
     fi

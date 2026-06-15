@@ -1653,11 +1653,12 @@ dump_daemonset_diagnostics() {
                   | select((.metadata.ownerReferences // [])[]?.name == $ds)
                   | .metadata.name
                 ][0:3][]
-              end' 2>/dev/null || echo "")
+              end' 2>/dev/null | tr -d '\r' || echo "")
     if [[ -z "${pods}" ]]; then
         log_detail "No pods found for daemonset ${ds}"
     fi
     while IFS= read -r pod; do
+        pod="${pod%$'\r'}"
         [[ -z "${pod}" ]] && continue
         log_detail "Pod summary for ${pod}:"
         kubectl -n "${ns}" get pod "${pod}" \

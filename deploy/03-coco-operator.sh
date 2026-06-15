@@ -275,6 +275,58 @@ if [[ -n "${CAA_ROLE_ARN}" ]]; then
 fi
 echo ""
 
+# Verify: the kata-remote RuntimeClass exists, then zero its pod overhead.
+#
+# This runs RIGHT AFTER the helm apply and BEFORE the CAA readiness/socket/
+# capacity gates below ON PURPOSE. The RuntimeClass is created by the chart's
+# bundled kata-deploy and the overhead is a property of that RuntimeClass — it
+# does NOT depend on the CAA daemonset pods being Ready. If the gates ran first
+# and step_fail'd on a partially-degraded fleet (e.g. an exhausted pod-VM subnet
+# or an ECR guest-pull failure keeping pods 0/1), this step would never run and
+# the overhead would stay non-zero — which the doctor then mis-reports as the
+# root cause. Doing it here means a re-run of ./03 always re-zeros the overhead,
+# even while the CAA fleet is still being remediated.
+#
+# We delete the RuntimeClass before the upgrade (field-ownership reset above) and
+# kata-deploy recreates it ASYNCHRONOUSLY, so poll rather than check once — a
+# one-shot check races kata-deploy and spuriously fails right after a fresh
+# install.
+KR_RC_DEADLINE=$((SECONDS + ${KATA_REMOTE_RC_WAIT_SECS:-180}))
+until kubectl get runtimeclass kata-remote >/dev/null 2>&1; do
+    if (( SECONDS >= KR_RC_DEADLINE )); then
+        step_fail "RuntimeClass kata-remote does not exist ${KATA_REMOTE_RC_WAIT_SECS:-180}s after the CAA install — kata-deploy did not (re)create it. Check the kata-deploy pods: kubectl -n ${CAA_NAMESPACE} get pods | grep kata-deploy"
+    fi
+    log_progress "waiting for kata-deploy to (re)create the kata-remote RuntimeClass..."
+    sleep 5
+done
+log_ok "RuntimeClass kata-remote exists"
+
+# Zero the kata-remote RuntimeClass pod overhead.
+#
+# Peer Pods scheduling goes through the kata.peerpods.io/vm extended resource
+# (the webhook strips a pod's cpu/memory and requests kata.peerpods.io/vm:1).
+# But kata-deploy stamps a DEFAULT kata overhead (podFixed cpu/memory) on the
+# kata-remote RuntimeClass, and the scheduler ADDS that overhead to every
+# kata-remote pod's effective requests. On a busy node pool that makes pods go
+# Unschedulable "Insufficient cpu" even though their containers request 0 cpu
+# (the real compute runs off-cluster in the pod VM). Scheduling must rely solely
+# on the extended resource, so zero the overhead. kata-deploy re-stamps it on
+# each install, so this is re-applied here every run.
+CURRENT_OVERHEAD="$(kubectl get runtimeclass kata-remote -o jsonpath='{.overhead.podFixed}' 2>/dev/null || true)"
+if [[ -n "${CURRENT_OVERHEAD}" && "${CURRENT_OVERHEAD}" != '{"cpu":"0","memory":"0"}' && "${CURRENT_OVERHEAD}" != "map[cpu:0 memory:0]" ]]; then
+    if kubectl patch runtimeclass kata-remote --type=merge \
+        -p '{"overhead":{"podFixed":{"cpu":"0","memory":"0"}}}' >/dev/null 2>&1; then
+        log_ok "Zeroed kata-remote RuntimeClass overhead (was ${CURRENT_OVERHEAD}; peer-pods schedules via kata.peerpods.io/vm)"
+    else
+        log_warn "Could not patch the kata-remote RuntimeClass overhead (${CURRENT_OVERHEAD})."
+        log_detail "kata-remote pods may go Unschedulable 'Insufficient cpu' on a busy pool; add node CPU or"
+        log_detail "patch it manually: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
+    fi
+else
+    log_ok "kata-remote RuntimeClass overhead already zero (scheduling via kata.peerpods.io/vm)"
+fi
+echo ""
+
 # Verify: CAA daemonset Ready on the workers — fails fast on CrashLoopBackOff
 # (e.g. missing AWS creds / IRSA not injected) instead of waiting the full timeout.
 # When only one healthy node is needed (CAA_HYPERVISOR_SOCKET_REQUIRE=one), accept
@@ -319,45 +371,6 @@ if [[ "${CAA_REQUIRE_HYPERVISOR_SOCKET:-true}" == "true" ]]; then
     kubectl -n ${CAA_NAMESPACE} logs <pod> | grep -iE 'hypervisor|socket|listen|bind|server started'
   (or set CAA_REQUIRE_HYPERVISOR_SOCKET=false to skip this guard)."
     fi
-fi
-
-# Verify: the kata-remote RuntimeClass exists. We delete it before the upgrade
-# (field-ownership reset above) and kata-deploy recreates it ASYNCHRONOUSLY, so
-# poll rather than check once — a one-shot check races kata-deploy and spuriously
-# fails right after a fresh install.
-KR_RC_DEADLINE=$((SECONDS + ${KATA_REMOTE_RC_WAIT_SECS:-180}))
-until kubectl get runtimeclass kata-remote >/dev/null 2>&1; do
-    if (( SECONDS >= KR_RC_DEADLINE )); then
-        step_fail "RuntimeClass kata-remote does not exist ${KATA_REMOTE_RC_WAIT_SECS:-180}s after the CAA install — kata-deploy did not (re)create it. Check the kata-deploy pods: kubectl -n ${CAA_NAMESPACE} get pods | grep kata-deploy"
-    fi
-    log_progress "waiting for kata-deploy to (re)create the kata-remote RuntimeClass..."
-    sleep 5
-done
-log_ok "RuntimeClass kata-remote exists"
-
-# Zero the kata-remote RuntimeClass pod overhead.
-#
-# Peer Pods scheduling goes through the kata.peerpods.io/vm extended resource
-# (the webhook strips a pod's cpu/memory and requests kata.peerpods.io/vm:1).
-# But kata-deploy stamps a DEFAULT kata overhead (podFixed cpu/memory) on the
-# kata-remote RuntimeClass, and the scheduler ADDS that overhead to every
-# kata-remote pod's effective requests. On a busy node pool that makes pods go
-# Unschedulable "Insufficient cpu" even though their containers request 0 cpu
-# (the real compute runs off-cluster in the pod VM). Scheduling must rely solely
-# on the extended resource, so zero the overhead. kata-deploy re-stamps it on
-# each install, so this is re-applied here every run.
-CURRENT_OVERHEAD="$(kubectl get runtimeclass kata-remote -o jsonpath='{.overhead.podFixed}' 2>/dev/null || true)"
-if [[ -n "${CURRENT_OVERHEAD}" && "${CURRENT_OVERHEAD}" != '{"cpu":"0","memory":"0"}' && "${CURRENT_OVERHEAD}" != "map[cpu:0 memory:0]" ]]; then
-    if kubectl patch runtimeclass kata-remote --type=merge \
-        -p '{"overhead":{"podFixed":{"cpu":"0","memory":"0"}}}' >/dev/null 2>&1; then
-        log_ok "Zeroed kata-remote RuntimeClass overhead (was ${CURRENT_OVERHEAD}; peer-pods schedules via kata.peerpods.io/vm)"
-    else
-        log_warn "Could not patch the kata-remote RuntimeClass overhead (${CURRENT_OVERHEAD})."
-        log_detail "kata-remote pods may go Unschedulable 'Insufficient cpu' on a busy pool; add node CPU or"
-        log_detail "patch it manually: kubectl patch runtimeclass kata-remote --type=merge -p '{\"overhead\":{\"podFixed\":{\"cpu\":\"0\",\"memory\":\"0\"}}}'"
-    fi
-else
-    log_ok "kata-remote RuntimeClass overhead already zero (scheduling via kata.peerpods.io/vm)"
 fi
 
 # Verify: when enabled, the peer-pods mutating webhook is actually registered.
