@@ -72,12 +72,13 @@ fi
 #------------------------------------------------------------------------------
 
 log_section "Cluster"
-if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
+if _kubectl_cluster_reachable; then
     log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME}"
     log_detail "Nodes:"
     kubectl get nodes -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[-1].type,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type,CONFIDENTIAL:.metadata.labels.swarm\.io/confidential-node' --no-headers \
         | indent
 else
+    [[ -n "${KUBECTL_PROBE_ERR}" ]] && log_detail "kubectl said: ${KUBECTL_PROBE_ERR}"
     fail_check "kubectl cannot reach ${EKS_CLUSTER_NAME} (try: aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME})"
 fi
 

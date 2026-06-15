@@ -318,20 +318,60 @@ ecr_login() {
     log_ok "Docker authenticated with ECR ($(ecr_registry))"
 }
 
+# Bounded, non-interactive cluster reachability + authorization probe. Returns 0
+# when kubectl can reach the API server AND list deployments in the system
+# namespace. On failure the real kubectl error is left in KUBECTL_PROBE_ERR so
+# callers can show WHY instead of hanging silently.
+#
+# Why this is not a bare `kubectl ... >/dev/null 2>&1`:
+#   - --request-timeout: bound the HTTP call so an unreachable/slow API endpoint
+#     fails fast instead of blocking forever with no output.
+#   - </dev/null: an EKS credential exec plugin (`aws eks get-token`) that waits
+#     on a TTY/stdin hangs indefinitely under Git-Bash/MINGW; never let it read
+#     stdin so it can't block.
+#   - outer `timeout`: --request-timeout does NOT bound the exec credential
+#     plugin, so wrap the whole call too (when `timeout` exists). The lib note
+#     warning against wrapping `kubectl exec` (false negatives in Git-Bash) is
+#     specific to exec, not to a plain `kubectl get`, so this is safe here.
+#   - `kubectl get` (not `auth can-i`): `auth can-i` was observed returning exit
+#     0 even on a connection-refused error, which would falsely report success;
+#     `get` returns non-zero on connection/auth failures.
+KUBECTL_PROBE_ERR=""
+_kubectl_cluster_reachable() {
+    local req_timeout="${1:-15s}" hard_timeout="${2:-25}"
+    local timeout_pfx=""
+    command -v timeout >/dev/null 2>&1 && timeout_pfx="timeout ${hard_timeout}"
+    KUBECTL_PROBE_ERR="$(${timeout_pfx} kubectl get deployments \
+        -n "${K8S_NAMESPACE_SYSTEM}" --request-timeout="${req_timeout}" \
+        </dev/null 2>&1 >/dev/null)"
+    local rc=$?
+    if [[ ${rc} -eq 124 ]]; then
+        KUBECTL_PROBE_ERR="timed out after ${hard_timeout}s (credential exec plugin or API endpoint not responding)"
+    fi
+    return ${rc}
+}
+
 # Verifies kubectl can talk to the deploy cluster; refreshes kubeconfig from
 # EKS once before failing (same recovery legacy 07-build-images.sh suggested).
 ensure_kubectl_context() {
-    if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
+    if _kubectl_cluster_reachable; then
         log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME}"
         return 0
     fi
     log_warn "kubectl cannot reach the cluster; refreshing kubeconfig..."
-    aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}" >/dev/null
-    if kubectl auth can-i get deployments -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1; then
+    [[ -n "${KUBECTL_PROBE_ERR}" ]] && log_detail "${KUBECTL_PROBE_ERR}"
+    local refresh_timeout=""
+    command -v timeout >/dev/null 2>&1 && refresh_timeout="timeout 60"
+    if ! ${refresh_timeout} aws eks update-kubeconfig \
+        --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}" </dev/null >/dev/null 2>&1; then
+        log_warn "aws eks update-kubeconfig did not complete (timed out or failed)"
+    fi
+    if _kubectl_cluster_reachable; then
         log_ok "kubectl authenticated to ${EKS_CLUSTER_NAME} (kubeconfig refreshed)"
         return 0
     fi
-    step_fail "kubectl cannot authenticate to ${EKS_CLUSTER_NAME} even after kubeconfig refresh"
+    [[ -n "${KUBECTL_PROBE_ERR}" ]] && log_detail "kubectl said: ${KUBECTL_PROBE_ERR}"
+    step_fail "kubectl cannot authenticate to ${EKS_CLUSTER_NAME} even after kubeconfig refresh (try: aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}; ensure your shell uses the SSO principal mapped in the cluster's EKS access entries)"
 }
 
 # `docker info` blocks indefinitely when the daemon is stopped or unreachable;
