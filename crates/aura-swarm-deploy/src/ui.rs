@@ -14,14 +14,32 @@ use ratatui::Frame;
 
 use crate::app::{App, Focus, ProgressItem, Screen};
 
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
+// Oxide cloud-shell inspired palette: green-on-dark.
+/// Near-black navy, the main canvas background.
+const BG: Color = Color::Rgb(11, 14, 20);
+/// Slightly lifted panel background for header/footer/title strips.
+const BG_PANEL: Color = Color::Rgb(18, 22, 30);
+/// Green-tinted selection row background.
+const BG_SEL: Color = Color::Rgb(28, 40, 34);
+/// Spring-green accent (replaces the old cyan everywhere).
+const ACCENT: Color = Color::Rgb(63, 207, 142);
+/// Brighter green for progress-bar fill and active accents.
+const ACCENT_BRIGHT: Color = Color::Rgb(74, 222, 128);
+/// Primary foreground text.
+const TEXT: Color = Color::Rgb(228, 231, 236);
+/// Muted secondary text.
+const DIM: Color = Color::Rgb(110, 118, 132);
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Top-level render entry point.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+
+    // Paint the whole canvas so unused cells use our dark navy, not the
+    // terminal default background.
+    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -47,7 +65,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let (status, status_style) = match app.screen {
         Screen::Picker => (
             "select a script".to_string(),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(DIM),
         ),
         Screen::Running => {
             let frame_i = SPINNER[app.spinner_tick % SPINNER.len()];
@@ -73,36 +91,46 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let script = app.running_script.as_deref().unwrap_or("");
-    let right = if script.is_empty() {
-        status.clone()
+
+    // Left label: "AURA SWARM DEPLOY". Right side shows the active script as a
+    // green underlined "tab" (echoing the WEB1 tab in the reference) plus
+    // run status.
+    let label_len = "AURA SWARM  DEPLOY ".len();
+    let tab = if script.is_empty() {
+        String::new()
     } else {
-        format!("{script}   {status}")
+        format!(" {script} ")
     };
-
+    let status_len = status.chars().count();
     let pad = (area.width as usize)
-        .saturating_sub("AURA SWARM  DEPLOY".len() + right.len() + 1);
+        .saturating_sub(label_len + tab.chars().count() + status_len + 2);
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
-            "AURA SWARM",
+            " AURA SWARM",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  DEPLOY", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(pad)),
         Span::styled(
-            if script.is_empty() {
-                String::new()
-            } else {
-                format!("{script}   ")
-            },
-            Style::default().fg(Color::Gray),
+            "  DEPLOY ",
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(status, status_style),
-        Span::raw(" "),
-    ]);
+        Span::raw(" ".repeat(pad)),
+    ];
+    if !tab.is_empty() {
+        spans.push(Span::styled(
+            tab,
+            Style::default()
+                .fg(ACCENT_BRIGHT)
+                .bg(BG_SEL)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(status, status_style));
+    spans.push(Span::raw(" "));
 
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::Rgb(28, 30, 38))),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL).fg(TEXT)),
         area,
     );
 }
@@ -120,13 +148,37 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Finished => "Enter/Esc: back to scripts   ↑/↓: scroll   q: quit",
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {hints}"),
-            Style::default().fg(Color::Gray),
-        )))
-        .style(Style::default().bg(Color::Rgb(20, 22, 28))),
+        Paragraph::new(Line::from(hint_spans(hints))).style(Style::default().bg(BG_PANEL)),
         area,
     );
+}
+
+/// Build footer hint spans, highlighting the key (text before each `:`) in the
+/// accent color for a shell-prompt feel: `Enter: run   q: quit`.
+fn hint_spans(hints: &str) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, segment) in hints.split("   ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", Style::default().fg(DIM)));
+        }
+        match segment.split_once(':') {
+            Some((key, rest)) => {
+                spans.push(Span::styled(
+                    key.to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(":{rest}"),
+                    Style::default().fg(DIM),
+                ));
+            }
+            None => spans.push(Span::styled(
+                segment.to_string(),
+                Style::default().fg(DIM),
+            )),
+        }
+    }
+    spans
 }
 
 // ---------------------------------------------------------------------------
@@ -146,9 +198,9 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<26}", s.file_name),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(s.title.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(s.title.clone(), Style::default().fg(DIM)),
             ]))
         })
         .collect();
@@ -166,11 +218,11 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(40, 44, 56))
-                .fg(ACCENT)
+                .bg(BG_SEL)
+                .fg(ACCENT_BRIGHT)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("❯ ");
 
     let mut state = ListState::default();
     if !app.scripts.is_empty() {
@@ -193,12 +245,22 @@ fn render_picker(frame: &mut Frame, app: &App, area: Rect) {
     let args_style = if app.args_input.is_empty() && !app.editing_args {
         Style::default().fg(DIM)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(TEXT)
     };
+    let prompt_style = Style::default()
+        .fg(if app.editing_args { ACCENT_BRIGHT } else { DIM })
+        .add_modifier(Modifier::BOLD);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(args_text, args_style))).block(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", prompt_style),
+            Span::styled(args_text, args_style),
+        ]))
+        .block(
             Block::default()
-                .title(args_title)
+                .title(Span::styled(
+                    args_title,
+                    Style::default().fg(if app.editing_args { ACCENT } else { DIM }),
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(if app.editing_args { ACCENT } else { DIM })),
         ),
@@ -234,10 +296,17 @@ fn render_progress(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = app.progress.iter().map(style_progress).collect();
     if running {
         let spin = SPINNER[app.spinner_tick % SPINNER.len()];
-        lines.push(Line::from(Span::styled(
-            format!("{spin} working…"),
-            Style::default().fg(Color::Yellow),
-        )));
+        let bar_len = 18usize;
+        // Indeterminate fill that cycles, echoing the reference progress bar.
+        let filled = (app.spinner_tick % (bar_len + 1)).min(bar_len);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{spin} working "), Style::default().fg(ACCENT)),
+            Span::styled("█".repeat(filled), Style::default().fg(ACCENT_BRIGHT)),
+            Span::styled(
+                "░".repeat(bar_len.saturating_sub(filled)),
+                Style::default().fg(DIM),
+            ),
+        ]));
     }
 
     let title = if running {
@@ -263,7 +332,7 @@ fn render_raw(frame: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .raw
         .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))))
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Rgb(176, 182, 194)))))
         .collect();
 
     let height = area.height.saturating_sub(2);
@@ -291,7 +360,7 @@ fn render_snapshot(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(body)
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(DIM))
             .block(pane_block(&title, false))
             .wrap(Wrap { trim: false }),
         area,
@@ -308,7 +377,7 @@ fn pane_block(title: &str, focused: bool) -> Block<'_> {
         .title(Span::styled(
             title.to_string(),
             Style::default()
-                .fg(if focused { ACCENT } else { Color::Gray })
+                .fg(if focused { ACCENT } else { DIM })
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -331,39 +400,43 @@ fn style_progress(item: &ProgressItem) -> Line<'static> {
     match item.level.as_str() {
         "banner" => Line::from(vec![
             Span::styled(
-                format!("◆ Step {} ", item.step),
+                format!("▌ Step {} ", item.step),
                 Style::default().fg(ACCENT).add_modifier(bold),
             ),
             Span::styled(
                 item.text.clone(),
-                Style::default().fg(Color::White).add_modifier(bold),
+                Style::default().fg(TEXT).add_modifier(bold),
             ),
         ]),
-        "section" => Line::from(Span::styled(
-            format!("◆ {}", item.text),
-            Style::default().fg(ACCENT).add_modifier(bold),
-        )),
-        "ok" => status_line("✓", Color::Green, &item.text, false),
-        "step_ok" => status_line("✓", Color::Green, &item.text, true),
+        "section" => Line::from(vec![
+            Span::styled("▌ ", Style::default().fg(ACCENT).add_modifier(bold)),
+            Span::styled(
+                item.text.clone(),
+                Style::default().fg(ACCENT).add_modifier(bold),
+            ),
+        ]),
+        "ok" => status_line("✓", ACCENT, &item.text, false),
+        "step_ok" => status_line("✓", ACCENT_BRIGHT, &item.text, true),
         "info" => status_line("ℹ", Color::Blue, &item.text, false),
         "warn" => status_line("⚠", Color::Yellow, &item.text, false),
         "err" => status_line("✗", Color::Red, &item.text, false),
         "step_fail" => status_line("✗", Color::Red, &item.text, true),
-        "cmd" => Line::from(Span::styled(
-            format!("  $ {}", item.text),
-            Style::default().fg(DIM),
-        )),
-        // detail / progress / kv and anything else: dim continuation text.
-        _ => Line::from(Span::styled(
-            format!("  {}", item.text),
-            Style::default().fg(DIM),
-        )),
+        "cmd" => Line::from(vec![
+            Span::styled("  ├ ", Style::default().fg(DIM)),
+            Span::styled("$ ", Style::default().fg(ACCENT)),
+            Span::styled(item.text.clone(), Style::default().fg(DIM)),
+        ]),
+        // detail / progress / kv and anything else: dim tree continuation.
+        _ => Line::from(vec![
+            Span::styled("  ├ ", Style::default().fg(DIM)),
+            Span::styled(item.text.clone(), Style::default().fg(DIM)),
+        ]),
     }
 }
 
 fn status_line(icon: &str, color: Color, text: &str, bold: bool) -> Line<'static> {
     let mut icon_style = Style::default().fg(color);
-    let mut text_style = Style::default().fg(Color::White);
+    let mut text_style = Style::default().fg(TEXT);
     if bold {
         icon_style = icon_style.add_modifier(Modifier::BOLD);
         text_style = text_style.add_modifier(Modifier::BOLD);
