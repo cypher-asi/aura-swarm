@@ -443,12 +443,14 @@ echo ""
 log_info "Ensuring the kata-remote host prerequisite (containerd guest-pull flags) on workers..."
 GUESTPULL_DS_MANIFEST="${DEPLOY_DIR}/k8s/coco-node-containerd-guestpull.yaml"
 [[ -f "${GUESTPULL_DS_MANIFEST}" ]] || step_fail "missing guest-pull installer manifest: ${GUESTPULL_DS_MANIFEST}"
-sed "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" "${GUESTPULL_DS_MANIFEST}" | kubectl apply -f - >/dev/null
+sed -e "s|__CAA_NAMESPACE__|${CAA_NAMESPACE}|g" \
+    -e "s|__KATA_CREATE_CONTAINER_TIMEOUT__|${KATA_CREATE_CONTAINER_TIMEOUT:-300}|g" \
+    "${GUESTPULL_DS_MANIFEST}" | kubectl apply -f - >/dev/null
 if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" "${CAA_INSTALL_TIMEOUT}"; then
     step_fail "the containerd guest-pull daemonset did not become Ready — kata-remote workload containers will be unpacked on the host and fail with 'content digest not found' (CreateContainerError).
   Inspect: kubectl -n ${CAA_NAMESPACE} logs ds/kata-remote-containerd-guestpull"
 fi
-log_ok "Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
+log_ok "Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false; kata-remote create_container_timeout=${KATA_CREATE_CONTAINER_TIMEOUT:-300}s)"
 
 # Re-trigger the guest-pull DaemonSet's incomplete-image self-heal. That heal
 # (evict WORKLOAD images whose layers were discarded before the flag flip, so the

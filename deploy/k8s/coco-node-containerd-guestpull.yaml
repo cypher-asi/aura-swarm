@@ -19,10 +19,14 @@
 # -> the kata-remote pod is stuck CreateContainerError.
 #
 # This privileged DaemonSet idempotently ensures both flags are false, restarts
-# containerd ONLY when it changed, and is a no-op once correct. As a DaemonSet it
-# also covers nodes added by future scale-ups. It targets the same workers as the
-# CAA daemonset (node.kubernetes.io/worker=""). Applied by ./03-coco-operator.sh
-# (namespace templated as __CAA_NAMESPACE__).
+# containerd ONLY when it changed, and is a no-op once correct. It ALSO raises the
+# kata-remote CreateContainer timeout (create_container_timeout) in the kata
+# configuration.toml so the in-guest pull of the large private harness image does
+# not blow kata's default 60s deadline ("CreateContainerRequest timed out"). As a
+# DaemonSet it also covers nodes added by future scale-ups. It targets the same
+# workers as the CAA daemonset (node.kubernetes.io/worker=""). Applied by
+# ./03-coco-operator.sh (namespace templated as __CAA_NAMESPACE__, the timeout as
+# __KATA_CREATE_CONTAINER_TIMEOUT__).
 #
 # IMPORTANT — how the flags are applied depends on the containerd config version:
 #   * v3 (containerd 2.x): the flags live under the SPLIT images plugin
@@ -263,6 +267,56 @@ spec:
                 echo "verified: kata-remote runtime present in the effective containerd config"
               else
                 echo "note: kata-remote runtime not in ${CONF} yet (kata-deploy may not have run on this node)"
+              fi
+
+              # Raise the kata-remote CreateContainer timeout. The WORKLOAD image
+              # is pulled+unpacked INSIDE the pod VM during CreateContainer (CoCo
+              # image_guest_pull), and kata's default (60s) is too short for the
+              # multi-hundred-MB private harness image on a cold pod VM. When it is
+              # exceeded the pod fails with
+              #   failed to create shim task: CreateContainerRequest timed out:
+              #   context deadline exceeded   (RunContainerError)
+              # and the agent never reaches Ready. Set create_container_timeout in
+              # the [runtime] table of the kata-remote configuration.toml that
+              # kata-deploy installs (its path is the kata-remote runtime's
+              # ConfigPath in the effective containerd config). kata reads this file
+              # per pod sandbox, so new agents pick it up WITHOUT a containerd
+              # restart; running pods are undisturbed. Idempotent: writes only when
+              # the value differs. Tunable via KATA_CREATE_CONTAINER_TIMEOUT (03).
+              KATA_CCT="__KATA_CREATE_CONTAINER_TIMEOUT__"
+              KATA_CONF="$(printf '%s' "$VERIFY" | awk '
+                /runtimes\.kata-remote\.options\]/{in_o=1; next}
+                in_o && /^[[:space:]]*\[/{in_o=0}
+                in_o && /ConfigPath[[:space:]]*=/{gsub(/.*=|["\x27[:space:]]/,"");print;exit}')"
+              if [ -n "$KATA_CCT" ] && [ -n "$KATA_CONF" ] && host sh -c "test -f '$KATA_CONF'"; then
+                KORIG="$(host cat "$KATA_CONF")"
+                # Replace create_container_timeout within [runtime] if present, else
+                # append it to that table; create [runtime] at EOF if it is absent.
+                KWORK="$(printf '%s\n' "$KORIG" | awk -v val="$KATA_CCT" '
+                  BEGIN{in_r=0;set=0;seen=0}
+                  {
+                    t=$0; sub(/^[ \t]+/,"",t); sub(/[ \t]+$/,"",t)
+                    if (t ~ /^\[/){
+                      if(in_r && !set){print "create_container_timeout = " val; set=1}
+                      if(t=="[runtime]"){in_r=1;seen=1}else{in_r=0}
+                      print; next
+                    }
+                    if(in_r && $0 ~ /^[ \t]*create_container_timeout[ \t]*=/){print "create_container_timeout = " val; set=1; next}
+                    print
+                  }
+                  END{
+                    if(in_r && !set){print "create_container_timeout = " val; set=1}
+                    if(!seen){print "[runtime]"; print "create_container_timeout = " val}
+                  }')"
+                if [ "$KWORK" != "$KORIG" ]; then
+                  host cp -n "$KATA_CONF" "${KATA_CONF}.coco-cct.bak" 2>/dev/null || true
+                  printf '%s\n' "$KWORK" | host tee "$KATA_CONF" >/dev/null
+                  echo "set create_container_timeout=${KATA_CCT}s in ${KATA_CONF} (new kata-remote pods pick it up on next sandbox start)"
+                else
+                  echo "kata-remote create_container_timeout already ${KATA_CCT}s in ${KATA_CONF}"
+                fi
+              else
+                echo "note: could not resolve kata-remote ConfigPath (or timeout unset); skipping create_container_timeout tune"
               fi
 
               # Self-heal WORKLOAD images whose layers were discarded BEFORE we
