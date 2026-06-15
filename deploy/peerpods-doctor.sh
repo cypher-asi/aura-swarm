@@ -351,7 +351,7 @@ sock_from_dump() { # <snap>; reads dump on stdin
 for node in "${NODES[@]}"; do
     [[ -z "${node}" ]] && continue
     short="${node%%.*}"
-    log_section "Node ${short}"
+    log_section "Node $(node_display "${node}")"
 
     GP_POD="$(guestpull_pod_on_node "${node}")"
     CAN_EXEC=false

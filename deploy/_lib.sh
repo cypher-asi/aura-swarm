@@ -1879,11 +1879,41 @@ peerpods_webhook_effective() {
     [[ "${cabundle:-0}" != "0" && "${eps:-0}" -ge 1 ]]
 }
 
+# Echo a consistent, human-readable label for a node, used everywhere the deploy
+# steps and the doctor name a node so the SAME node always reads the same way and
+# you can see what KIND of box it is at a glance:
+#   "<short-hostname>  [<instance-type> · <pool>]"
+# <instance-type> is the EC2 box type (node.kubernetes.io/instance-type, e.g.
+# m5.2xlarge); <pool> is aura.swarm/pool (e.g. tee) when set, else the EKS
+# nodegroup name, so the dedicated TEE pool is distinguishable from the shared
+# pool. Degrades to just the short hostname when kubectl/labels are unavailable.
+# One kubectl call; safe in tight loops (the doctor already exec's per node).
+node_display() {
+    local node="$1"
+    local short="${node%%.*}"
+    local meta itype pool ng tag
+    meta="$(kubectl get node "${node}" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}|{.metadata.labels.aura\.swarm/pool}|{.metadata.labels.eks\.amazonaws\.com/nodegroup}' 2>/dev/null | tr -d '\r')"
+    itype="${meta%%|*}"; meta="${meta#*|}"
+    pool="${meta%%|*}"; ng="${meta##*|}"
+    tag="${pool:-${ng}}"
+    if [[ -z "${itype}" && -z "${tag}" ]]; then
+        printf '%s' "${short}"
+        return 0
+    fi
+    local detail="${itype:-unknown}"
+    [[ -n "${tag}" ]] && detail="${detail} · ${tag}"
+    printf '%s  [%s]' "${short}" "${detail}"
+}
+
 # Print worker node peer-pod capacity/allocatable values. CAA advertises the
 # kata.peerpods.io/vm extended resource by patching nodes/status.
 peerpods_node_capacity_summary() {
     kubectl get nodes -l node.kubernetes.io/worker -o json 2>/dev/null \
-        | jq -r '.items[] | "    \(.metadata.name): capacity=\(.status.capacity["kata.peerpods.io/vm"] // "<none>") allocatable=\(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
+        | jq -r '.items[]
+            | .metadata.name as $n
+            | (.metadata.labels["node.kubernetes.io/instance-type"] // "?") as $it
+            | (.metadata.labels["aura.swarm/pool"] // .metadata.labels["eks.amazonaws.com/nodegroup"] // "") as $pool
+            | "    \($n | sub("\\..*$";"")) [\($it)\(if $pool=="" then "" else " · "+$pool end)]: capacity=\(.status.capacity["kata.peerpods.io/vm"] // "<none>") allocatable=\(.status.allocatable["kata.peerpods.io/vm"] // "<none>")"' 2>/dev/null || true
 }
 
 # Idempotently label worker nodes with node.kubernetes.io/worker="" so the CAA /
@@ -1940,10 +1970,12 @@ peerpods_vm_headroom() {
            | select(.vm > 0) ]) as $u
         | [ ($nodes[0].items // [])[]
             | .metadata.name as $name
+            | (.metadata.labels["node.kubernetes.io/instance-type"] // "?") as $itype
+            | (.metadata.labels["aura.swarm/pool"] // .metadata.labels["eks.amazonaws.com/nodegroup"] // "") as $pool
             | (((.status.allocatable["kata.peerpods.io/vm"] // "0") | tonumber? // 0)) as $cap
             | ([ $u[] | select(.node == $name) ]) as $on
             | (([ $on[] | .vm ] | add) // 0) as $used
-            | { name: $name, cap: $cap, used: $used,
+            | { name: $name, itype: $itype, pool: $pool, cap: $cap, used: $used,
                 healthy: (([ $on[] | select(.running) | .vm ] | add) // 0),
                 failed:  (([ $on[] | select(.running | not) | .vm ] | add) // 0),
                 free: ($cap - $used) } ]
@@ -1964,7 +1996,7 @@ peerpods_vm_headroom() {
     tfailed=$(printf '%s' "${out}" | jq -r '.total_failed // 0')
 
     printf '%s' "${out}" | jq -r '.nodes[]
-        | "    \(.name): used=\(.used)/\(.cap) free=\(.free) (healthy=\(.healthy) failed/stuck=\(.failed))"' 2>/dev/null || true
+        | "    \(.name | sub("\\..*$";"")) [\(.itype)\(if .pool=="" then "" else " · "+.pool end)]: used=\(.used)/\(.cap) free=\(.free) (healthy=\(.healthy) failed/stuck=\(.failed))"' 2>/dev/null || true
     printf '    TOTAL free=%s/%s (failed/stuck slots=%s) across %s node(s) [selector: %s]\n' \
         "${tfree}" "${tcap}" "${tfailed}" "${ncount}" "${selector}"
 
