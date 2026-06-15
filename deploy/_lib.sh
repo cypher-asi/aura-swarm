@@ -1681,6 +1681,26 @@ wait_daemonset_ready() {
             return 1
         fi
         log_progress "[${elapsed}s] ${ds} Ready: ${ready:-0}/${desired:-0}"
+        # Per-poll detail on each NOT-Ready owned pod (node + phase/reason +
+        # message) so the operator sees WHAT is blocking — pulling, unschedulable,
+        # ContainerCreating, crashlooping — and on which node, not just "3/6".
+        local notready
+        notready=$(kubectl -n "${ns}" get pods -o json 2>/dev/null | jq -r --arg ds "${ds}" '
+            .items[]
+            | select((.metadata.ownerReferences // [])[]?.name == $ds)
+            | select(((.status.conditions // []) | any(.type=="Ready" and .status=="True")) | not)
+            | (.status.containerStatuses // [])[0] as $cs
+            | ([.status.conditions[]? | select(.type=="PodScheduled")][0]) as $sc
+            | (.spec.nodeName // "<unscheduled>" | sub("\\..*";"")) as $node
+            | ($cs.state.waiting.reason
+                // (if ($cs.state.running) then "Running(not-ready)" else null end)
+                // $cs.state.terminated.reason
+                // $sc.reason
+                // .status.phase) as $reason
+            | ($cs.state.waiting.message // $sc.message // "") as $msg
+            | "        \(.metadata.name)  node=\($node)  \($reason)\(if ($msg|length)>0 then "  — " + ($msg[0:90]) else "" end)"
+          ' 2>/dev/null | head -6 || true)
+        [[ -n "${notready}" ]] && printf '%s\n' "${notready}"
         sleep "${poll}"; elapsed=$((elapsed + poll))
     done
     log_err "daemonset ${ds} not Ready (${ready:-0}/${desired:-0}) after ${timeout}s"
