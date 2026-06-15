@@ -458,6 +458,15 @@ fn build_security_context(isolation: IsolationLevel) -> PodSecurityContext {
         IsolationLevel::ConfidentialVM => PodSecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
+            // Set the primary GID explicitly so the effective user is "0:0".
+            // Confidential agents run as Peer Pods with guest pull, where the
+            // workload rootfs is materialized INSIDE the pod VM. If only
+            // run_as_user is set, containerd resolves the bare uid by
+            // host-mounting the (empty) guest-pull snapshot to read its GID from
+            // /etc/passwd and fails CreateContainer with "mount callback failed
+            // ... /etc/passwd: no such file or directory". Providing uid AND gid
+            // makes containerd use them directly and skip that host-side lookup.
+            run_as_group: Some(0),
             fs_group: Some(1000),
             ..Default::default()
         },
@@ -481,6 +490,10 @@ fn build_container_security_context(isolation: IsolationLevel) -> SecurityContex
         IsolationLevel::ConfidentialVM => SecurityContext {
             run_as_non_root: Some(false),
             run_as_user: Some(0),
+            // Mirror the pod-level "0:0" so containerd never host-mounts the
+            // guest-pull rootfs to resolve the uid's GID from /etc/passwd (which
+            // fails under Peer Pods guest pull; see build_security_context).
+            run_as_group: Some(0),
             allow_privilege_escalation: Some(true),
             ..Default::default()
         },
@@ -731,10 +744,15 @@ mod tests {
         let sec = pod_spec.security_context.as_ref().unwrap();
         assert_eq!(sec.run_as_non_root, Some(false));
         assert_eq!(sec.run_as_user, Some(0));
+        // Numeric primary GID so the effective user is "0:0" and containerd does
+        // not host-mount the guest-pull rootfs to resolve the GID from
+        // /etc/passwd (which fails under Peer Pods guest pull).
+        assert_eq!(sec.run_as_group, Some(0));
         assert_eq!(sec.fs_group, Some(1000));
 
         let container_sec = pod_spec.containers[0].security_context.as_ref().unwrap();
         assert_eq!(container_sec.run_as_user, Some(0));
+        assert_eq!(container_sec.run_as_group, Some(0));
         assert_eq!(container_sec.allow_privilege_escalation, Some(true));
     }
 

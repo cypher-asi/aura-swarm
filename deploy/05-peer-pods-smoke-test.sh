@@ -490,6 +490,17 @@ ${SMOKE_NODE_SELECTOR}
   containers:
     - name: smoke
       image: curlimages/curl:8.10.1
+      # Run as a NUMERIC uid/gid. curlimages/curl ships a NAMED user
+      # (USER curl_user), which makes containerd host-mount the image rootfs to
+      # resolve the name in /etc/passwd at container-create. With kata-remote
+      # guest pull the rootfs is pulled INSIDE the pod VM, so the host snapshot
+      # is empty and that lookup fails with 'mount callback failed ...
+      # /etc/passwd: no such file or directory' (CreateContainerError). Setting
+      # both runAsUser and runAsGroup numerically makes containerd use them
+      # directly and skip the host-side passwd/group resolution entirely.
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
       command:
         - sh
         - -c
@@ -705,8 +716,13 @@ while [[ ${ELAPSED} -le ${TIMEOUT} ]]; do
                 log_info "--- end diagnostics ---"
                 step_fail "kata-remote smoke pod stuck in ${CWAIT} for ${CWAIT_ELAPSED}s:
   '${CMSG:0:200}'
-  An 'error unpacking image ... content digest not found' here means the WORKLOAD image is being
-  unpacked on the worker instead of pulled inside the guest pod VM — the containerd guest-pull flags
+  A 'mount callback failed ... /etc/passwd: no such file or directory' (or 'no users found') here
+  means containerd tried to resolve the image's USER on the WORKER by host-mounting the rootfs — but
+  with guest pull the rootfs is materialized INSIDE the pod VM, so the host snapshot is empty. The pod
+  must set a NUMERIC securityContext.runAsUser AND runAsGroup so containerd skips that host-side
+  passwd/group lookup (images with a named USER cannot be resolved on the host under guest pull).
+  An 'error unpacking image ... content digest not found' here instead means the WORKLOAD image is
+  being unpacked on the worker rather than guest-pulled — the containerd guest-pull flags
   (disable_snapshot_annotations / discard_unpacked_layers) are not effective on this node. Ensure
   ./03-coco-operator.sh applied the guest-pull DaemonSet and it is Ready:
     kubectl -n ${CAA_NAMESPACE:-confidential-containers-system} get ds kata-remote-containerd-guestpull
