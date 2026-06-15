@@ -1683,9 +1683,22 @@ wait_daemonset_ready() {
         log_progress "[${elapsed}s] ${ds} Ready: ${ready:-0}/${desired:-0}"
         # Per-poll detail on each NOT-Ready owned pod (node + phase/reason +
         # message) so the operator sees WHAT is blocking — pulling, unschedulable,
-        # ContainerCreating, crashlooping — and on which node, not just "3/6".
-        local notready
-        notready=$(kubectl -n "${ns}" get pods -o json 2>/dev/null | jq -r --arg ds "${ds}" '
+        # ContainerCreating, crashlooping, or Running-but-failing-readiness — and
+        # on which node, not just "3/6". For a Running-but-not-ready pod the cause
+        # is the readiness probe, whose message lives in the pod's events, so we
+        # also append each pod's latest event (e.g. "Unhealthy: Readiness probe
+        # failed: ...").
+        local nr_pod nr_node nr_reason nr_msg nr_ev
+        while IFS=$'\t' read -r nr_pod nr_node nr_reason nr_msg; do
+            [[ -z "${nr_pod}" ]] && continue
+            nr_ev=$(kubectl -n "${ns}" get events \
+                --field-selector "involvedObject.name=${nr_pod}" \
+                --sort-by=.lastTimestamp \
+                -o jsonpath='{range .items[*]}{.reason}: {.message}{"\n"}{end}' 2>/dev/null \
+                | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -1)
+            printf '        %s  node=%s  %s%s%s\n' "${nr_pod}" "${nr_node}" "${nr_reason}" \
+                "${nr_msg:+  — ${nr_msg:0:90}}" "${nr_ev:+  [evt] ${nr_ev:0:110}}"
+        done < <(kubectl -n "${ns}" get pods -o json 2>/dev/null | jq -r --arg ds "${ds}" '
             .items[]
             | select((.metadata.ownerReferences // [])[]?.name == $ds)
             | select(((.status.conditions // []) | any(.type=="Ready" and .status=="True")) | not)
@@ -1698,9 +1711,8 @@ wait_daemonset_ready() {
                 // $sc.reason
                 // .status.phase) as $reason
             | ($cs.state.waiting.message // $sc.message // "") as $msg
-            | "        \(.metadata.name)  node=\($node)  \($reason)\(if ($msg|length)>0 then "  — " + ($msg[0:90]) else "" end)"
-          ' 2>/dev/null | head -6 || true)
-        [[ -n "${notready}" ]] && printf '%s\n' "${notready}"
+            | [.metadata.name, $node, $reason, $msg] | @tsv
+          ' 2>/dev/null | head -6)
         sleep "${poll}"; elapsed=$((elapsed + poll))
     done
     log_err "daemonset ${ds} not Ready (${ready:-0}/${desired:-0}) after ${timeout}s"
