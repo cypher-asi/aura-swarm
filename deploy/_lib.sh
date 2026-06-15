@@ -1162,26 +1162,27 @@ diagnose_test_agent() {
 # Never deletes the agent (it persists for reuse across steps / the soak window).
 # Requires an active gateway port-forward. Returns 0 Running, non-zero otherwise.
 ensure_owner_test_agent() {
-    local id rc
+    local id rc st resp
     id="$(find_owner_agent_by_name "${SMOKE_AGENT_NAME}")"
+    # If an existing agent is in error, delete it so a fresh one is created: it
+    # has been dropped from the scheduler's active set and may carry a stale pod
+    # from an older scheduler (e.g. a kata-qemu-snp pod pinned to the removed
+    # confidential-node pool). Restart proved unreliable, so delete + recreate —
+    # the new pod is built by the current scheduler (kata-remote, no selector).
     if [[ -n "${id}" ]]; then
-        local st
         st="$(agent_status "${id}")"
         if [[ "${st}" == "error" ]]; then
-            # An errored agent has been dropped from the scheduler's active set,
-            # so it never gets a new pod on its own. Restart it to move it back
-            # to provisioning and re-trigger scheduling (no need to delete +
-            # recreate, which would churn its id/DEK).
-            log_warn "Designated agent '${SMOKE_AGENT_NAME}' (${id}) is in error — restarting to re-trigger scheduling"
-            gw_user_api POST "/v1/agents/${id}/restart" >/dev/null 2>&1 \
-                || log_warn "restart request failed; will wait and diagnose"
+            log_warn "Designated agent '${SMOKE_AGENT_NAME}' (${id}) is in error — deleting and recreating for a clean pod"
+            gw_user_api DELETE "/v1/agents/${id}" >/dev/null 2>&1 \
+                || log_warn "delete request failed; will try to create a fresh agent anyway"
             sleep 5
+            id=""
         else
             log_ok "Reusing designated owner agent '${SMOKE_AGENT_NAME}' (${id}, status=${st:-?})"
         fi
-    else
+    fi
+    if [[ -z "${id}" ]]; then
         log_info "Creating designated owner agent '${SMOKE_AGENT_NAME}' (tier ${SMOKE_AGENT_TIER})..."
-        local resp
         resp="$(gw_user_api POST "/v1/agents" \
             "{\"name\": \"${SMOKE_AGENT_NAME}\", \"tier\": \"${SMOKE_AGENT_TIER}\"}" || echo "")"
         id="$(echo "${resp}" | jq -r '.agent_id // .id // empty' 2>/dev/null || echo "")"
@@ -1527,19 +1528,41 @@ or build a self-built SEV-SNP image (TEE_PLATFORM=amd; see deploy/PEER-PODS-PLAN
 
 # Dump describe(Events) + recent logs for the pods of a daemonset (diagnostics).
 dump_daemonset_diagnostics() {
-    local ns="$1" ds="$2" pod
+    local ns="$1" ds="$2" pods pod
     log_section "${ds} diagnostics"
     kubectl -n "${ns}" get pods -o wide 2>&1 | indent || true
-    pod=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
-        | jq -r --arg ds "${ds}" '[.items[] | select((.metadata.ownerReferences // [])[]?.name == $ds) | .metadata.name][0] // ""' 2>/dev/null || echo "")
-    if [[ -n "${pod}" ]]; then
+    pods=$(kubectl -n "${ns}" get pods -o json 2>/dev/null \
+        | jq -r --arg ds "${ds}" '
+            .items as $items
+            | [ $items[]
+                | select((.metadata.ownerReferences // [])[]?.name == $ds)
+                | select(((.status.conditions // []) | any(.type == "Ready" and .status == "True")) | not)
+                | .metadata.name
+              ] as $unready
+            | if ($unready | length) > 0 then
+                $unready[]
+              else
+                [ $items[]
+                  | select((.metadata.ownerReferences // [])[]?.name == $ds)
+                  | .metadata.name
+                ][0:3][]
+              end' 2>/dev/null || echo "")
+    if [[ -z "${pods}" ]]; then
+        log_detail "No pods found for daemonset ${ds}"
+    fi
+    while IFS= read -r pod; do
+        [[ -z "${pod}" ]] && continue
+        log_detail "Pod summary for ${pod}:"
+        kubectl -n "${ns}" get pod "${pod}" \
+            -o "custom-columns=POD:.metadata.name,READY:.status.containerStatuses[*].ready,PHASE:.status.phase,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[*].restartCount" 2>&1 \
+            | indent || true
         log_detail "Events for ${pod}:"
         kubectl -n "${ns}" describe pod "${pod}" 2>/dev/null | sed -n '/Events:/,$p' | indent || true
         log_detail "Logs (current) for ${pod}:"
         kubectl -n "${ns}" logs "${pod}" --tail=50 2>&1 | indent || true
         log_detail "Logs (previous) for ${pod}:"
         kubectl -n "${ns}" logs "${pod}" --previous --tail=50 2>&1 | indent || true
-    fi
+    done <<< "${pods}"
     log_detail "--- end diagnostics ---"
 }
 
@@ -1807,6 +1830,29 @@ ensure_peerpods_node_capacity() {
 # advertises kata.peerpods.io/vm can STILL be missing this (e.g. the adaptor came
 # up half-initialized after a surging hostNetwork rollout — it logs "server
 # started" yet never bound the socket), so this must be checked explicitly.
+# True when a CAA pod serves the socket. Uses a PLAIN `kubectl exec` — do NOT
+# wrap it: both `kubectl exec --request-timeout=Ns` and a `timeout N kubectl
+# exec` wrapper yield false negatives in Git-Bash/MINGW (observed 1/4 served
+# when all 4 actually serve it), while the bare exec is reliable. The original
+# "looks hung" symptom was the silent poll loop, now fixed by the per-poll
+# progress log in ensure_caa_hypervisor_socket — not a hanging exec — so no
+# bound is needed here.
+_caa_pod_has_socket() {
+    local ns="$1" pod="$2" sock="$3" i
+    # Strip any stray CR: Windows-native kubectl/jq emit CRLF, and a pod name
+    # with a trailing \r makes `kubectl exec` target a non-existent pod (false
+    # "missing"). `kubectl exec` is also intermittently flaky from Git-Bash, so
+    # retry a few times — only conclude "missing" if every attempt fails.
+    pod="${pod//$'\r'/}"
+    for i in 1 2 3 4 5; do
+        if MSYS_NO_PATHCONV=1 kubectl -n "${ns}" exec "${pod}" -- ls "${sock}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 caa_pods_missing_hypervisor_socket() {
     local ns="$1" ds="$2" sock="${3:-/run/peerpod/hypervisor.sock}"
     local pods pod
@@ -1818,7 +1864,7 @@ caa_pods_missing_hypervisor_socket() {
             | select((.metadata.ownerReferences // [])[]?.name == $ds)
             | select(.metadata.deletionTimestamp == null)
             | select(.status.phase == "Running")
-            | .metadata.name' 2>/dev/null) || return 0
+            | .metadata.name' 2>/dev/null | tr -d '\r') || return 0
     while IFS= read -r pod; do
         [[ -z "${pod}" ]] && continue
         # MSYS_NO_PATHCONV stops Git Bash (MINGW) rewriting the in-container path
@@ -1826,7 +1872,7 @@ caa_pods_missing_hypervisor_socket() {
         # reaches kubectl exec; harmless on Linux/macOS. `ls <path>` exits non-zero
         # when the socket is absent. The CAA image ships `ls` (it is not fully
         # distroless), so no shell is required.
-        if ! MSYS_NO_PATHCONV=1 kubectl -n "${ns}" exec "${pod}" -- ls "${sock}" >/dev/null 2>&1; then
+        if ! _caa_pod_has_socket "${ns}" "${pod}" "${sock}"; then
             echo "${pod}"
         fi
     done <<< "${pods}"
@@ -1843,10 +1889,10 @@ caa_node_with_hypervisor_socket() {
             | select((.metadata.ownerReferences // [])[]?.name == $ds)
             | select(.metadata.deletionTimestamp == null)
             | select(.status.phase == "Running")
-            | [.metadata.name, .spec.nodeName] | @tsv' 2>/dev/null) || return 0
+            | [.metadata.name, .spec.nodeName] | @tsv' 2>/dev/null | tr -d '\r') || return 0
     while IFS=$'\t' read -r pod node; do
         [[ -z "${pod}" ]] && continue
-        if MSYS_NO_PATHCONV=1 kubectl -n "${ns}" exec "${pod}" -- ls "${sock}" >/dev/null 2>&1; then
+        if _caa_pod_has_socket "${ns}" "${pod}" "${sock}"; then
             echo "${node}"
             return 0
         fi
@@ -1914,7 +1960,12 @@ ensure_caa_hypervisor_socket() {
             running=$(_caa_running_pod_count "${ns}" "${ds}")
             missing="$(caa_pods_missing_hypervisor_socket "${ns}" "${ds}" "${sock}")"
             missing_n=$(printf '%s' "${missing}" | grep -c . || true)
-            served=$(( ${running:-0} - missing_n ))
+            # Coerce to bare integers: a transient kubectl/jq hiccup during pod
+            # churn can yield a multiline/empty value that breaks `$(( ))` with
+            # "invalid arithmetic operator".
+            running="${running//[^0-9]/}"; running="${running:-0}"
+            missing_n="${missing_n//[^0-9]/}"; missing_n="${missing_n:-0}"
+            served=$(( running - missing_n ))
             if [[ "${require}" == "one" ]]; then
                 if (( served >= 1 )); then
                     log_ok "a ${ds} pod serves ${sock} (kata-remote sandbox creation can reach the hypervisor)"
@@ -1927,6 +1978,8 @@ ensure_caa_hypervisor_socket() {
                     return 0
                 fi
             fi
+            # Show progress each poll so a slow bind/roll never looks like a hang.
+            log_progress "[${elapsed}s] socket served by ${served:-0}/${running:-0} running CAA pod(s) (require=${require})"
             sleep "${poll}"; elapsed=$((elapsed + poll))
         done
         # Grace exhausted. If pods are merely not Running yet (no confirmed

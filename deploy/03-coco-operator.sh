@@ -299,9 +299,18 @@ if [[ "${CAA_REQUIRE_HYPERVISOR_SOCKET:-true}" == "true" ]]; then
     fi
 fi
 
-# Verify: the kata-remote RuntimeClass exists.
-kubectl get runtimeclass kata-remote >/dev/null 2>&1 \
-    || step_fail "RuntimeClass kata-remote does not exist after the CAA install"
+# Verify: the kata-remote RuntimeClass exists. We delete it before the upgrade
+# (field-ownership reset above) and kata-deploy recreates it ASYNCHRONOUSLY, so
+# poll rather than check once — a one-shot check races kata-deploy and spuriously
+# fails right after a fresh install.
+KR_RC_DEADLINE=$((SECONDS + ${KATA_REMOTE_RC_WAIT_SECS:-180}))
+until kubectl get runtimeclass kata-remote >/dev/null 2>&1; do
+    if (( SECONDS >= KR_RC_DEADLINE )); then
+        step_fail "RuntimeClass kata-remote does not exist ${KATA_REMOTE_RC_WAIT_SECS:-180}s after the CAA install — kata-deploy did not (re)create it. Check the kata-deploy pods: kubectl -n ${CAA_NAMESPACE} get pods | grep kata-deploy"
+    fi
+    log_progress "waiting for kata-deploy to (re)create the kata-remote RuntimeClass..."
+    sleep 5
+done
 log_ok "RuntimeClass kata-remote exists"
 
 # Zero the kata-remote RuntimeClass pod overhead.
