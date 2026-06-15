@@ -17,7 +17,7 @@ pub fn default_watch() -> String {
         .to_string()
 }
 
-/// Run a read-only snapshot command and return its combined output text.
+/// Run a read-only snapshot command and return its (condensed) output text.
 pub async fn run_snapshot(cmd: String) -> String {
     let result = Command::new("bash")
         .arg("-c")
@@ -29,16 +29,46 @@ pub async fn run_snapshot(cmd: String) -> String {
     match result {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if !stdout.trim().is_empty() {
-                return stdout.into_owned();
-            }
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.trim().is_empty() {
-                "(no output)".to_string()
+            let body = if stdout.trim().is_empty() {
+                String::from_utf8_lossy(&out.stderr).into_owned()
             } else {
-                stderr.into_owned()
-            }
+                stdout.into_owned()
+            };
+            condense(&body)
         }
-        Err(e) => format!("snapshot command failed to run: {e}"),
+        Err(e) => format!(
+            "snapshot command failed to run: {e}\n(is `bash` on PATH? on Windows, run under WSL)"
+        ),
+    }
+}
+
+/// Collapse common "cluster not up yet" noise into a single calm line, so the
+/// pane stays readable during early steps that build the cluster/node group.
+fn condense(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let cluster_down = [
+        "connection refused",
+        "was refused",
+        "unable to connect to the server",
+        "couldn't get current server api group list",
+        "no such host",
+        "i/o timeout",
+        "the server doesn't have a resource type",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    if cluster_down {
+        return "Kubernetes API not reachable yet.\n\
+                Infra snapshots populate once the cluster and kubeconfig are available\n\
+                (expected during early steps like 02 that build the node group).\n\
+                Override the polled command with --watch / AURA_DEPLOY_WATCH."
+            .to_string();
+    }
+
+    if text.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        text.to_string()
     }
 }
