@@ -19,7 +19,7 @@ pub fn default_watch() -> String {
 
 /// Run a read-only snapshot command and return its (condensed) output text.
 pub async fn run_snapshot(cmd: String) -> String {
-    let result = Command::new("bash")
+    let result = Command::new(crate::runner::bash_program())
         .arg("-c")
         .arg(&cmd)
         .stdin(Stdio::null())

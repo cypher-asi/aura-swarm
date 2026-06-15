@@ -168,45 +168,56 @@ fn parse_record(rec: &str) -> Option<RunEvent> {
     Some(RunEvent::Progress { level, step, text })
 }
 
-/// Build the `bash` command that runs the script, translating paths for WSL
-/// when the Windows-native binary is driving `bash.exe` (WSL2).
+/// Build the `bash` command that runs the script, translating paths to match
+/// the actual `bash` interpreter on Windows.
 ///
-/// On Windows, `bash` is typically WSL's launcher, which cannot resolve Windows
-/// paths like `C:\…`. If `wslpath` is available we convert the script, working
-/// directory, and channel path to `/mnt/c/…` form and `cd` into the dir before
-/// exec'ing the script. Everywhere else (Linux, macOS, Windows Git Bash) we
-/// pass native paths directly.
+/// On Windows a `bash` on PATH can be either the WSL launcher (which resolves
+/// Windows paths as `/mnt/c/…` via `wslpath`) or Git Bash/Cygwin (which use
+/// `/c/…` via `cygpath`). Feeding the wrong flavor a path it can't resolve is
+/// what caused `cd: /mnt/c/…: No such file or directory` when launched from Git
+/// Bash. We therefore resolve a single concrete `bash.exe`, detect *its* flavor,
+/// convert the script/working-dir/channel paths with the matching tool, and run
+/// that same binary. Everywhere else (Linux, macOS) we pass native paths.
 fn make_bash_command(
     script_path: &Path,
     args: &[String],
     deploy_dir: &Path,
     channel_path: &Path,
 ) -> Command {
-    let mut cmd = Command::new("bash");
-
     #[cfg(windows)]
-    if let (Some(wsl_script), Some(wsl_dir), Some(wsl_chan)) = (
-        wslpath(script_path),
-        wslpath(deploy_dir),
-        wslpath(channel_path),
-    ) {
-        let inner = format!(
-            "cd {} && exec bash {} \"$@\"",
-            sh_single_quote(&wsl_dir),
-            sh_single_quote(&wsl_script),
-        );
-        cmd.arg("-c")
-            .arg(inner)
-            .arg("aswarm-deploy") // $0 for the inner shell
-            .args(args)
-            .env("DEPLOY_TUI", "1")
-            .env("DEPLOY_TUI_CHANNEL", wsl_chan)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        return cmd;
+    if let Some(bash) = resolve_bash() {
+        let tool = match bash_flavor(&bash) {
+            BashFlavor::Wsl => Some("wslpath"),
+            BashFlavor::Msys => Some("cygpath"),
+            BashFlavor::Other => None,
+        };
+        if let Some(tool) = tool {
+            if let (Some(u_script), Some(u_dir), Some(u_chan)) = (
+                to_unix_path(&bash, tool, script_path),
+                to_unix_path(&bash, tool, deploy_dir),
+                to_unix_path(&bash, tool, channel_path),
+            ) {
+                let inner = format!(
+                    "cd {} && exec bash {} \"$@\"",
+                    sh_single_quote(&u_dir),
+                    sh_single_quote(&u_script),
+                );
+                let mut cmd = Command::new(&bash);
+                cmd.arg("-c")
+                    .arg(inner)
+                    .arg("aswarm-deploy") // $0 for the inner shell
+                    .args(args)
+                    .env("DEPLOY_TUI", "1")
+                    .env("DEPLOY_TUI_CHANNEL", u_chan)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                return cmd;
+            }
+        }
     }
 
+    let mut cmd = Command::new(bash_program());
     cmd.arg(script_path)
         .args(args)
         .current_dir(deploy_dir)
@@ -218,21 +229,86 @@ fn make_bash_command(
     cmd
 }
 
-/// Convert a Windows path to its WSL (`/mnt/c/…`) form via `wslpath`.
-/// Returns `None` if `wslpath` is unavailable (e.g. Git Bash), so the caller
-/// falls back to passing the native path.
+/// The `bash` program to spawn: a concrete `bash.exe` resolved from PATH on
+/// Windows (so every pane uses the same interpreter), or plain `bash` elsewhere.
+pub(crate) fn bash_program() -> std::ffi::OsString {
+    #[cfg(windows)]
+    if let Some(p) = resolve_bash() {
+        return p.into_os_string();
+    }
+    std::ffi::OsString::from("bash")
+}
+
+/// Which `bash` flavor we're driving, which decides how Windows paths are
+/// translated for the interpreter.
 #[cfg(windows)]
-fn wslpath(path: &Path) -> Option<String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BashFlavor {
+    /// WSL: convert via `wslpath` to `/mnt/c/…`.
+    Wsl,
+    /// Git Bash / MSYS / Cygwin: convert via `cygpath` to `/c/…`.
+    Msys,
+    /// Unknown: pass native paths and let the shell sort it out.
+    Other,
+}
+
+/// Resolve a concrete `bash.exe` by scanning the inherited `PATH` in order.
+///
+/// Returns the first existing match, so launching from Git Bash picks Git Bash
+/// and launching from PowerShell/WSL picks the WSL launcher. Using one resolved
+/// binary for both the flavor probe and the run avoids the probe and runner
+/// disagreeing about which interpreter is in play.
+#[cfg(windows)]
+fn resolve_bash() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("bash.exe"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Detect the flavor of `bash` by inspecting `uname -s`.
+#[cfg(windows)]
+fn bash_flavor(bash: &Path) -> BashFlavor {
+    let Ok(out) = std::process::Command::new(bash)
+        .arg("-c")
+        .arg("uname -s")
+        .output()
+    else {
+        return BashFlavor::Other;
+    };
+    if !out.status.success() {
+        return BashFlavor::Other;
+    }
+    let kernel = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .to_ascii_uppercase();
+    if kernel.starts_with("LINUX") {
+        BashFlavor::Wsl
+    } else if kernel.starts_with("MINGW")
+        || kernel.starts_with("MSYS")
+        || kernel.starts_with("CYGWIN")
+    {
+        BashFlavor::Msys
+    } else {
+        BashFlavor::Other
+    }
+}
+
+/// Convert a Windows path to the unix form the interpreter understands, using
+/// `tool` (`wslpath` for WSL, `cygpath` for Git Bash/Cygwin). Returns `None`
+/// if the conversion fails, so the caller can fall back to native paths.
+#[cfg(windows)]
+fn to_unix_path(bash: &Path, tool: &str, path: &Path) -> Option<String> {
     let raw = path.to_str()?;
     // `Path::canonicalize` on Windows yields verbatim paths (`\\?\C:\...`) which
-    // `wslpath` mistranslates to `/mnt/c/?/C:/...`; strip the prefix first.
+    // both converters mistranslate; strip the prefix first.
     let win = raw.strip_prefix(r"\\?\UNC\").map_or_else(
         || raw.strip_prefix(r"\\?\").unwrap_or(raw).to_string(),
         |rest| format!(r"\\{rest}"),
     );
-    let out = std::process::Command::new("bash")
+    let out = std::process::Command::new(bash)
         .arg("-c")
-        .arg(format!("wslpath -a -u {}", sh_single_quote(&win)))
+        .arg(format!("{tool} -a -u {}", sh_single_quote(&win)))
         .output()
         .ok()?;
     if !out.status.success() {
