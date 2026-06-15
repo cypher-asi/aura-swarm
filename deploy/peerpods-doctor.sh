@@ -181,6 +181,29 @@ else
     record "runtimeclass-overhead" SKIP "RuntimeClass kata-remote missing (see runtimeclass)"
 fi
 
+# agent-pull-secret: kata-remote agents pull the workload image INSIDE the pod VM
+# (CoCo image_guest_pull), so the GUEST needs registry credentials — the worker
+# node-role's ECR access is not used. ./03 seeds a dockerconfigjson secret in the
+# agent namespace and links it to the default SA the agent pods use; without it
+# every confidential agent fails CreateContainer with "[CDH] Image Pull error:
+# ... Not authorized" (the fleet/caa-log layers see it reactively — this catches
+# it proactively, before any agent is launched).
+AGENT_NS="${K8S_NAMESPACE_AGENTS:-swarm-agents}"
+PULL_SECRET="${AGENT_ECR_PULL_SECRET_NAME:-ecr-harness-pull}"
+if kubectl get namespace "${AGENT_NS}" >/dev/null 2>&1; then
+    SA_REFS="$(kubectl get serviceaccount default -n "${AGENT_NS}" \
+        -o jsonpath='{range .imagePullSecrets[*]}{.name}{"\n"}{end}' 2>/dev/null | tr -d '\r')"
+    if ! kubectl get secret "${PULL_SECRET}" -n "${AGENT_NS}" >/dev/null 2>&1; then
+        record "agent-pull-secret" FAIL "pull secret ${PULL_SECRET} missing in ${AGENT_NS}; in-guest ECR pull will fail 'Not authorized'. Re-run ./03-coco-operator.sh (it seeds it + installs the refresher CronJob)."
+    elif ! printf '%s\n' "${SA_REFS}" | grep -qxF "${PULL_SECRET}"; then
+        record "agent-pull-secret" FAIL "secret ${PULL_SECRET} exists but the default SA in ${AGENT_NS} does not reference it (new agents won't get it). Re-run ./03-coco-operator.sh, or: kubectl patch serviceaccount default -n ${AGENT_NS} -p '{\"imagePullSecrets\":[{\"name\":\"${PULL_SECRET}\"}]}'"
+    else
+        record "agent-pull-secret" PASS "${PULL_SECRET} present in ${AGENT_NS} and linked to the default SA"
+    fi
+else
+    record "agent-pull-secret" SKIP "namespace ${AGENT_NS} does not exist yet (deploy not past ./04)"
+fi
+
 # webhook: peer-pods mutating webhook effective.
 WH_DIAG=""; WH_RC=0
 WH_DIAG=$(peerpods_webhook_effective) || WH_RC=$?

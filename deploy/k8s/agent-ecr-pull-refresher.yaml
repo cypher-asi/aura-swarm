@@ -1,0 +1,129 @@
+# kata-remote prerequisite: refresh the in-guest ECR pull credentials
+#
+# Confidential agent pods pull the workload image INSIDE the pod VM (CoCo
+# "image_guest_pull"), so the guest needs its own registry credentials — the
+# worker node-role's ECR access is not used for guest pull. Those credentials are
+# a dockerconfigjson Secret (__SECRET_NAME__) in __NAMESPACE__, linked to the
+# default ServiceAccount (see ensure_agent_ecr_pull_secret in _lib.sh), which the
+# kata-agent forwards to the in-guest image-rs.
+#
+# ECR auth tokens expire after 12h, so this CronJob re-mints the Secret on a
+# schedule. It authenticates to AWS via the WORKER NODE INSTANCE ROLE over IMDS
+# (the EKS node role already carries AmazonEC2ContainerRegistryReadOnly, which
+# includes ecr:GetAuthorizationToken) — no IRSA role, no static keys. hostNetwork
+# is required so the pod reaches 169.254.169.254 regardless of the IMDS hop limit.
+# Applied by ./03-coco-operator.sh with the sed placeholders substituted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ecr-pull-refresher
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: ecr-pull-refresher
+    app.kubernetes.io/part-of: cloud-api-adaptor
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ecr-pull-refresher
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: ecr-pull-refresher
+    app.kubernetes.io/part-of: cloud-api-adaptor
+rules:
+  # `kubectl apply` of the secret does a get then create-or-patch.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ecr-pull-refresher
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: ecr-pull-refresher
+    app.kubernetes.io/part-of: cloud-api-adaptor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ecr-pull-refresher
+subjects:
+  - kind: ServiceAccount
+    name: ecr-pull-refresher
+    namespace: __NAMESPACE__
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ecr-pull-refresher
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: ecr-pull-refresher
+    app.kubernetes.io/part-of: cloud-api-adaptor
+spec:
+  schedule: "__SCHEDULE__"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Give up (and let the next tick retry) rather than hammering on failure.
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ecr-pull-refresher
+        spec:
+          serviceAccountName: ecr-pull-refresher
+          restartPolicy: Never
+          # hostNetwork so the node role is reachable via IMDS regardless of the
+          # instance metadata hop limit; ClusterFirstWithHostNet so aws-cli can
+          # still resolve the ECR/STS endpoints over DNS.
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            node.kubernetes.io/worker: ""
+          tolerations:
+            - operator: Exists
+          volumes:
+            # In-memory only: the ECR token never touches disk.
+            - name: shared
+              emptyDir:
+                medium: Memory
+          initContainers:
+            # Mint a fresh ECR token using the node instance role (IMDS).
+            - name: get-token
+              image: public.ecr.aws/aws-cli/aws-cli:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  aws ecr get-login-password --region "__AWS_REGION__" > /shared/pass
+                  test -s /shared/pass
+              volumeMounts:
+                - { name: shared, mountPath: /shared }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { memory: 256Mi }
+          containers:
+            # Create/refresh the dockerconfigjson Secret in place.
+            - name: apply-secret
+              image: docker.io/bitnami/kubectl:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  kubectl create secret docker-registry "__SECRET_NAME__" \
+                    -n "__NAMESPACE__" \
+                    --docker-server="__ECR_REGISTRY__" \
+                    --docker-username=AWS \
+                    --docker-password="$(cat /shared/pass)" \
+                    --dry-run=client -o yaml | kubectl apply -f -
+                  echo "refreshed __SECRET_NAME__ in __NAMESPACE__"
+              volumeMounts:
+                - { name: shared, mountPath: /shared, readOnly: true }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { memory: 256Mi }

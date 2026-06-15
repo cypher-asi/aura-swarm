@@ -450,4 +450,38 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" 
 fi
 log_ok "Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
 
+#------------------------------------------------------------------------------
+# In-guest workload image-pull credentials for the private ECR.
+#
+# kata-remote pulls the workload (harness) image INSIDE the pod VM via the CDH
+# (driver image_guest_pull), so the guest — not the worker — needs registry
+# credentials. Without them every confidential agent fails CreateContainer with
+# "[CDH] Image Pull error: ... Not authorized" and its PeerPod never becomes
+# Ready, which 500s the CAA node probe and drops the whole CAA pod off the node.
+# Seed a dockerconfigjson pull secret in the agent namespace + link it to the
+# default SA the agent pods use, then install a CronJob that re-mints the 12h ECR
+# token via the worker node role (IMDS). Idempotent; re-run-safe.
+#------------------------------------------------------------------------------
+echo ""
+AGENT_ECR_PULL_SECRET_NAME="${AGENT_ECR_PULL_SECRET_NAME:-ecr-harness-pull}"
+AGENT_ECR_PULL_REFRESH_SCHEDULE="${AGENT_ECR_PULL_REFRESH_SCHEDULE:-0 */6 * * *}"
+ECR_REGISTRY_HOST="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+log_info "Ensuring in-guest ECR pull credentials for kata-remote agents (${AGENT_ECR_PULL_SECRET_NAME} in ${K8S_NAMESPACE_AGENTS})..."
+if ! ensure_agent_ecr_pull_secret; then
+    step_fail "could not mint an ECR token to seed the agent pull secret (aws ecr get-login-password failed).
+  Confidential agents would fail the in-guest image pull with '[CDH] Image Pull error: ... Not authorized'.
+  Check AWS auth/region (${AWS_REGION}) and ECR access, then re-run ./03-coco-operator.sh."
+fi
+log_ok "Agent ECR pull secret ${AGENT_ECR_PULL_SECRET_NAME} seeded and linked to the default SA in ${K8S_NAMESPACE_AGENTS}"
+
+PULL_REFRESH_MANIFEST="${DEPLOY_DIR}/k8s/agent-ecr-pull-refresher.yaml"
+[[ -f "${PULL_REFRESH_MANIFEST}" ]] || step_fail "missing pull-secret refresher manifest: ${PULL_REFRESH_MANIFEST}"
+sed -e "s|__NAMESPACE__|${K8S_NAMESPACE_AGENTS}|g" \
+    -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+    -e "s|__ECR_REGISTRY__|${ECR_REGISTRY_HOST}|g" \
+    -e "s|__SECRET_NAME__|${AGENT_ECR_PULL_SECRET_NAME}|g" \
+    -e "s|__SCHEDULE__|${AGENT_ECR_PULL_REFRESH_SCHEDULE}|g" \
+    "${PULL_REFRESH_MANIFEST}" | kubectl apply -f - >/dev/null
+log_ok "Agent ECR pull-secret refresher CronJob installed (schedule '${AGENT_ECR_PULL_REFRESH_SCHEDULE}', node-role via IMDS)"
+
 step_ok "04 (./04-trustee-kbs.sh)"

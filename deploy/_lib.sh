@@ -1674,6 +1674,42 @@ dump_daemonset_diagnostics() {
     log_detail "--- end diagnostics ---"
 }
 
+# Ensure the confidential agent pods can authenticate the IN-GUEST workload image
+# pull from the private ECR registry. kata-remote pulls the workload image inside
+# the pod VM via the CDH (driver image_guest_pull), NOT on the worker, so the
+# worker node-role's ECR access is irrelevant — the guest needs its own
+# credentials. The supported path is a dockerconfigjson pull secret in the agent
+# namespace, linked to the ServiceAccount the agent pods run as (default), which
+# the kata-agent forwards to the in-guest image-rs. Without it every kata-remote
+# agent fails CreateContainer with "[CDH] Image Pull error: ... Not authorized"
+# and its PeerPod never becomes Ready (which then 500s the CAA node probe).
+#
+# The ECR token is valid 12h; agent-ecr-pull-refresher.yaml (a CronJob) re-mints
+# it. This call seeds the secret immediately so it works before the first tick.
+# Idempotent. Returns 1 only if the ECR token could not be obtained.
+ensure_agent_ecr_pull_secret() {
+    local ns="${K8S_NAMESPACE_AGENTS}"
+    local secret="${AGENT_ECR_PULL_SECRET_NAME:-ecr-harness-pull}"
+    local registry="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    local pass
+    kubectl create namespace "${ns}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    if ! pass="$(aws ecr get-login-password --region "${AWS_REGION}" 2>/dev/null)" || [[ -z "${pass}" ]]; then
+        return 1
+    fi
+    # `create ... --dry-run=client | apply` so the secret is created or updated
+    # in place (idempotent, no field-manager conflict on re-run).
+    kubectl create secret docker-registry "${secret}" -n "${ns}" \
+        --docker-server="${registry}" \
+        --docker-username=AWS \
+        --docker-password="${pass}" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    # Link it to the default SA so every agent pod (the scheduler sets no
+    # serviceAccountName) inherits it. Sets, not appends — the default SA carries
+    # no other pull secrets here.
+    kubectl patch serviceaccount default -n "${ns}" \
+        -p "{\"imagePullSecrets\":[{\"name\":\"${secret}\"}]}" >/dev/null
+}
+
 # Wait for a DaemonSet to be fully Ready, but FAIL FAST when its pods enter
 # CrashLoopBackOff or restart repeatedly instead of burning the whole timeout.
 # Dumps diagnostics on failure. Returns 0 Ready, 1 on crashloop/timeout.

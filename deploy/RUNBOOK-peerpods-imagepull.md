@@ -91,77 +91,65 @@ aws ec2 terminate-instances --region us-east-2 --instance-ids i-xxxx i-yyyy
 For Peer Pods the **workload image is pulled inside the pod VM** by the in-guest
 CDH / image-rs (driver `image_guest_pull`), **not** on the worker. The worker
 node-role's ECR permission is therefore irrelevant — the guest needs its own
-registry credentials. Nothing in the deploy chain currently provisions them
-(the `05` smoke test only ever pulls a public image with `credentials = []`), so
-every pull of the private `aura-swarm-dev-harness` image returns `Not authorized`.
+registry credentials. `./03-coco-operator.sh` now provisions them (an ECR pull
+secret linked to the agent `default` SA, plus a refresher CronJob); if that step
+has not run, every pull of the private `aura-swarm-dev-harness` image returns
+`Not authorized`.
 
-### Recommended: hand the guest an ECR auth file via the KBS, referenced by initdata
+### Implemented fix: a pull secret linked to the agent ServiceAccount
 
-This reuses the existing Trustee/KBS plumbing (same writer-pod technique as
-[`05-peer-pods-smoke-test.sh`](05-peer-pods-smoke-test.sh)) so the credential is
-released only after attestation.
+`./03-coco-operator.sh` now seeds this automatically (`ensure_agent_ecr_pull_secret`
+in [`_lib.sh`](_lib.sh) + the refresher manifest
+[`k8s/agent-ecr-pull-refresher.yaml`](k8s/agent-ecr-pull-refresher.yaml)). The
+kata-agent forwards the pod's `imagePullSecrets` to the in-guest image-rs, and the
+scheduler sets no `serviceAccountName`, so linking the secret to the `default` SA
+in `swarm-agents` covers every agent pod with no scheduler change.
 
-#### B1. Mint an ECR `auth.json` (docker config format)
+What step 03 does (and what to run by hand if you are not re-running 03):
 
 ```bash
 REG=909208902094.dkr.ecr.us-east-2.amazonaws.com
-TOKEN=$(aws ecr get-login-password --region us-east-2)
-AUTH=$(printf 'AWS:%s' "$TOKEN" | base64 -w0)
-cat > /tmp/auth.json <<EOF
-{ "auths": { "$REG": { "auth": "$AUTH" } } }
-EOF
+NS=swarm-agents
+SECRET=ecr-harness-pull
+
+# 1. seed/refresh the dockerconfigjson secret (ECR token is valid 12h)
+kubectl create secret docker-registry "$SECRET" -n "$NS" \
+  --docker-server="$REG" --docker-username=AWS \
+  --docker-password="$(aws ecr get-login-password --region us-east-2)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2. link it to the default SA the agent pods run as
+kubectl patch serviceaccount default -n "$NS" \
+  -p '{"imagePullSecrets":[{"name":"'"$SECRET"'"}]}'
 ```
 
-#### B2. Store it as a KBS resource in the `kbs-repository` PVC
+#### Token refresh (12h expiry)
 
-The KBS LocalFs backend stores each resource as a single flat file whose name is
-the resource path with every `/` replaced by the literal 4-char string `\x2F`
-(see the detailed note in [`05-peer-pods-smoke-test.sh`](05-peer-pods-smoke-test.sh)).
-Write `default/credentials/auth.json` with a throwaway busybox pod that mounts the
-PVC (same pattern the smoke test uses), e.g. on-disk name
-`default\x2Fcredentials\x2Fauth.json` under `/opt/confidential-containers/kbs/repository`.
+ECR tokens expire after 12 hours, so step 03 also installs the
+`ecr-pull-refresher` CronJob (default `0 */6 * * *`, override with
+`AGENT_ECR_PULL_REFRESH_SCHEDULE`). It authenticates to AWS via the **worker node
+instance role over IMDS** (`hostNetwork: true`; the node role already carries
+`AmazonEC2ContainerRegistryReadOnly`), so there is no IRSA role and no static key.
+Verify it:
 
-#### B3. Make agent pods carry initdata that references the credential
-
-The guest needs `cc_init_data` whose `cdh.toml` points AA/CDH at the KBS pod IP
-(reachable over the VPC from the pod-VM subnet) and enables authenticated image
-pull from the stored credential, e.g.:
-
-```toml
-[image]
-# image-rs fetches the registry auth file from the KBS as an attestation-gated resource
-auth = true
-
-[kbc]
-name = 'cc_kbc'
-url  = 'http://<KBS_POD_IP>:8080'
+```bash
+kubectl -n swarm-agents get cronjob ecr-pull-refresher
+kubectl -n swarm-agents create job --from=cronjob/ecr-pull-refresher ecr-refresh-test  # manual tick
 ```
 
-Pass it on the pod as the base64(gzip(TOML)) annotation
-`io.katacontainers.config.hypervisor.cc_init_data` (the exact mechanics — KBS pod
-IP discovery, the `aa.toml`/`cdh.toml` body, and the gzip|base64 encoding — are
-in [`05-peer-pods-smoke-test.sh`](05-peer-pods-smoke-test.sh) lines ~423-466).
+### Alternative paths (not used here)
 
-> Making this automatic for **every** confidential agent requires the scheduler
-> to inject `cc_init_data` (it currently injects only
-> `io.containerd.cri.runtime-handler`; see
-> [`crates/aura-swarm-scheduler/src/pod.rs`](../crates/aura-swarm-scheduler/src/pod.rs)).
-> That is a deliberate agent-pod-spec change — see Part D.
-
-#### B4. Refresh the ECR token (it expires every 12h)
-
-ECR tokens are valid for 12 hours, so a static auth file goes stale. Add a
-`CronJob` (every ~6h) that re-runs B1 + B2 to rewrite the KBS credential
-resource. Without it, agents created after the token expires fail with the same
-`Not authorized`.
-
-### Alternative: pod-VM IAM instance profile + ECR credential provider
-
-Bake an ECR credential helper into a custom pod-VM AMI and attach an instance
-profile with `ecr:GetAuthorizationToken` + pull permissions, so the guest mints
-its own short-lived token (no KBS resource, no refresh CronJob). Heavier up front
-(custom AMI build + IAM), but no 12h expiry to manage. Pin the new AMI via
-`PODVM_AMI_ID` in `config.env`.
+- **KBS-provided auth file via initdata.** Store the `auth.json` as an
+  attestation-gated KBS resource and pass `cc_init_data` (`cdh.toml`) on each pod.
+  Heavier (needs the scheduler to emit `cc_init_data`), but releases the
+  credential only after attestation. See
+  [`05-peer-pods-smoke-test.sh`](05-peer-pods-smoke-test.sh) lines ~423-466 for the
+  initdata mechanics.
+- **Pod-VM IAM instance profile + ECR credential provider.** Bake an ECR
+  credential helper into a custom pod-VM AMI and attach an instance profile with
+  `ecr:GetAuthorizationToken`, so the guest mints its own token (no secret, no
+  refresh CronJob). No 12h expiry to manage, but requires a custom AMI; pin it via
+  `PODVM_AMI_ID`.
 
 ---
 
@@ -186,12 +174,22 @@ Expected after the fix: `caa-daemonset` 6/6, `runtimeclass-overhead` PASS, and
 
 ---
 
-## D. Optional follow-up — make ECR auth permanent
+## D. How this is wired permanently
 
-To stop doing B by hand for every agent, inject `cc_init_data` (cdh.toml + the
-credential-resource reference, plus the KBS pod IP) into the confidential agent
-pod spec in
-[`crates/aura-swarm-scheduler/src/pod.rs`](../crates/aura-swarm-scheduler/src/pod.rs),
-alongside the existing `io.containerd.cri.runtime-handler` annotation. This is a
-behavior change to every confidential agent pod, so treat it as a separate,
-reviewed change rather than an ad-hoc remediation.
+The fix in Part B is built into the deploy flow, so steady-state needs no manual
+steps:
+
+- [`_lib.sh`](_lib.sh) `ensure_agent_ecr_pull_secret` seeds the secret + SA link.
+- [`k8s/agent-ecr-pull-refresher.yaml`](k8s/agent-ecr-pull-refresher.yaml) refreshes
+  the 12h token via the worker node role (IMDS).
+- [`03-coco-operator.sh`](03-coco-operator.sh) calls both, so re-running step 03
+  (the doctor's standard remediation) re-establishes everything.
+- [`peerpods-doctor.sh`](peerpods-doctor.sh) `agent-pull-secret` layer flags a
+  missing/unlinked secret proactively.
+- Knobs: `AGENT_ECR_PULL_SECRET_NAME`, `AGENT_ECR_PULL_REFRESH_SCHEDULE` in
+  [`config.env`](config.env).
+
+An alternative, attestation-gated path (KBS auth file via `cc_init_data`, which
+would need the scheduler to emit the annotation in
+[`crates/aura-swarm-scheduler/src/pod.rs`](../crates/aura-swarm-scheduler/src/pod.rs))
+remains possible if you later want the credential released only post-attestation.
