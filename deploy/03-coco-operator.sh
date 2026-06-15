@@ -450,6 +450,24 @@ if ! wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" 
 fi
 log_ok "Worker containerd guest-pull flags ensured (disable_snapshot_annotations=false, discard_unpacked_layers=false)"
 
+# Re-trigger the guest-pull DaemonSet's incomplete-image self-heal. That heal
+# (evict WORKLOAD images whose layers were discarded before the flag flip, so the
+# kubelet re-pulls them complete and the nydus snapshotter can unpack them) runs
+# ONCE at pod start and then sleeps, so a `kubectl apply` of an unchanged manifest
+# never re-runs it — leaving any image that reappeared incomplete (the doctor's
+# <node>/incomplete-images FAIL) stuck. A rollout restart makes every ./03 re-run
+# the heal on each node; ./03 is the doctor's recommended remediation entrypoint,
+# so an operator fixing the fleet also clears stale incomplete harness images.
+# Best-effort: a restart hiccup must not fail the whole step.
+log_info "Re-running the guest-pull incomplete-image self-heal (rollout restart)..."
+if kubectl -n "${CAA_NAMESPACE}" rollout restart daemonset/kata-remote-containerd-guestpull >/dev/null 2>&1; then
+    wait_daemonset_ready "${CAA_NAMESPACE}" "kata-remote-containerd-guestpull" "${CAA_INSTALL_TIMEOUT}" >/dev/null 2>&1 \
+        || log_warn "guest-pull DaemonSet did not re-report Ready after the self-heal restart (continuing; see ./peerpods-doctor.sh)"
+    log_ok "Guest-pull incomplete-image self-heal re-triggered"
+else
+    log_warn "could not rollout-restart the guest-pull DaemonSet to re-run the incomplete-image self-heal (continuing)"
+fi
+
 #------------------------------------------------------------------------------
 # In-guest workload image-pull credentials for the private ECR.
 #
