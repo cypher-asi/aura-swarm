@@ -223,10 +223,16 @@ fn make_bash_command(
 /// falls back to passing the native path.
 #[cfg(windows)]
 fn wslpath(path: &Path) -> Option<String> {
-    let win = path.to_str()?;
+    let raw = path.to_str()?;
+    // `Path::canonicalize` on Windows yields verbatim paths (`\\?\C:\...`) which
+    // `wslpath` mistranslates to `/mnt/c/?/C:/...`; strip the prefix first.
+    let win = raw.strip_prefix(r"\\?\UNC\").map_or_else(
+        || raw.strip_prefix(r"\\?\").unwrap_or(raw).to_string(),
+        |rest| format!(r"\\{rest}"),
+    );
     let out = std::process::Command::new("bash")
         .arg("-c")
-        .arg(format!("wslpath -a -u {}", sh_single_quote(win)))
+        .arg(format!("wslpath -a -u {}", sh_single_quote(&win)))
         .output()
         .ok()?;
     if !out.status.success() {
