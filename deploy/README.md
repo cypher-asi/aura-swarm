@@ -17,7 +17,9 @@ Pick a script with the arrow keys (optionally press `e` to add arguments such as
 - **Left — Progress:** the script's curated step feed (`step_banner`, `log_section`, `log_ok/info/warn/err`, …) rendered as styled widgets, with a spinner on the active step.
 - **Right — live machine view:** the top pane streams the raw stdout/stderr of the underlying `terraform`/`kubectl`/`aws`/`docker` commands; the bottom pane shows a periodic, read-only infra-state snapshot (default `kubectl get nodes` + `kubectl get pods -A`, overridable with `--watch` / `AURA_DEPLOY_WATCH`, or per-step via a `log_watch "<cmd>"` hint in the script).
 
-`Tab` switches which pane scrolls, `Esc` cancels a running script, and the scripts behave identically outside the TUI — it only sets `DEPLOY_TUI=1` + `DEPLOY_TUI_CHANNEL` so [`_lib.sh`](_lib.sh) can mirror its curated log lines onto a structured side-channel. Because the scripts are bash, run the TUI where `bash` and your cloud tooling live; on Windows, run it under WSL.
+`Tab` switches which pane scrolls, `Esc` cancels a running script, and the scripts behave identically outside the TUI — it only sets `DEPLOY_TUI=1` + `DEPLOY_TUI_CHANNEL` so [`_lib.sh`](_lib.sh) can mirror its curated log lines onto a structured side-channel.
+
+Because the scripts are bash, run the TUI where `bash` and your cloud tooling (`kubectl`/`terraform`/`aws`) live. On Windows the native binary detects WSL's `bash` and auto-translates Windows paths to `/mnt/...` form via `wslpath`, so it works as long as bash and the tooling are installed in WSL (Git Bash is also supported); you can equally build and run it inside WSL.
 
 ## Prerequisites
 

@@ -71,19 +71,10 @@ pub fn spawn(
         )
     })?;
 
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script.path)
-        .args(args)
-        .current_dir(deploy_dir)
-        .env("DEPLOY_TUI", "1")
-        .env("DEPLOY_TUI_CHANNEL", &channel_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
+    let mut cmd = make_bash_command(&script.path, args, deploy_dir, &channel_path);
     let mut child = cmd
         .spawn()
-        .context("failed to spawn `bash` (is bash on PATH? on Windows, run under WSL)")?;
+        .context("failed to spawn `bash` (is bash on PATH? on Windows you need WSL or Git Bash)")?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -175,6 +166,84 @@ fn parse_record(rec: &str) -> Option<RunEvent> {
         return Some(RunEvent::Watch(text));
     }
     Some(RunEvent::Progress { level, step, text })
+}
+
+/// Build the `bash` command that runs the script, translating paths for WSL
+/// when the Windows-native binary is driving `bash.exe` (WSL2).
+///
+/// On Windows, `bash` is typically WSL's launcher, which cannot resolve Windows
+/// paths like `C:\…`. If `wslpath` is available we convert the script, working
+/// directory, and channel path to `/mnt/c/…` form and `cd` into the dir before
+/// exec'ing the script. Everywhere else (Linux, macOS, Windows Git Bash) we
+/// pass native paths directly.
+fn make_bash_command(
+    script_path: &Path,
+    args: &[String],
+    deploy_dir: &Path,
+    channel_path: &Path,
+) -> Command {
+    let mut cmd = Command::new("bash");
+
+    #[cfg(windows)]
+    if let (Some(wsl_script), Some(wsl_dir), Some(wsl_chan)) = (
+        wslpath(script_path),
+        wslpath(deploy_dir),
+        wslpath(channel_path),
+    ) {
+        let inner = format!(
+            "cd {} && exec bash {} \"$@\"",
+            sh_single_quote(&wsl_dir),
+            sh_single_quote(&wsl_script),
+        );
+        cmd.arg("-c")
+            .arg(inner)
+            .arg("aswarm-deploy") // $0 for the inner shell
+            .args(args)
+            .env("DEPLOY_TUI", "1")
+            .env("DEPLOY_TUI_CHANNEL", wsl_chan)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        return cmd;
+    }
+
+    cmd.arg(script_path)
+        .args(args)
+        .current_dir(deploy_dir)
+        .env("DEPLOY_TUI", "1")
+        .env("DEPLOY_TUI_CHANNEL", channel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Convert a Windows path to its WSL (`/mnt/c/…`) form via `wslpath`.
+/// Returns `None` if `wslpath` is unavailable (e.g. Git Bash), so the caller
+/// falls back to passing the native path.
+#[cfg(windows)]
+fn wslpath(path: &Path) -> Option<String> {
+    let win = path.to_str()?;
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("wslpath -a -u {}", sh_single_quote(win)))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Single-quote a string for safe interpolation into a bash command line.
+#[cfg(windows)]
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// A unique temp path for this run's structured progress channel.
