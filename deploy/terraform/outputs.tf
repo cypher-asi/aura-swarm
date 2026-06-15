@@ -27,6 +27,11 @@ output "agent_subnet_ids" {
   value       = var.enable_network ? module.network[0].agent_subnet_ids : []
 }
 
+output "podvm_subnet_ids" {
+  description = "IDs of the dedicated Peer Pods pod-VM subnets (set CAA AWS_SUBNET_ID to one of these)"
+  value       = var.enable_network ? module.network[0].podvm_subnet_ids : []
+}
+
 output "storage_subnet_ids" {
   description = "IDs of storage subnets"
   value       = var.enable_network ? module.network[0].storage_subnet_ids : []

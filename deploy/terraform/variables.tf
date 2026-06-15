@@ -48,6 +48,12 @@ variable "private_subnet_cidr" {
   default     = "10.0.2.0/24"
 }
 
+variable "podvm_subnet_cidr" {
+  description = "CIDR for the dedicated Peer Pods pod-VM subnets (isolated from the VPC CNI so pod VMs never exhaust addresses)"
+  type        = string
+  default     = "10.0.8.0/21"
+}
+
 variable "agent_subnet_cidr" {
   description = "CIDR block for agent subnet (confidential agent pods + node groups)"
   type        = string

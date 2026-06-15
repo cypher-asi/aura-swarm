@@ -77,8 +77,8 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(var.tags, {
-    Name                                           = "${var.resource_prefix}-public-${var.availability_zones[count.index]}"
-    "kubernetes.io/role/elb"                       = "1"
+    Name                                                   = "${var.resource_prefix}-public-${var.availability_zones[count.index]}"
+    "kubernetes.io/role/elb"                               = "1"
     "kubernetes.io/cluster/${var.resource_prefix}-cluster" = "shared"
   })
 }
@@ -95,8 +95,8 @@ resource "aws_subnet" "private" {
   availability_zone = var.availability_zones[count.index]
 
   tags = merge(var.tags, {
-    Name                                           = "${var.resource_prefix}-private-${var.availability_zones[count.index]}"
-    "kubernetes.io/role/internal-elb"              = "1"
+    Name                                                   = "${var.resource_prefix}-private-${var.availability_zones[count.index]}"
+    "kubernetes.io/role/internal-elb"                      = "1"
     "kubernetes.io/cluster/${var.resource_prefix}-cluster" = "shared"
   })
 }
@@ -113,8 +113,37 @@ resource "aws_subnet" "agent" {
   availability_zone = var.availability_zones[count.index]
 
   tags = merge(var.tags, {
-    Name                                           = "${var.resource_prefix}-agent-${var.availability_zones[count.index]}"
+    Name                                                   = "${var.resource_prefix}-agent-${var.availability_zones[count.index]}"
     "kubernetes.io/cluster/${var.resource_prefix}-cluster" = "shared"
+  })
+}
+
+#------------------------------------------------------------------------------
+# Pod-VM Subnets (dedicated to Peer Pods / CAA-launched SEV-SNP pod VMs)
+#
+# CAA launches one EC2 pod VM per confidential agent, each needing an IP in the
+# subnet named by AWS_SUBNET_ID. The agent subnets are ALSO used by the AWS VPC
+# CNI, which assigns every Kubernetes pod a real subnet IP and pre-warms ENIs —
+# so the small agent /25s get exhausted and RunInstances fails with
+# InsufficientFreeAddressesInSubnet, leaving every confidential agent stuck.
+# These dedicated subnets are deliberately large and carry NO
+# kubernetes.io/cluster or kubernetes.io/role tags, so neither EKS nor the VPC
+# CNI ever place nodes or pod IPs here — the whole range is reserved for pod VMs.
+# They route egress through the NAT gateway (in-guest guest-pull needs to reach
+# the registry); worker<->pod-VM and pod-VM->KBS rules are already VPC-CIDR
+# scoped, so no security-group change is required.
+#------------------------------------------------------------------------------
+
+resource "aws_subnet" "podvm" {
+  count = length(var.availability_zones)
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.podvm_subnet_cidr, 1, count.index)
+  availability_zone = var.availability_zones[count.index]
+
+  tags = merge(var.tags, {
+    Name              = "${var.resource_prefix}-podvm-${var.availability_zones[count.index]}"
+    "aura.swarm/pool" = "tee-podvm"
   })
 }
 
@@ -195,5 +224,13 @@ resource "aws_route_table_association" "storage" {
   count = length(var.availability_zones)
 
   subnet_id      = aws_subnet.storage[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+# Pod-VM subnets egress via NAT (in-guest guest-pull reaches the registry).
+resource "aws_route_table_association" "podvm" {
+  count = length(var.availability_zones)
+
+  subnet_id      = aws_subnet.podvm[count.index].id
   route_table_id = aws_route_table.private.id
 }

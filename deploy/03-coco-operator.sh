@@ -77,10 +77,26 @@ if printf '%s' "${AGENT_SUBNET_IDS_RAW}" | jq -e 'type=="array"' >/dev/null 2>&1
 else
     AGENT_SUBNET_IDS="${AGENT_SUBNET_IDS_RAW}"
 fi
-# The peerpods chart takes a SINGLE pod-VM subnet (AWS_SUBNET_ID), not a list;
-# launch pod VMs into the first agent subnet (must be EFS-reachable — see
-# PEER-PODS-PLAN §6.1). Override with CAA_PODVM_SUBNET_ID to pin another.
-CAA_PODVM_SUBNET_ID="${CAA_PODVM_SUBNET_ID:-${AGENT_SUBNET_IDS%%,*}}"
+# The peerpods chart takes a SINGLE pod-VM subnet (AWS_SUBNET_ID), not a list.
+# Prefer the DEDICATED pod-VM subnet (large, isolated from the VPC CNI) so pod VMs
+# never hit InsufficientFreeAddressesInSubnet the way the shared agent /25 did.
+# Fall back to the first agent subnet for clusters not yet re-applied with the
+# dedicated subnet. Override explicitly with CAA_PODVM_SUBNET_ID.
+PODVM_SUBNET_IDS_RAW="$(tf_output podvm_subnet_ids 2>/dev/null || true)"
+if printf '%s' "${PODVM_SUBNET_IDS_RAW}" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    PODVM_SUBNET_IDS="$(printf '%s' "${PODVM_SUBNET_IDS_RAW}" | jq -r 'join(",")')"
+else
+    PODVM_SUBNET_IDS="${PODVM_SUBNET_IDS_RAW}"
+fi
+if [[ -n "${CAA_PODVM_SUBNET_ID:-}" ]]; then
+    : # operator-pinned; honor it
+elif [[ -n "${PODVM_SUBNET_IDS%%,*}" && "${PODVM_SUBNET_IDS%%,*}" != "null" ]]; then
+    CAA_PODVM_SUBNET_ID="${PODVM_SUBNET_IDS%%,*}"
+else
+    CAA_PODVM_SUBNET_ID="${AGENT_SUBNET_IDS%%,*}"
+    log_warn "No dedicated pod-VM subnet found (terraform output podvm_subnet_ids empty) — falling back to the agent subnet."
+    log_detail "Re-run ./02-snp-node-group.sh to create the dedicated pod-VM subnet (avoids InsufficientFreeAddressesInSubnet)."
+fi
 NODE_SG_ID="$(tf_output node_security_group_id)"
 
 # The CAA IRSA role is owned by org-admin's ./01-iam.sh (IAM left terraform for

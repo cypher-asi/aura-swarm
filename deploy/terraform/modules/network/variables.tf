@@ -28,6 +28,12 @@ variable "storage_subnet_cidr" {
   type        = string
 }
 
+variable "podvm_subnet_cidr" {
+  description = "CIDR block for the dedicated Peer Pods pod-VM subnets (NOT used by the VPC CNI for pod IPs, so pod VMs never run out of addresses). Large on purpose."
+  type        = string
+  default     = "10.0.8.0/21"
+}
+
 variable "availability_zones" {
   description = "List of availability zones"
   type        = list(string)

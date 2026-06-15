@@ -43,6 +43,16 @@ output "storage_subnet_ids" {
   value       = aws_subnet.storage[*].id
 }
 
+output "podvm_subnet_ids" {
+  description = "IDs of the dedicated Peer Pods pod-VM subnets"
+  value       = aws_subnet.podvm[*].id
+}
+
+output "podvm_subnet_cidrs" {
+  description = "CIDR blocks of the dedicated pod-VM subnets"
+  value       = aws_subnet.podvm[*].cidr_block
+}
+
 output "storage_subnet_cidrs" {
   description = "CIDR blocks of storage subnets"
   value       = aws_subnet.storage[*].cidr_block

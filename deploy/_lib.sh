@@ -72,6 +72,29 @@ fi
 # Best-effort warning tally for the step footer.
 LOG_WARN_COUNT=0
 
+# Mirror a curated log line to the deploy TUI (crates/aura-swarm-deploy) on a
+# dedicated structured channel, so it can render the left "progress" column as
+# styled widgets while raw command output flows to stdout/stderr.
+#
+# Record format (one per line): <level><US><step-id><US><text>, where <US> is
+# the ASCII Unit Separator (0x1f). The channel is the file in DEPLOY_TUI_CHANNEL
+# (the TUI tails it), or FD 3 as a fallback. Fully additive: a no-op unless
+# DEPLOY_TUI=1, and it never disturbs normal terminal/file output.
+_tui_emit() {
+    [[ "${DEPLOY_TUI:-0}" == "1" ]] || return 0
+    local level="$1"; shift
+    if [[ -n "${DEPLOY_TUI_CHANNEL:-}" ]]; then
+        printf '%s\037%s\037%s\n' "${level}" "${STEP_ID:-}" "$*" \
+            >> "${DEPLOY_TUI_CHANNEL}" 2>/dev/null || true
+    else
+        printf '%s\037%s\037%s\n' "${level}" "${STEP_ID:-}" "$*" >&3 2>/dev/null || true
+    fi
+}
+
+# Hint the TUI which read-only command it should poll for the live infra-state
+# pane (e.g. log_watch "kubectl get pods -n aura"). No-op outside the TUI.
+log_watch() { _tui_emit watch "$*"; }
+
 _log_rule() {
     local n="${1:-60}" out="" i
     for ((i = 0; i < n; i++)); do out+="${RULE_CHAR}"; done
@@ -80,30 +103,32 @@ _log_rule() {
 
 # Section header (a labelled group of status lines under a step).
 log_section() {
+    _tui_emit section "$*"
     printf '\n%s%s %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "$*" "${NC}"
 }
 
 # Status lines (2-space indent so they nest under the section header).
-log_ok()   { printf '  %s%s%s %s\n' "${GREEN}"  "${ICON_OK}"   "${NC}" "$*"; }
-log_info() { printf '  %s%s%s %s\n' "${BLUE}"   "${ICON_INFO}" "${NC}" "$*"; }
+log_ok()   { _tui_emit ok "$*";   printf '  %s%s%s %s\n' "${GREEN}"  "${ICON_OK}"   "${NC}" "$*"; }
+log_info() { _tui_emit info "$*"; printf '  %s%s%s %s\n' "${BLUE}"   "${ICON_INFO}" "${NC}" "$*"; }
 log_warn() {
     LOG_WARN_COUNT=$((LOG_WARN_COUNT + 1))
+    _tui_emit warn "$*"
     printf '  %s%s%s %s\n' "${YELLOW}" "${ICON_WARN}" "${NC}" "$*"
 }
 # Errors go to stderr so they survive command substitution.
-log_err()  { printf '  %s%s%s %s\n' "${RED}" "${ICON_ERR}" "${NC}" "$*" >&2; }
+log_err()  { _tui_emit err "$*"; printf '  %s%s%s %s\n' "${RED}" "${ICON_ERR}" "${NC}" "$*" >&2; }
 
 # Dim, indented context/continuation lines (comments, notes, sub-detail).
-log_detail() { printf '    %s%s%s\n' "${DIM}" "$*" "${NC}"; }
+log_detail() { _tui_emit detail "$*"; printf '    %s%s%s\n' "${DIM}" "$*" "${NC}"; }
 
 # A command about to run (or being shown for reference).
-log_cmd() { printf '  %s$ %s%s\n' "${DIM}" "$*" "${NC}"; }
+log_cmd() { _tui_emit cmd "$*"; printf '  %s$ %s%s\n' "${DIM}" "$*" "${NC}"; }
 
 # A progress/poll line (e.g. "[30s] waiting ...").
-log_progress() { printf '  %s%s%s\n' "${DIM}" "$*" "${NC}"; }
+log_progress() { _tui_emit progress "$*"; printf '  %s%s%s\n' "${DIM}" "$*" "${NC}"; }
 
 # Aligned key/value, for summaries (identity, region, ARNs, ...).
-log_kv() { printf '  %s%-22s%s %s\n' "${DIM}" "$1" "${NC}" "${2:-}"; }
+log_kv() { _tui_emit kv "$1: ${2:-}"; printf '  %s%-22s%s %s\n' "${DIM}" "$1" "${NC}" "${2:-}"; }
 
 # Filter: uniformly indent a block of streamed sub-command output (4 spaces).
 # Usage:  some-command 2>&1 | indent
@@ -253,6 +278,7 @@ step_banner() {
     local rule meta
     rule="$(_log_rule)"
     meta="Run as: ${STEP_OWNER:-n/a}  ${ICON_BULLET}  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    _tui_emit banner "${title}"
     printf '\n%s%s%s\n' "${BOLD}${CYAN}" "${rule}" "${NC}"
     printf '%s %s  Aura Swarm TEE Rollout — Step %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "${STEP_ID}" "${NC}"
     printf '%s    %s%s\n' "${BOLD}" "${title}" "${NC}"
@@ -270,6 +296,7 @@ step_ok() {
     local parts="STEP ${STEP_ID} OK$(_step_owner_tag)  ${ICON_BULLET}  $(_log_elapsed)"
     [[ "${LOG_WARN_COUNT:-0}" -gt 0 ]] && parts+="  ${ICON_BULLET}  ${LOG_WARN_COUNT} warning(s)"
     [[ -n "${next}" ]] && parts+="  —  proceed to ${next}"
+    _tui_emit step_ok "${parts}"
     printf '\n%s%s %s%s\n' "${GREEN}${BOLD}" "${ICON_OK}" "${parts}" "${NC}"
 }
 
@@ -277,6 +304,7 @@ step_ok() {
 # (e.g. failures inside render_k8s_manifests).
 step_fail() {
     local parts="STEP ${STEP_ID} FAILED$(_step_owner_tag)  ${ICON_BULLET}  $(_log_elapsed): $*"
+    _tui_emit step_fail "${parts}"
     printf '\n%s%s %s%s\n' "${RED}${BOLD}" "${ICON_ERR}" "${parts}" "${NC}" >&2
     exit 1
 }
@@ -2301,6 +2329,7 @@ public_subnet_cidr  = "${PUBLIC_SUBNET_CIDR}"
 private_subnet_cidr = "${PRIVATE_SUBNET_CIDR}"
 agent_subnet_cidr   = "${AGENT_SUBNET_CIDR}"
 storage_subnet_cidr = "${STORAGE_SUBNET_CIDR}"
+podvm_subnet_cidr   = "${PODVM_SUBNET_CIDR}"
 
 # EKS configuration. Agents run as Peer Pods (off-cluster SEV-SNP pod VMs);
 # there is no on-node confidential pool. The CAA worker<->pod-VM SG rules are

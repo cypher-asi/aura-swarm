@@ -48,6 +48,7 @@ module "network" {
   private_subnet_cidr = var.private_subnet_cidr
   agent_subnet_cidr   = var.agent_subnet_cidr
   storage_subnet_cidr = var.storage_subnet_cidr
+  podvm_subnet_cidr   = var.podvm_subnet_cidr
   availability_zones  = local.availability_zones
   tags                = local.common_tags
 }
