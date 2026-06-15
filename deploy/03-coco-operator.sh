@@ -215,8 +215,19 @@ if kubectl get runtimeclass kata-remote >/dev/null 2>&1; then
         kubectl delete runtimeclass kata-remote --ignore-not-found >/dev/null 2>&1 || true
         log_ok "Reset kata-remote RuntimeClass field ownership before upgrade (no running kata-remote pods)"
     else
-        log_warn "${KR_RUNNING} kata-remote pod(s) Running — leaving the RuntimeClass in place."
-        log_detail "If helm upgrade hits an overhead field-manager conflict, drain those pods and re-run."
+        # Pods are Running, so deleting the RuntimeClass (which would briefly break
+        # new-pod admission until kata-deploy recreates it) is unsafe. Instead drop
+        # the stale "kubectl-patch" field-manager ownership of .overhead.podFixed
+        # (from a prior overhead-zeroing) by stripping managedFields — the object
+        # stays in place, so running pods + admission are unaffected, and helm's
+        # server-side apply can then re-own the overhead without conflicting.
+        log_warn "${KR_RUNNING} kata-remote pod(s) Running — clearing RuntimeClass field ownership in place (not deleting)."
+        if kubectl patch runtimeclass kata-remote --type=json \
+            -p='[{"op":"remove","path":"/metadata/managedFields"}]' >/dev/null 2>&1; then
+            log_ok "Cleared kata-remote RuntimeClass field ownership (helm re-owns overhead; no disruption to running pods)"
+        else
+            log_detail "If helm upgrade hits an overhead field-manager conflict, drain those pods and re-run."
+        fi
     fi
 fi
 
