@@ -1,0 +1,32 @@
+[package]
+name = "aura-swarm-deploy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal UI for running the Aura Swarm staged deploy scripts"
+
+[[bin]]
+name = "aswarm-deploy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (process spawning + piped IO + timers)
+tokio.workspace = true
+futures.workspace = true
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+
+# Date/time (elapsed + snapshot timestamps)
+chrono.workspace = true
+
+[lints]
+workspace = true

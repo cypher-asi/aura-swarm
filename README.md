@@ -95,6 +95,7 @@ See the [full specification](docs/spec/v0.2.0/README.md) for production deployme
 | `aura-swarm-gateway` | Public Axum HTTP/WebSocket API, auth middleware, run/terminal/file/secrets proxying, internal service API |
 | `aura-swarm-client` | Typed client for external consumers (aura-os, aura-network) |
 | `aura-swarm-cli` | Terminal UI (`aswarm`): agent listing, creation, and interactive chat via ratatui |
+| `aura-swarm-deploy` | Deploy TUI (`aswarm-deploy`): runs the staged `deploy/` scripts with a curated step-progress column and a live machine view (raw output + read-only infra-state snapshots) via ratatui |
 
 The agent runtime inside the TEE is **aura-harness** (sibling repository): attestation boot, sealed stores, secrets vault, processes, run/terminal/file APIs.
 
@@ -112,6 +113,7 @@ aura-swarm/
     aura-swarm-gateway/         # public HTTP + WebSocket API
     aura-swarm-client/          # typed external client
     aura-swarm-cli/             # terminal UI (aswarm)
+    aura-swarm-deploy/          # deploy-script runner TUI (aswarm-deploy)
   docker/
     Dockerfile.gateway          # gateway container image
     Dockerfile.control          # control plane container image

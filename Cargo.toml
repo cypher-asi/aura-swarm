@@ -8,6 +8,7 @@ members = [
     "crates/aura-swarm-scheduler",
     "crates/aura-swarm-gateway",
     "crates/aura-swarm-cli",
+    "crates/aura-swarm-deploy",
     "crates/aura-swarm-protocol",
     "crates/aura-swarm-client",
 ]
@@ -19,6 +20,7 @@ default-members = [
     "crates/aura-swarm-scheduler",
     "crates/aura-swarm-gateway",
     "crates/aura-swarm-cli",
+    "crates/aura-swarm-deploy",
     "crates/aura-swarm-protocol",
     "crates/aura-swarm-client",
 ]

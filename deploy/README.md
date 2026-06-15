@@ -4,6 +4,21 @@ Numbered scripts implementing the Swarm TEE upgrade rollout (R1 dual-mode → R2
 
 The pre-TEE-rollout scripts live in [legacy/](legacy/) for reference.
 
+## Deploy TUI (`aswarm-deploy`)
+
+For an interactive runner, build the [`aura-swarm-deploy`](../crates/aura-swarm-deploy) crate and launch the TUI from the repo root:
+
+```
+cargo run --release --bin aswarm-deploy
+```
+
+Pick a script with the arrow keys (optionally press `e` to add arguments such as `--ref master` or `--skip-test-agent`) and press Enter to run it. While a script runs you get a two-column view:
+
+- **Left — Progress:** the script's curated step feed (`step_banner`, `log_section`, `log_ok/info/warn/err`, …) rendered as styled widgets, with a spinner on the active step.
+- **Right — live machine view:** the top pane streams the raw stdout/stderr of the underlying `terraform`/`kubectl`/`aws`/`docker` commands; the bottom pane shows a periodic, read-only infra-state snapshot (default `kubectl get nodes` + `kubectl get pods -A`, overridable with `--watch` / `AURA_DEPLOY_WATCH`, or per-step via a `log_watch "<cmd>"` hint in the script).
+
+`Tab` switches which pane scrolls, `Esc` cancels a running script, and the scripts behave identically outside the TUI — it only sets `DEPLOY_TUI=1` + `DEPLOY_TUI_CHANNEL` so [`_lib.sh`](_lib.sh) can mirror its curated log lines onto a structured side-channel. Because the scripts are bash, run the TUI where `bash` and your cloud tooling live; on Windows, run it under WSL.
+
 ## Prerequisites
 
 - `config.env` (sourced by every script) defines region, cluster, node groups, namespaces, and the `org-admin`/`ops-admin` permission-set + policy names (see [Separation of duties](#separation-of-duties)).

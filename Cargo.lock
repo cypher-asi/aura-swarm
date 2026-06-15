@@ -264,6 +264,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-swarm-deploy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
 name = "aura-swarm-gateway"
 version = "0.1.0"
 dependencies = [
