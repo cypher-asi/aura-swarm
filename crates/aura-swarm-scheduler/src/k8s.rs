@@ -1360,6 +1360,22 @@ fn detect_stuck_pod(
     let phase = status
         .and_then(|s| s.phase.as_deref())
         .unwrap_or("Unknown");
+
+    // A pod in phase Running whose container has started but is not yet Ready is
+    // still legitimately progressing, not stuck. A confidential (kata-remote)
+    // agent boots its in-guest harness only AFTER the pod-VM image pull — it then
+    // attests, fetches its sealed-state DEK, opens the sealed store, and starts
+    // serving /health — and that Running-but-not-Ready window routinely runs past
+    // the base stuck budget. The container has left the `waiting` state by then,
+    // so without this it would fall through and be escalated at `stuck_threshold`
+    // (120s), falsely terminalizing an agent that was seconds from Ready. Give a
+    // Running pod the longer `pull_threshold` budget instead; a genuinely wedged
+    // harness still escalates at `pull_threshold`, and hard container errors are
+    // caught immediately upstream by `extract_container_error`.
+    if phase == "Running" && age < pull_threshold {
+        return None;
+    }
+
     Some(format!(
         "pod stuck in phase {phase} for {}s with no progress signal",
         age.num_seconds()
@@ -2127,6 +2143,33 @@ mod tests {
     fn detect_stuck_pod_without_timestamps_returns_none() {
         let pod = Pod::default();
         assert!(detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).is_none());
+    }
+
+    #[test]
+    fn detect_stuck_pod_running_not_ready_within_pull_grace_returns_none() {
+        // A confidential pod whose container has Started (phase=Running) but is
+        // not yet Ready is booting the in-guest harness (attestation + DEK fetch
+        // + sealed-state open). Past the base stuck budget but inside the pull
+        // grace it must NOT be escalated, or it gets flipped to Error seconds
+        // before going Ready.
+        let mut pod = pod_with_age_secs(200);
+        pod.status.as_mut().unwrap().phase = Some("Running".to_string());
+        assert!(
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).is_none(),
+            "Running-but-not-Ready within the pull grace window must not be flagged stuck"
+        );
+    }
+
+    #[test]
+    fn detect_stuck_pod_running_not_ready_past_pull_grace_is_stuck() {
+        // A genuinely wedged Running pod (never Ready well past the pull grace)
+        // still escalates so a hung harness is not Provisioning forever.
+        let mut pod = pod_with_age_secs(700);
+        pod.status.as_mut().unwrap().phase = Some("Running".to_string());
+        let msg =
+            detect_stuck_pod(&pod, Utc::now(), STUCK_THRESHOLD, PULL_THRESHOLD).expect("stuck");
+        assert!(msg.contains("Running"), "expected phase in message: {msg}");
+        assert!(msg.contains("700s"), "expected age in message: {msg}");
     }
 
     // =========================================================================
