@@ -68,11 +68,21 @@ rm -f "${TMP_SC}"
 kubectl apply -f "${SCRIPT_DIR}/k8s/11-trustee.yaml"
 log_ok "Trustee manifests applied"
 
+# A ConfigMap edit does NOT restart the KBS Deployment on its own, so a change to
+# kbs-config.toml (e.g. the [attestation_token] verifier settings) would otherwise
+# sit inert while the running pod keeps its stale config. That manifests as
+# "Cannot verify token since trusted JWK Set is empty" -> 401 on every
+# attestation-gated resource read, so the agent harness's DEK fetch fails (CDH 500)
+# and confidential agents never reach Ready. Force the pod to adopt the current
+# ConfigMap. Idempotent; the Recreate strategy means only a brief gap during this
+# setup step. Best-effort on a brand-new cluster (the Deployment was just created).
+kubectl rollout restart deployment/kbs -n "${K8S_NAMESPACE_SYSTEM}" >/dev/null 2>&1 || true
+
 echo ""
 log_info "Waiting for the KBS deployment..."
 kubectl rollout status deployment/kbs -n "${K8S_NAMESPACE_SYSTEM}" --timeout=300s \
     || step_fail "KBS deployment did not become ready (check kbs-repository PVC binding and the kbs-auth-public-key secret)"
-log_ok "KBS pod ready"
+log_ok "KBS pod ready (restarted to adopt the current kbs-config)"
 
 #------------------------------------------------------------------------------
 # Verify: service resolves + listener answers from inside the cluster
