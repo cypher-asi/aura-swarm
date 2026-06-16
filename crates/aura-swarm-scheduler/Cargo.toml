@@ -46,6 +46,10 @@ thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 uuid = { workspace = true }
+# CoCo initdata (cc_init_data annotation) is gzip+base64 of the aa.toml/cdh.toml
+# TOML that tells the in-guest CDH where the KBS is.
+base64.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -148,6 +148,17 @@ pub struct SchedulerConfig {
     /// receive this variable.
     #[serde(default = "default_kbs_url")]
     pub kbs_url: String,
+    /// VPC-routable KBS address for the in-guest CoCo components (attestation
+    /// agent + CDH) on the pod VM, baked into the `cc_init_data` initdata
+    /// annotation. Unlike `kbs_url` (the in-cluster ClusterIP DNS the harness
+    /// reports), this MUST be reachable from the off-cluster pod VM, which has
+    /// no kube-proxy and so cannot resolve/route a ClusterIP — see
+    /// `deploy/05-peer-pods-smoke-test.sh`. It is resolved at schedule time
+    /// (the live KBS pod IP), not configured statically, so it is `None` by
+    /// default and skipped during (de)serialization; `K8sScheduler` populates a
+    /// per-pod clone of the config before building a confidential pod.
+    #[serde(skip)]
+    pub kbs_guest_url: Option<String>,
     /// Node selector applied to confidential (`kata-remote`) agent pods so
     /// they land on a dedicated peer-pods worker pool (e.g. the clean
     /// `aura-swarm-tee-hosts` node group) instead of competing for VM slots
@@ -181,6 +192,7 @@ impl Default for SchedulerConfig {
             aura_network_url: "https://aura-network.onrender.com".to_string(),
             gateway_token: String::new(),
             kbs_url: default_kbs_url(),
+            kbs_guest_url: None,
             agent_node_selector: BTreeMap::new(),
         }
     }

@@ -14,11 +14,63 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
+use std::io::Write;
+
+use base64::Engine as _;
+use flate2::{write::GzEncoder, Compression};
 
 use crate::SchedulerConfig;
 
 /// The container port for the Aura runtime HTTP server.
 const AURA_PORT: i32 = 8080;
+
+/// Kata annotation carrying the gzip+base64 CoCo initdata. The kata-agent
+/// inflates it inside the pod VM and writes `aa.toml`/`cdh.toml`, which point
+/// the in-guest attestation agent + confidential-data-hub at the KBS. Without
+/// it the CDH has no KBS endpoint and the harness's DEK fetch fails with
+/// "[CDH] [ERROR]: Get Resource failed" (surfaced as a CDH 500) — the request
+/// never even reaches the KBS, so the agent never opens sealed state.
+const CC_INIT_DATA_ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
+
+/// Build the gzip+base64 CoCo `cc_init_data` payload that points the in-guest
+/// attestation agent (`aa.toml`) and confidential-data-hub (`cdh.toml`) at the
+/// KBS. `kbs_guest_url` must be VPC-routable from the pod VM (e.g. the KBS pod
+/// IP), NOT the in-cluster ClusterIP DNS. Mirrors the initdata the proven
+/// `deploy/05-peer-pods-smoke-test.sh` injects.
+fn build_cc_init_data(kbs_guest_url: &str) -> Option<String> {
+    // The `cc_kbc` KBC name selects the CoCo KBS attestation client; the AA and
+    // CDH both target the same KBS URL. Single-quoted TOML strings are fine here
+    // because a validated http(s) URL contains no single quotes.
+    let toml = format!(
+        "algorithm = \"sha384\"\n\
+         version = \"0.1.0\"\n\
+         \n\
+         [data]\n\
+         \"aa.toml\" = '''\n\
+         [token_configs]\n\
+         [token_configs.coco_as]\n\
+         url = '{url}'\n\
+         \n\
+         [token_configs.kbs]\n\
+         url = '{url}'\n\
+         '''\n\
+         \n\
+         \"cdh.toml\" = '''\n\
+         socket = 'unix:///run/confidential-containers/cdh.sock'\n\
+         credentials = []\n\
+         \n\
+         [kbc]\n\
+         name = 'cc_kbc'\n\
+         url = '{url}'\n\
+         '''\n",
+        url = kbs_guest_url
+    );
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(toml.as_bytes()).ok()?;
+    let gzipped = encoder.finish().ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(gzipped))
+}
 
 /// Build a Kubernetes pod spec for an agent.
 ///
@@ -154,6 +206,19 @@ fn build_metadata(
             "io.containerd.cri.runtime-handler".to_string(),
             handler.to_string(),
         );
+
+        // Confidential (kata-remote / Peer Pods) agents attest and fetch their
+        // sealed-state DEK through the in-guest CDH, which only knows where the
+        // KBS is via this initdata. The guest-reachable KBS address is resolved
+        // at schedule time (see K8sScheduler::resolve_kbs_guest_url) because the
+        // pod VM cannot reach the ClusterIP `kbs_url`. If it is unset we emit no
+        // annotation (the scheduler fails fast before this for confidential
+        // pods), so non-confidential/dev pods and tests are unaffected.
+        if let Some(kbs_guest_url) = config.kbs_guest_url.as_deref() {
+            if let Some(init_data) = build_cc_init_data(kbs_guest_url) {
+                annotations.insert(CC_INIT_DATA_ANNOTATION.to_string(), init_data);
+            }
+        }
     }
 
     ObjectMeta {
@@ -863,6 +928,62 @@ mod tests {
             .as_ref()
             .expect("confidential pod should carry the configured node selector");
         assert_eq!(sel.get("aura.swarm/pool"), Some(&"tee".to_string()));
+    }
+
+    #[test]
+    fn confidential_pod_injects_cc_init_data_when_kbs_guest_url_set() {
+        use std::io::Read as _;
+
+        let agent_id = test_agent_id();
+        let key_id = format!("swarm/agents/{agent_id}/state-key");
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            storage_encryption: StorageEncryption::Sealed { key_id },
+            ..test_spec(&agent_id)
+        };
+        let mut config = SchedulerConfig::default();
+        config.kbs_guest_url = Some("http://10.0.3.169:8080".to_string());
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let annotations = pod.metadata.annotations.as_ref().unwrap();
+        let b64 = annotations
+            .get(CC_INIT_DATA_ANNOTATION)
+            .expect("confidential pod with a resolved KBS guest URL must carry cc_init_data");
+
+        // It must be gzip+base64 of TOML that points the in-guest AA/CDH at the
+        // resolved (VPC-routable) KBS address.
+        let gz = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("cc_init_data must be valid base64");
+        let mut toml = String::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_string(&mut toml)
+            .expect("cc_init_data must be valid gzip");
+        assert!(toml.contains("name = 'cc_kbc'"), "TOML: {toml}");
+        assert!(
+            toml.matches("url = 'http://10.0.3.169:8080'").count() >= 3,
+            "KBS URL must be set for coco_as, kbs, and the cdh kbc: {toml}"
+        );
+    }
+
+    #[test]
+    fn confidential_pod_omits_cc_init_data_without_kbs_guest_url() {
+        let agent_id = test_agent_id();
+        let key_id = format!("swarm/agents/{agent_id}/state-key");
+        let spec = AgentSpec {
+            isolation: Some(IsolationLevel::ConfidentialVM),
+            storage_encryption: StorageEncryption::Sealed { key_id },
+            ..test_spec(&agent_id)
+        };
+        // Default config has kbs_guest_url = None (resolved only at schedule time).
+        let config = SchedulerConfig::default();
+
+        let pod = build_pod(&agent_id, "user-hex", "tee-agent", &spec, &config);
+        let annotations = pod.metadata.annotations.as_ref().unwrap();
+        assert!(
+            !annotations.contains_key(CC_INIT_DATA_ANNOTATION),
+            "no initdata annotation should be emitted until the KBS guest URL is resolved"
+        );
     }
 
     #[test]

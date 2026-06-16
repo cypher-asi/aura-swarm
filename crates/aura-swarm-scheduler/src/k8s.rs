@@ -18,13 +18,21 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
 use aura_swarm_core::AgentId;
-use aura_swarm_store::{AgentSpec, AgentState, BoxTier, LogLine};
+use aura_swarm_store::{AgentSpec, AgentState, BoxTier, IsolationLevel, LogLine};
 
 use crate::billing::ComputeUsageReporter;
 use crate::cache::{EndpointCache, StateCache};
 use crate::pod::build_pod;
 use crate::types::{ActiveAgentInfo, PodInfo, PodPhase, PodStatus, SchedulerConfig};
 use crate::{Result, SchedulerError};
+
+/// Namespace the Trustee KBS runs in (see `deploy/k8s/11-trustee.yaml`). Used to
+/// resolve the KBS pod IP for confidential pods' `cc_init_data` initdata.
+const KBS_NAMESPACE: &str = "swarm-system";
+/// Label selector for the KBS pod.
+const KBS_POD_LABEL: &str = "app=kbs";
+/// Port the KBS HTTP listener serves on.
+const KBS_PORT: u16 = 8080;
 
 /// The `Scheduler` trait defines the interface for pod lifecycle management.
 #[async_trait]
@@ -270,6 +278,30 @@ impl K8sScheduler {
     /// Get the events API client for the configured namespace.
     fn events_api(&self) -> Api<Event> {
         Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
+    /// Resolve a VPC-routable KBS URL for the in-guest CoCo components, used in
+    /// the confidential pod's `cc_init_data` initdata.
+    ///
+    /// The pod VM runs off-cluster and has no kube-proxy, so it cannot reach the
+    /// KBS ClusterIP/DNS; it must target a real VPC address. The KBS pod IP is a
+    /// VPC ENI address reachable over the peer-pods data path, so look up the
+    /// live KBS pod and use its IP. Returns `None` if no Running KBS pod with a
+    /// `podIP` is found. Resolved per pod-creation so a KBS restart (new IP) is
+    /// picked up by the next agent without redeploying the scheduler.
+    async fn resolve_kbs_guest_url(&self) -> Option<String> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), KBS_NAMESPACE);
+        let params = ListParams::default().labels(KBS_POD_LABEL);
+        let list = pods.list(&params).await.ok()?;
+        for pod in list {
+            let status = pod.status.as_ref();
+            let running = status.and_then(|s| s.phase.as_deref()) == Some("Running");
+            let pod_ip = status.and_then(|s| s.pod_ip.as_deref()).unwrap_or("");
+            if running && !pod_ip.is_empty() {
+                return Some(format!("http://{pod_ip}:{KBS_PORT}"));
+            }
+        }
+        None
     }
 
     /// Find a pod belonging to an agent by label selector.
@@ -1474,8 +1506,32 @@ impl Scheduler for K8sScheduler {
             return Ok(());
         }
 
+        // Confidential (kata-remote / Peer Pods) agents attest + fetch their
+        // sealed-state DEK through the in-guest CDH, which learns the KBS
+        // endpoint only from the pod's `cc_init_data` initdata. The pod VM runs
+        // off-cluster and cannot reach the ClusterIP `kbs_url`, so resolve the
+        // VPC-routable KBS pod IP now and thread it into a per-pod config clone.
+        // Fail fast if it cannot be resolved: a confidential pod with no initdata
+        // would just loop forever on the DEK fetch and never reach Ready.
+        let isolation = spec.isolation.unwrap_or(self.config.default_isolation);
+        let build_config = if isolation == IsolationLevel::ConfidentialVM {
+            let kbs_guest_url = self.resolve_kbs_guest_url().await.ok_or_else(|| {
+                SchedulerError::Config(
+                    "could not resolve a VPC-routable KBS address (no Running pod \
+                     with label app=kbs and a podIP in the system namespace); \
+                     confidential agents cannot attest without it"
+                        .to_string(),
+                )
+            })?;
+            let mut cfg = self.config.clone();
+            cfg.kbs_guest_url = Some(kbs_guest_url);
+            cfg
+        } else {
+            self.config.clone()
+        };
+
         // Build and create the pod
-        let pod = build_pod(agent_id, user_id_hex, agent_name, spec, &self.config);
+        let pod = build_pod(agent_id, user_id_hex, agent_name, spec, &build_config);
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
         pods.create(&PostParams::default(), &pod).await?;
 
