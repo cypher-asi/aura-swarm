@@ -73,6 +73,18 @@ spec:
                 secretKeyRef:
                   name: aura-swarm-secrets
                   key: INTERNAL_TOKEN
+            # Trustee KBS: the gateway provisions a per-agent state DEK on
+            # confidential-agent create (and backfills missing ones at startup)
+            # via the KBS admin API. Without these the gateway uses a no-op KBS
+            # client, agents are created with NO DEK, and their harness loops on
+            # the attestation-gated DEK fetch ("CDH ... returned 500") and never
+            # becomes Ready. KBS_ADMIN_KEY_PATH points at the mounted private key.
+            - name: KBS_URL
+              value: "http://kbs.swarm-system.svc.cluster.local:8080"
+            - name: KBS_ENABLED
+              value: "true"
+            - name: KBS_ADMIN_KEY_PATH
+              value: "/etc/kbs-admin/kbs-admin.key"
             # zbilling integration
             - name: Z_BILLING_URL
               valueFrom:
@@ -119,6 +131,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data/aura-swarm
+            - name: kbs-admin-key
+              mountPath: /etc/kbs-admin
+              readOnly: true
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -127,6 +142,14 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: aura-swarm-gateway-data
+        # Admin private key (Ed25519 PEM) for the KBS DEK lifecycle. Synced from
+        # .secrets/kbs-admin.key into the kbs-admin-key Secret by ./04 (
+        # ensure_kbs_admin_keypair). World-readable within the pod (defaultMode
+        # 0444) so the non-root (uid 1000) gateway can read the root-owned file.
+        - name: kbs-admin-key
+          secret:
+            secretName: kbs-admin-key
+            defaultMode: 0444
 ---
 # Internal ClusterIP service
 apiVersion: v1

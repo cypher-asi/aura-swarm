@@ -1339,6 +1339,18 @@ ensure_kbs_admin_keypair() {
         --dry-run=client -o yaml | kubectl apply -f -
     rm -f "${pub_tmp}"
     log_ok "kbs-auth-public-key secret in sync with .secrets/kbs-admin.key"
+
+    # The gateway provisions/backfills per-agent state DEKs via the KBS admin
+    # API, which requires the admin PRIVATE key (the public half above only lets
+    # the KBS verify admin tokens). Mount it into the gateway as a Secret —
+    # WITHOUT it the gateway falls back to the no-op KBS client, agents are
+    # created with NO DEK in KBS, and their harness then loops on the
+    # attestation-gated DEK fetch ("CDH ... returned 500") and never goes Ready.
+    kubectl create secret generic kbs-admin-key \
+        --from-file=kbs-admin.key="${key}" \
+        -n "${K8S_NAMESPACE_SYSTEM}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    log_ok "kbs-admin-key secret (admin private key) in sync for the gateway DEK lifecycle"
 }
 
 #------------------------------------------------------------------------------
