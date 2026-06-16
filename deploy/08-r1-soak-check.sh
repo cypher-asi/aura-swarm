@@ -212,18 +212,40 @@ fi
 log_section "[5/8] tier-change"
 if [[ -n "${TEST_AGENT_ID}" ]]; then
     TIER_OK=true
+    # The observable, runtime-class-agnostic effect of a tier change is a pod
+    # RECREATE that converges back to Running+Ready. For confidential agents the
+    # tier's cpu/memory does NOT show up as a pod resource request — the peer-pods
+    # webhook strips cpu/memory and swaps in the kata.peerpods.io/vm extended
+    # resource (the real sizing lives in the off-cluster pod VM). So assert the
+    # pod was recreated each way (name changes) rather than reading a stripped
+    # cpu request, and only fall back to the cpu-request check for container
+    # (dev-mode) pods that keep their literal requests.
+    POD_BEFORE="$(test_agent_pod)"
+    RC=$(kubectl get pod "${POD_BEFORE}" -n "${K8S_NAMESPACE_AGENTS}" \
+        -o jsonpath='{.spec.runtimeClassName}' 2>/dev/null || echo "")
     gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/tier" '{"tier": "pro"}' >/dev/null 2>&1 || TIER_OK=false
     if [[ "${TIER_OK}" == "true" ]] && wait_test_agent_running 600; then
-        CPU=$(kubectl get pod "$(test_agent_pod)" -n "${K8S_NAMESPACE_AGENTS}" \
-            -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null || echo "")
-        [[ "${CPU}" == "2" || "${CPU}" == "2000m" ]] || TIER_OK=false
+        POD_PRO="$(test_agent_pod)"
+        # Pod must have been recreated (new pod) for the pro tier.
+        [[ -n "${POD_PRO}" && "${POD_PRO}" != "${POD_BEFORE}" ]] || TIER_OK=false
+        if [[ "${RC}" != "kata-remote" ]]; then
+            # Container (dev) pods keep literal requests; verify the bump landed.
+            CPU=$(kubectl get pod "${POD_PRO}" -n "${K8S_NAMESPACE_AGENTS}" \
+                -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null || echo "")
+            [[ "${CPU}" == "2" || "${CPU}" == "2000m" ]] || TIER_OK=false
+        fi
         gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/tier" '{"tier": "standard"}' >/dev/null 2>&1 || TIER_OK=false
-        wait_test_agent_running 600 || TIER_OK=false
+        if wait_test_agent_running 600; then
+            POD_STD="$(test_agent_pod)"
+            [[ -n "${POD_STD}" && "${POD_STD}" != "${POD_PRO}" ]] || TIER_OK=false
+        else
+            TIER_OK=false
+        fi
     else
         TIER_OK=false
     fi
     if [[ "${TIER_OK}" == "true" ]]; then
-        record "tier-change" PASS "standard -> pro (cpu=${CPU:-?}) -> standard"
+        record "tier-change" PASS "standard -> pro -> standard, pod recreated + reconverged each way"
     else
         record "tier-change" FAIL "tier change or pod recreate did not converge"
     fi
