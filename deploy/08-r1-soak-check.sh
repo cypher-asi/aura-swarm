@@ -124,14 +124,34 @@ TIERED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier != null)] | length'
 LEGACY=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.spec.tier == null)] | length')
 ERRORED=$(echo "${ALL_AGENTS}" | jq '[.[] | select(.status == "error")] | length')
 BAD_PODS=$(jq '[.[] | select(.runtime_class != "kata-remote" and .runtime_class != "kata-fc")] | length' "${PODS_JSON}")
-log_detail "Agents: ${TIERED} tiered (TEE), ${LEGACY} legacy, ${ERRORED} in error"
+# An error-state agent is only a real *regression* if it still has a pod. Agents
+# that errored historically (e.g. before a fix) and have no pod are inert
+# records, not a live failure: a dev cluster accumulates many such debris agents
+# (throwaway test/automation agents, e.g. aura-status-remote) that can never
+# self-heal and would otherwise keep this read-only gate permanently red.
+# Cross-reference each error agent against the live pod snapshot and FAIL only on
+# the ones that still have a pod; report the inert remainder as a warning. IDs are
+# normalized to undashed lower-hex so a format difference between
+# /internal/agents/all and the pod label can never cause a false "no pod" match.
+LIVE_ERRORED=$(jq -n --argjson agents "${ALL_AGENTS}" --slurpfile pods "${PODS_JSON}" '
+    (($pods[0] // []) | map(.agent_id | ascii_downcase | gsub("-"; ""))) as $podids
+    | [ $agents[]
+        | select(.status == "error")
+        | (.agent_id | ascii_downcase | gsub("-"; ""))
+        | select($podids | index(.) != null) ]
+    | length' 2>/dev/null || echo 0)
+DEBRIS_ERRORED=$(( ERRORED - LIVE_ERRORED ))
+log_detail "Agents: ${TIERED} tiered (TEE), ${LEGACY} legacy, ${ERRORED} in error (${LIVE_ERRORED} with a live pod, ${DEBRIS_ERRORED} inert/no-pod)"
 jq -r 'group_by(.runtime_class) | .[] | "pods on \(.[0].runtime_class): \(length)"' "${PODS_JSON}" \
     | while IFS= read -r line; do log_detail "${line}"; done
 rm -f "${PODS_JSON}"
-if [[ "${ERRORED}" == "0" && "${BAD_PODS}" == "0" ]]; then
-    record "fleet-read-only" PASS "${TIERED} tiered / ${LEGACY} legacy"
+if [[ "${DEBRIS_ERRORED}" -gt 0 ]]; then
+    log_warn "fleet-read-only ${DEBRIS_ERRORED} inert error-state agent(s) with no pod (pre-existing debris; ignored)"
+fi
+if [[ "${LIVE_ERRORED}" == "0" && "${BAD_PODS}" == "0" ]]; then
+    record "fleet-read-only" PASS "${TIERED} tiered / ${LEGACY} legacy (${DEBRIS_ERRORED} inert error debris ignored)"
 else
-    record "fleet-read-only" FAIL "${ERRORED} error-state agent(s), ${BAD_PODS} pod(s) on unexpected runtime class"
+    record "fleet-read-only" FAIL "${LIVE_ERRORED} error-state agent(s) with a live pod, ${BAD_PODS} pod(s) on unexpected runtime class"
 fi
 
 #------------------------------------------------------------------------------
