@@ -2685,6 +2685,7 @@ render_k8s_manifests() {
     sed -i "s|__INTERNAL_TOKEN__|${token}|g" "${secrets_yaml}"
     sed -i "s|__DEFAULT_ISOLATION__|${DEFAULT_ISOLATION}|g" "${secrets_yaml}"
     sed -i "s|__AGENT_NODE_SELECTOR__|${AGENT_NODE_SELECTOR:-}|g" "${secrets_yaml}"
+    sed -i "s|__POD_VM_INSTANCE_TYPE__|${PODVM_INSTANCE_TYPE:-}|g" "${secrets_yaml}"
 
     local manifest
     for manifest in "${tmp_dir}"/05-*.yaml "${tmp_dir}"/06-*.yaml "${tmp_dir}"/07-*.yaml; do

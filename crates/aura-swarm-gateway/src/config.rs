@@ -55,6 +55,17 @@ pub struct GatewayConfig {
     /// When set, internal endpoints require this token in the Authorization header.
     #[serde(default)]
     pub internal_token: Option<String>,
+
+    /// AWS instance type of the confidential pod VM launched per agent by
+    /// the peer-pods cloud-api-adaptor (mirrors the deploy `PODVM_INSTANCE_TYPE`).
+    ///
+    /// The peer-pods mutating webhook STRIPS the pod's tier-sized cpu/memory
+    /// requests and the real VM is sized by this instance type instead, so the
+    /// agent state endpoint reports these real numbers for confidential agents
+    /// rather than the (stripped, billing-only) tier spec. `None` falls back to
+    /// the tier spec values, so unset config is a no-op.
+    #[serde(default)]
+    pub pod_vm_instance_type: Option<String>,
 }
 
 impl GatewayConfig {
@@ -116,6 +127,9 @@ impl Default for GatewayConfig {
             max_body_bytes: Self::default_max_body(),
             request_timeout_seconds: Self::default_request_timeout(),
             internal_token: std::env::var("INTERNAL_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            pod_vm_instance_type: std::env::var("POD_VM_INSTANCE_TYPE")
                 .ok()
                 .filter(|s| !s.is_empty()),
         }

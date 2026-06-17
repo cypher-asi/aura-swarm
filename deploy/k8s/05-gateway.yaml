@@ -73,6 +73,14 @@ spec:
                 secretKeyRef:
                   name: aura-swarm-secrets
                   key: INTERNAL_TOKEN
+            # Real confidential pod-VM size so the agent state endpoint reports
+            # actual resources (the peer-pods webhook strips the tier spec).
+            - name: POD_VM_INSTANCE_TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: aura-swarm-config
+                  key: POD_VM_INSTANCE_TYPE
+                  optional: true
             # Trustee KBS: the gateway provisions a per-agent state DEK on
             # confidential-agent create (and backfills missing ones at startup)
             # via the KBS admin API. Without these the gateway uses a no-op KBS

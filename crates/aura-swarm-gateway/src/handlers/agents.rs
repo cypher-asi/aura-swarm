@@ -620,10 +620,18 @@ pub(crate) struct AgentStateResponse {
     pub(crate) agent_id: String,
     /// Human-readable name.
     pub(crate) name: String,
-    /// CPU allocation in millicores.
+    /// CPU allocation in millicores. For confidential agents this reflects
+    /// the real pod-VM instance type (the tier spec is stripped by the
+    /// peer-pods webhook), not the billing-only tier request.
     pub(crate) cpu_millicores: u32,
-    /// Memory allocation in megabytes.
+    /// Memory allocation in megabytes. See [`Self::cpu_millicores`] for the
+    /// confidential-agent caveat.
     pub(crate) memory_mb: u32,
+    /// AWS instance type backing a confidential pod VM (e.g. `m6a.xlarge`),
+    /// when known. Absent for container (dev-mode) agents and when the
+    /// gateway has no `POD_VM_INSTANCE_TYPE` configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vm_instance_type: Option<String>,
     /// Runtime version.
     pub(crate) runtime_version: String,
     /// Git commit of the harness build running in the pod, as reported by
@@ -673,6 +681,29 @@ where
         .spec
         .isolation
         .map(|i| format!("{i:?}").to_lowercase());
+
+    // For confidential agents the peer-pods webhook strips the tier-sized
+    // cpu/memory requests and the real VM is sized by `POD_VM_INSTANCE_TYPE`.
+    // Report those real numbers (and the instance type) when configured, so
+    // the UI stops showing the misleading billing-only tier spec. Container
+    // (dev-mode) agents keep their literal spec requests, which are not
+    // stripped.
+    let is_confidential = matches!(
+        agent.spec.isolation,
+        Some(aura_swarm_store::IsolationLevel::ConfidentialVM)
+    );
+    let (cpu_millicores, memory_mb, vm_instance_type) = match (
+        is_confidential,
+        state.config.pod_vm_instance_type.as_deref(),
+    ) {
+        (true, Some(instance_type)) => {
+            let (cpu, mem) = pod_vm_resources(instance_type)
+                .unwrap_or((agent.spec.cpu_millicores, agent.spec.memory_mb));
+            (cpu, mem, Some(instance_type.to_string()))
+        }
+        _ => (agent.spec.cpu_millicores, agent.spec.memory_mb, None),
+    };
+
     let endpoint = state
         .control
         .resolve_agent_endpoint(&agent.agent_id)
@@ -697,14 +728,29 @@ where
         error_message: agent.error_message,
         agent_id: agent.agent_id.to_string(),
         name: agent.name,
-        cpu_millicores: agent.spec.cpu_millicores,
-        memory_mb: agent.spec.memory_mb,
+        cpu_millicores,
+        memory_mb,
+        vm_instance_type,
         runtime_version: agent.spec.runtime_version,
         harness_git_sha,
         isolation,
         endpoint,
         created_at: agent.created_at,
     }))
+}
+
+/// Map a known AWS instance type (the peer-pods pod-VM size) to its real
+/// `(cpu_millicores, memory_mb)`. Covers the families used by the swarm
+/// deploy; unknown types fall back to the tier spec at the call site.
+fn pod_vm_resources(instance_type: &str) -> Option<(u32, u32)> {
+    let resources = match instance_type {
+        "m6a.large" | "m6i.large" | "m5.large" | "m5a.large" => (2000, 8192),
+        "m6a.xlarge" | "m6i.xlarge" | "m5.xlarge" | "m5a.xlarge" => (4000, 16384),
+        "m6a.2xlarge" | "m6i.2xlarge" | "m5.2xlarge" | "m5a.2xlarge" => (8000, 32768),
+        "m6a.4xlarge" | "m6i.4xlarge" | "m5.4xlarge" | "m5a.4xlarge" => (16000, 65536),
+        _ => return None,
+    };
+    Some(resources)
 }
 
 /// Resolve the harness git SHA for a pod endpoint, using the per-endpoint
@@ -771,4 +817,23 @@ async fn probe_harness_git_sha(endpoint: &str) -> Result<Option<String>, ()> {
 /// Parse an agent ID from a string.
 fn parse_agent_id(s: &str) -> Result<AgentId, ApiError> {
     AgentId::from_hex(s).map_err(|_| ApiError::BadRequest(format!("invalid agent ID: {s}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pod_vm_resources;
+
+    #[test]
+    fn known_instance_types_map_to_real_resources() {
+        assert_eq!(pod_vm_resources("m6a.large"), Some((2000, 8192)));
+        assert_eq!(pod_vm_resources("m6a.xlarge"), Some((4000, 16384)));
+        assert_eq!(pod_vm_resources("m6a.2xlarge"), Some((8000, 32768)));
+        assert_eq!(pod_vm_resources("m5.xlarge"), Some((4000, 16384)));
+    }
+
+    #[test]
+    fn unknown_instance_type_falls_back() {
+        assert_eq!(pod_vm_resources("t3.nano"), None);
+        assert_eq!(pod_vm_resources(""), None);
+    }
 }
