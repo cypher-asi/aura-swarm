@@ -89,6 +89,23 @@ trap cleanup EXIT
 test_agent_pod() { agent_pod_name "${TEST_AGENT_ID}"; }
 wait_test_agent_running() { wait_agent_running "${TEST_AGENT_ID}" "${1:-600}"; }
 
+# Wait until the agent's pod is RECREATED away from ${1} (a known prior pod
+# name), i.e. a different (or no) pod is present. A tier change recreates the
+# pod asynchronously: the old pod lingers Running+Ready for a moment, so a bare
+# wait_agent_running would return immediately against the stale pod. Poll for the
+# name to change first, then the caller waits for the new pod to be Ready.
+# Returns 0 once a different pod (or none) is observed, 1 on timeout.
+# Args: old_pod [timeout=300] [poll=5]
+wait_test_agent_pod_recreated() {
+    local old="$1" timeout="${2:-300}" poll="${3:-5}" elapsed=0 cur
+    while [[ ${elapsed} -le ${timeout} ]]; do
+        cur="$(test_agent_pod)"
+        [[ "${cur}" != "${old}" ]] && return 0
+        sleep "${poll}"; elapsed=$((elapsed + poll))
+    done
+    return 1
+}
+
 #------------------------------------------------------------------------------
 # platform-health
 #------------------------------------------------------------------------------
@@ -246,8 +263,12 @@ if [[ -n "${TEST_AGENT_ID}" ]]; then
     POD_BEFORE="$(test_agent_pod)"
     RC=$(kubectl get pod "${POD_BEFORE}" -n "${K8S_NAMESPACE_AGENTS}" \
         -o jsonpath='{.spec.runtimeClassName}' 2>/dev/null || echo "")
+    # The pod recreate is async: wait for the pod NAME to change off the prior one
+    # (so we don't capture the lingering old pod) BEFORE waiting for Running+Ready.
     gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/tier" '{"tier": "pro"}' >/dev/null 2>&1 || TIER_OK=false
-    if [[ "${TIER_OK}" == "true" ]] && wait_test_agent_running 600; then
+    if [[ "${TIER_OK}" == "true" ]] \
+        && wait_test_agent_pod_recreated "${POD_BEFORE}" 300 \
+        && wait_test_agent_running 600; then
         POD_PRO="$(test_agent_pod)"
         # Pod must have been recreated (new pod) for the pro tier.
         [[ -n "${POD_PRO}" && "${POD_PRO}" != "${POD_BEFORE}" ]] || TIER_OK=false
@@ -258,7 +279,7 @@ if [[ -n "${TEST_AGENT_ID}" ]]; then
             [[ "${CPU}" == "2" || "${CPU}" == "2000m" ]] || TIER_OK=false
         fi
         gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/tier" '{"tier": "standard"}' >/dev/null 2>&1 || TIER_OK=false
-        if wait_test_agent_running 600; then
+        if wait_test_agent_pod_recreated "${POD_PRO}" 300 && wait_test_agent_running 600; then
             POD_STD="$(test_agent_pod)"
             [[ -n "${POD_STD}" && "${POD_STD}" != "${POD_PRO}" ]] || TIER_OK=false
         else
