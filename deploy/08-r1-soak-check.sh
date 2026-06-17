@@ -279,32 +279,25 @@ fi
 #------------------------------------------------------------------------------
 # cron-cycle (process registration + hibernate -> wake -> run)
 #
-# A process is created through the harness API on the test agent's pod
-# (pod port-forward; the gateway only stores trigger metadata). Then the
-# agent is hibernated and we wait for the ProcessCronService to wake it
-# and fire the trigger (cron "* * * * *").
+# The process is created through the gateway's authenticated pod proxy
+# (/v1/agents/:id/processes -> harness /v1/processes). Confidential agents run
+# as Peer Pods whose workload lives off-cluster, so `kubectl port-forward`
+# cannot reach the harness; the gateway dials the pod over the cluster tunnel.
+# The harness still registers the trigger metadata back to the gateway. Then the
+# agent is hibernated and we wait for the ProcessCronService to wake it and fire
+# the trigger (cron "* * * * *").
 #------------------------------------------------------------------------------
 
 log_section "[6/8] cron-cycle"
 if [[ -n "${TEST_AGENT_ID}" ]] && [[ -n "$(test_agent_pod)" ]]; then
     CRON_OK=true
-    POD=$(test_agent_pod)
-    HARNESS_PORT="${AURA_HARNESS_PORT:-8080}"
-    LOCAL_PORT=$((19080 + RANDOM % 1000))
-    kubectl port-forward -n "${K8S_NAMESPACE_AGENTS}" "pod/${POD}" \
-        "${LOCAL_PORT}:${HARNESS_PORT}" >/dev/null 2>&1 &
-    PF_PID=$!
-    sleep 3
-    PROC_RESP=$(curl -fsS -X POST -H "Authorization: Bearer ${SMOKE_TEST_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d '{"name": "soak-cron", "cron": "* * * * *", "prompt": "echo soak", "enabled": true}' \
-        "http://127.0.0.1:${LOCAL_PORT}/v1/processes" 2>/dev/null || echo "")
-    PROC_ID=$(echo "${PROC_RESP}" | jq -r '.process_id // .id // empty' 2>/dev/null || echo "")
-    kill "${PF_PID}" 2>/dev/null || true
-    wait "${PF_PID}" 2>/dev/null || true
+    PROC_RESP=$(gw_user_api POST "/v1/agents/${TEST_AGENT_ID}/processes" \
+        '{"name": "soak-cron", "cron": "* * * * *", "prompt": "echo soak", "enabled": true}' 2>/dev/null || echo "")
+    PROC_ID=$(echo "${PROC_RESP}" \
+        | jq -r '.process_id // .id // .process.id // .process.process_id // empty' 2>/dev/null || echo "")
 
     if [[ -z "${PROC_ID}" ]]; then
-        record "cron-cycle" FAIL "process creation via harness API failed (resp: ${PROC_RESP:0:120})"
+        record "cron-cycle" FAIL "process creation via gateway proxy failed (resp: ${PROC_RESP:0:120})"
     else
         # Trigger metadata must reach the gateway.
         REGISTERED=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/process-triggers" 2>/dev/null \

@@ -16,8 +16,8 @@ use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
 use crate::handlers::{
-    agents, automaton, files, health, internal, process_triggers, run, secrets, sessions,
-    terminal, usage, ws,
+    agents, automaton, files, health, internal, process_triggers, processes, run, secrets,
+    sessions, terminal, usage, ws,
 };
 use crate::state::GatewayState;
 
@@ -217,6 +217,13 @@ where
         .route(
             "/v1/agents/:agent_id/workspace/resolve",
             get(automaton::workspace_resolve::<C, V>),
+        )
+        // Process API pass-through (owner create/list scheduled processes on the
+        // in-VM harness; peer-pods can't be reached via kubectl port-forward, so
+        // this authenticated pod proxy is the supported path).
+        .route(
+            "/v1/agents/:agent_id/processes",
+            get(processes::list_processes::<C, V>).post(processes::create_process::<C, V>),
         )
         // Process-trigger metadata (owner read; registration is internal)
         .route(

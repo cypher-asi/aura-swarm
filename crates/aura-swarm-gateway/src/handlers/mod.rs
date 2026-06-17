@@ -8,6 +8,7 @@ pub(crate) mod files;
 pub(crate) mod health;
 pub(crate) mod internal;
 pub(crate) mod process_triggers;
+pub(crate) mod processes;
 pub(crate) mod run;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
