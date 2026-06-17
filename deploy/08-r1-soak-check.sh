@@ -209,8 +209,11 @@ if [[ -n "${TEST_AGENT_ID}" ]]; then
     SECRET_VAL="soak-$(date +%s)"
     gw_user_api PUT "/v1/agents/${TEST_AGENT_ID}/secrets/soak_check" \
         "{\"value\": \"${SECRET_VAL}\"}" >/dev/null 2>&1 || VAULT_OK=false
+    # The harness reveal response nests the secret as {"ok":true,"secret":{...,
+    # "value":"..."}}, so read .secret.value; tolerate a flat .value too in case
+    # the harness response shape changes.
     GOT=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/secrets/soak_check?reveal=true" 2>/dev/null \
-        | jq -r '.value // empty' || echo "")
+        | jq -r '.secret.value // .value // empty' || echo "")
     [[ "${GOT}" == "${SECRET_VAL}" ]] || VAULT_OK=false
     LISTED=$(gw_user_api GET "/v1/agents/${TEST_AGENT_ID}/secrets" 2>/dev/null \
         | jq '[.. | strings | select(. == "soak_check")] | length' || echo "0")
