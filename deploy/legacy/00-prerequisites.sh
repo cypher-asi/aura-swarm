@@ -18,7 +18,7 @@ NC='\033[0m' # No Color
 ERRORS=0
 
 echo "=============================================="
-echo "  Aura Swarm - Prerequisites Check"
+echo "  AURA Swarm - Prerequisites Check"
 echo "=============================================="
 echo ""
 

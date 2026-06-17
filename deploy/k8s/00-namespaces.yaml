@@ -1,4 +1,4 @@
-# Namespaces for Aura Swarm
+# Namespaces for AURA Swarm
 # - swarm-system: Platform services (gateway, control, scheduler)
 # - swarm-agents: Agent MicroVM pods
 ---

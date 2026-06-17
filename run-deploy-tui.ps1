@@ -1,4 +1,4 @@
-# Aura Swarm Deploy TUI - run the staged deploy scripts with a live two-column view.
+# AURA Swarm Deploy TUI - run the staged deploy scripts with a live two-column view.
 # Run with: .\run-deploy-tui.ps1
 #
 # The deploy scripts are bash and need your cloud tooling (bash, aws, kubectl,

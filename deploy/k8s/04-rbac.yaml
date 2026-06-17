@@ -1,4 +1,4 @@
-# RBAC for Aura Swarm services
+# RBAC for AURA Swarm services
 ---
 # Service account for gateway
 apiVersion: v1

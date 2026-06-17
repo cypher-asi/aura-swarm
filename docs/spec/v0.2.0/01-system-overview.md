@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Aura Swarm is a multi-user platform for running isolated AI agents. Every agent runs in its own **confidential SEV-SNP virtual machine** (Confidential Containers: Kata + QEMU via the `kata-qemu-snp` RuntimeClass), with **sealed per-agent storage** whose encryption key is released only after successful remote attestation. The platform — gateway, control plane, scheduler, and the underlying hosts — is outside the trust boundary for agent data.
+AURA Swarm is a multi-user platform for running isolated AI agents. Every agent runs in its own **confidential SEV-SNP virtual machine** (Confidential Containers: Kata + QEMU via the `kata-qemu-snp` RuntimeClass), with **sealed per-agent storage** whose encryption key is released only after successful remote attestation. The platform — gateway, control plane, scheduler, and the underlying hosts — is outside the trust boundary for agent data.
 
 ### 1.1 Purpose
 

@@ -1,4 +1,4 @@
-# Network Policies for Aura Swarm
+# Network Policies for AURA Swarm
 # Based on spec 08-networking.md section 5
 ---
 # Default deny all in swarm-agents namespace

@@ -1,4 +1,4 @@
-//! Aura Swarm CLI - Terminal UI for managing agents.
+//! AURA Swarm CLI - Terminal UI for managing agents.
 //!
 //! This is the entry point for the `aswarm` binary.
 //!
@@ -41,7 +41,7 @@ use client::GatewayClient;
 use types::AgentState;
 use ws::WsEvent;
 
-/// Aura Swarm CLI - Terminal UI for managing agents.
+/// AURA Swarm CLI - Terminal UI for managing agents.
 #[derive(Parser, Debug)]
 #[command(name = "aswarm")]
 #[command(author, version, about, long_about = None)]

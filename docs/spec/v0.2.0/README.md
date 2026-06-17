@@ -1,6 +1,6 @@
 # Confidential Agent Platform Specification v0.2.0
 
-This directory contains the specification for the Aura Swarm platform v0.2.0: a multi-user platform for running isolated AI agents where **every agent is a confidential SEV-SNP VM** (Confidential Containers / Kata + QEMU, `kata-qemu-snp`) with **sealed per-agent storage** and **tier-based pricing**.
+This directory contains the specification for the AURA Swarm platform v0.2.0: a multi-user platform for running isolated AI agents where **every agent is a confidential SEV-SNP VM** (Confidential Containers / Kata + QEMU, `kata-qemu-snp`) with **sealed per-agent storage** and **tier-based pricing**.
 
 v0.2.0 documents the architecture as shipped by the Swarm TEE upgrade (releases R1–R3): the dual-mode rollout (R1), the one-time fleet migration (R2), and the legacy-path cleanup (R3) are complete. There are no MicroVM/`kata-fc` agents anymore; the legacy decode path survives only inside the store migration module.
 

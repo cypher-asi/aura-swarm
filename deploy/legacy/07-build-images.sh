@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=============================================="
-echo "  Aura Swarm - Build and Push Images"
+echo "  AURA Swarm - Build and Push Images"
 echo "=============================================="
 echo ""
 echo "Build platform services: ${BUILD_PLATFORM}"

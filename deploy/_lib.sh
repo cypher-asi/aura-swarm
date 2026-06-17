@@ -280,7 +280,7 @@ step_banner() {
     meta="Run as: ${STEP_OWNER:-n/a}  ${ICON_BULLET}  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _tui_emit banner "${title}"
     printf '\n%s%s%s\n' "${BOLD}${CYAN}" "${rule}" "${NC}"
-    printf '%s %s  Aura Swarm TEE Rollout — Step %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "${STEP_ID}" "${NC}"
+    printf '%s %s  AURA Swarm TEE Rollout — Step %s%s\n' "${BOLD}${CYAN}" "${ICON_STEP}" "${STEP_ID}" "${NC}"
     printf '%s    %s%s\n' "${BOLD}" "${title}" "${NC}"
     printf '%s    %s%s\n' "${DIM}" "${meta}" "${NC}"
     printf '%s%s%s\n' "${BOLD}${CYAN}" "${rule}" "${NC}"
@@ -499,7 +499,7 @@ ensure_iam_policy() {
         aws iam create-policy \
             --policy-name "${policy_name}" \
             --policy-document "${doc}" \
-            --description "Aura Swarm staged rollout permissions for ${RESOURCE_PREFIX}" \
+            --description "AURA Swarm staged rollout permissions for ${RESOURCE_PREFIX}" \
             --tags "Key=Project,Value=${PROJECT_NAME}" "Key=Environment,Value=${ENVIRONMENT}" \
             >/dev/null
         log_ok "Created IAM policy ${policy_name}"

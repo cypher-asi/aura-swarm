@@ -22,7 +22,7 @@ source <(tr -d '\r' < "${SCRIPT_DIR}/config.env")
 source "${SCRIPT_DIR}/_lib.sh"
 
 STEP_ID="configure"
-log_section "Aura Swarm — configure deploy/config.env"
+log_section "AURA Swarm — configure deploy/config.env"
 
 # Knobs configure.sh may write (each must already have an export line in
 # config.env). Anything else is rejected to catch typos.

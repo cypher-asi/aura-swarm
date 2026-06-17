@@ -1,4 +1,4 @@
-//! Aura Swarm Deploy TUI — `aswarm-deploy`.
+//! AURA Swarm Deploy TUI — `aswarm-deploy`.
 //!
 //! A terminal UI for running the staged bash deploy scripts in `deploy/`.
 //! The left column shows a polished, curated step-progress feed (mirrored from
@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use app::{App, Screen};
 use runner::RunHandle;
 
-/// Aura Swarm deploy-script runner TUI.
+/// AURA Swarm deploy-script runner TUI.
 #[derive(Parser, Debug)]
 #[command(name = "aswarm-deploy")]
 #[command(author, version, about, long_about = None)]

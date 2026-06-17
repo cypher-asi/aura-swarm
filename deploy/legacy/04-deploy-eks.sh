@@ -20,7 +20,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo "=============================================="
-echo "  Aura Swarm - Deploy EKS Cluster"
+echo "  AURA Swarm - Deploy EKS Cluster"
 echo "=============================================="
 echo ""
 echo -e "${YELLOW}Note: EKS cluster creation takes 10-15 minutes${NC}"

@@ -28,7 +28,7 @@ ERRORS=0
 WARNINGS=0
 
 echo "=============================================="
-echo "  Aura Swarm - Verification"
+echo "  AURA Swarm - Verification"
 echo "=============================================="
 echo ""
 

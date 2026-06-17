@@ -1,4 +1,4 @@
-# Aura Swarm CLI - Connect to Gateway
+# AURA Swarm CLI - Connect to Gateway
 # Run with: .\run-cli.ps1
 #
 # Set these environment variables before running:

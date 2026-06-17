@@ -1,4 +1,4 @@
-//! Aura Swarm Control Plane - Agent Lifecycle Management Service
+//! AURA Swarm Control Plane - Agent Lifecycle Management Service
 //!
 //! This is the main entry point for the control plane service.
 //! It provides internal APIs for agent and session management.
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Aura Swarm Control Plane");
+    tracing::info!("Starting AURA Swarm Control Plane");
 
     // Load configuration from environment
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

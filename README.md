@@ -20,7 +20,7 @@
 
 ## Overview
 
-Aura Swarm is a platform for running isolated AI agents as long-lived services. **Every agent in the fleet is a confidential SEV-SNP virtual machine** (Confidential Containers: Kata + QEMU via the `kata-qemu-snp` runtime class on AMD bare-metal nodes). Agent memory is hardware-encrypted, agent state is sealed at rest with a per-agent key released only after remote attestation by a Trustee KBS, and the platform itself — control plane, hosts, storage, operators — sits outside the trust boundary for agent data. The migration to the all-TEE architecture is complete: there is no legacy microVM tier.
+AURA Swarm is a platform for running isolated AI agents as long-lived services. **Every agent in the fleet is a confidential SEV-SNP virtual machine** (Confidential Containers: Kata + QEMU via the `kata-qemu-snp` runtime class on AMD bare-metal nodes). Agent memory is hardware-encrypted, agent state is sealed at rest with a per-agent key released only after remote attestation by a Trustee KBS, and the platform itself — control plane, hosts, storage, operators — sits outside the trust boundary for agent data. The migration to the all-TEE architecture is complete: there is no legacy microVM tier.
 
 Users interact with their agents through run streams proxied by the gateway, or through the `aswarm` terminal UI. The platform handles the full agent lifecycle — provisioning, running, hibernation, three wake paths (API, new session, cron trigger), tier resizing, and crypto-erasing teardown — while keeping per-agent sealed state isolated on encrypted EFS.
 

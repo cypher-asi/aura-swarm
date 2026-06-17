@@ -430,7 +430,7 @@ verify_r2_convergence() {
 }
 
 echo "=============================================="
-echo "  Aura Swarm - Redeploy Verification"
+echo "  AURA Swarm - Redeploy Verification"
 echo "=============================================="
 echo ""
 echo "Deploy cluster: ${EKS_CLUSTER_NAME}"

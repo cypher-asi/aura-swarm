@@ -1,4 +1,4 @@
-//! Aura Swarm Scheduler - Kubernetes Pod Scheduler Service
+//! AURA Swarm Scheduler - Kubernetes Pod Scheduler Service
 //!
 //! This is the main entry point for the scheduler service.
 //! It manages agent pods in Kubernetes and provides health endpoints.
@@ -518,7 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Aura Swarm Scheduler");
+    tracing::info!("Starting AURA Swarm Scheduler");
 
     // Load configuration from environment
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

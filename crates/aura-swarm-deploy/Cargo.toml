@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Terminal UI for running the Aura Swarm staged deploy scripts"
+description = "Terminal UI for running the AURA Swarm staged deploy scripts"
 
 [[bin]]
 name = "aswarm-deploy"

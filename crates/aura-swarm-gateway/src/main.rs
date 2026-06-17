@@ -1,4 +1,4 @@
-//! Aura Swarm Gateway - HTTP/WebSocket API Gateway
+//! AURA Swarm Gateway - HTTP/WebSocket API Gateway
 //!
 //! This is the main entry point for the gateway service.
 //! The gateway provides the public API for managing agents and sessions,
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Aura Swarm Gateway");
+    tracing::info!("Starting AURA Swarm Gateway");
 
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data/aura-swarm".into());
