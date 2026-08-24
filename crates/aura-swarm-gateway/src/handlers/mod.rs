@@ -7,6 +7,7 @@ pub(crate) mod automaton;
 pub(crate) mod files;
 pub(crate) mod health;
 pub(crate) mod internal;
+pub(crate) mod preview_tcp;
 pub(crate) mod process_triggers;
 pub(crate) mod processes;
 pub(crate) mod run;

@@ -16,8 +16,8 @@ use aura_swarm_auth::JwtValidator;
 use aura_swarm_control::ControlPlane;
 
 use crate::handlers::{
-    agents, automaton, files, health, internal, process_triggers, processes, run, secrets,
-    sessions, terminal, usage, ws,
+    agents, automaton, files, health, internal, preview_tcp, process_triggers, processes, run,
+    secrets, sessions, terminal, usage, ws,
 };
 use crate::state::GatewayState;
 
@@ -160,6 +160,10 @@ where
         .route(
             "/v1/agents/:agent_id/terminal/ws",
             get(terminal::terminal_ws::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/preview/tcp/:port/ws",
+            get(preview_tcp::preview_tcp_ws::<C, V>),
         )
         // File proxies (HTTP — forward to pod /api/files and /api/read-file)
         .route(
