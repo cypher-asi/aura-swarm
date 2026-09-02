@@ -5,8 +5,12 @@
 //! the terminal WebSocket proxy.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use aura_swarm_auth::JwtValidator;
@@ -134,4 +138,51 @@ where
         .map_err(|e| ApiError::Internal(format!("bad response from agent pod: {e}")))?;
 
     Ok(Json(json))
+}
+
+/// `PUT /v1/agents/:agent_id/write-file`
+///
+/// Relays a bounded, revision-checked write request to the agent pod. The
+/// gateway deliberately treats the JSON as opaque bytes and preserves the pod
+/// status so conflicts and validation failures reach Aura Web unchanged.
+pub(crate) async fn write_file<C, V>(
+    State(state): State<Arc<GatewayState<C, V>>>,
+    Path(agent_id): Path<String>,
+    user: AuthUser,
+    body: Bytes,
+) -> Result<Response, ApiError>
+where
+    C: ControlPlane + 'static,
+    V: JwtValidator + 'static,
+{
+    let agent_id = parse_agent_id(&agent_id)?;
+    let _ = state.control.get_agent(&user.user_id, &agent_id).await?;
+    let endpoint = state
+        .control
+        .resolve_agent_endpoint(&agent_id)
+        .await?
+        .ok_or(ApiError::AgentUnavailable)?;
+    let url = format!("http://{endpoint}/api/write-file");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
+    let response = client
+        .put(&url)
+        .header("content-type", "application/json")
+        .body(body)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "failed to reach agent pod for file write");
+            ApiError::AgentUnavailable
+        })?;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| ApiError::Internal(format!("bad response from agent pod: {error}")))?;
+    Ok((status, [("content-type", "application/json")], body).into_response())
 }
