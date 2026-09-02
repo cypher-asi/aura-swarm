@@ -53,6 +53,7 @@ use crate::state::GatewayState;
 /// ## Files (authenticated, proxied to agent pod)
 /// - `POST /v1/agents/:agent_id/files` - List directory contents
 /// - `POST /v1/agents/:agent_id/read-file` - Read file contents
+/// - `PUT /v1/agents/:agent_id/write-file` - Replace a revision-matched text file
 ///
 /// ## Secrets (authenticated, proxied to the in-TEE vault on the pod;
 /// values are never persisted, cached, or logged by the gateway)
@@ -165,7 +166,7 @@ where
             "/v1/agents/:agent_id/preview/tcp/:port/ws",
             get(preview_tcp::preview_tcp_ws::<C, V>),
         )
-        // File proxies (HTTP — forward to pod /api/files and /api/read-file)
+        // File proxies (HTTP — forward list/read/write operations to the pod)
         .route(
             "/v1/agents/:agent_id/files",
             post(files::list_files::<C, V>),
@@ -173,6 +174,10 @@ where
         .route(
             "/v1/agents/:agent_id/read-file",
             post(files::read_file::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/write-file",
+            axum::routing::put(files::write_file::<C, V>),
         )
         // Secrets vault pass-through (HTTP — forward to the pod's /secrets
         // routes; pure proxy, no control-plane persistence or body logging)
