@@ -66,6 +66,14 @@ where
         .resolve_agent_endpoint(&agent_id)
         .await?
         .ok_or(ApiError::AgentUnavailable)?;
+    request_pod_git(&endpoint, endpoint_path, query).await
+}
+
+async fn request_pod_git(
+    endpoint: &str,
+    endpoint_path: &'static str,
+    query: &[(&str, &str)],
+) -> Result<Json<serde_json::Value>, ApiError> {
     let url = format!("http://{endpoint}{endpoint_path}");
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -144,6 +152,9 @@ where
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::json;
 
     #[test]
     fn rejects_unbounded_paths_and_maps_pod_failures() {
@@ -159,5 +170,45 @@ mod tests {
             pod_git_error(503).status_code(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_status_query_and_preserves_pod_failures() {
+        let pod = Router::new()
+            .route(
+                "/api/git/status",
+                get(
+                    |axum::extract::Query(query): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        Json(json!({ "available": true, "path": query.get("path") }))
+                    },
+                ),
+            )
+            .route(
+                "/api/git/diff",
+                get(|| async { (StatusCode::FORBIDDEN, Json(json!({ "error": "private" }))) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, pod).await.unwrap();
+        });
+
+        let Json(status) = request_pod_git(
+            &endpoint,
+            "/api/git/status",
+            &[("path", "/workspace/my project")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["path"], "/workspace/my project");
+        assert_eq!(status["available"], true);
+
+        let error = request_pod_git(&endpoint, "/api/git/diff", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        server.abort();
     }
 }
