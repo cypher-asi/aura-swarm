@@ -36,6 +36,18 @@ fn default_depth() -> usize {
     3
 }
 
+/// Preserve the pod's file-access failure semantics without returning its
+/// potentially sensitive error body (which may contain workspace paths).
+fn pod_file_error(status: u16) -> ApiError {
+    match status {
+        400 => ApiError::BadRequest("invalid remote workspace path".into()),
+        403 => ApiError::Forbidden,
+        404 => ApiError::NotFound("remote workspace path".into()),
+        413 => ApiError::BadRequest("remote workspace file exceeds the read limit".into()),
+        _ => ApiError::AgentUnavailable,
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct ReadFileRequest {
     path: String,
@@ -80,6 +92,12 @@ where
             tracing::warn!(error = %e, "failed to reach agent pod for file listing");
             ApiError::AgentUnavailable
         })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        tracing::warn!(status, "agent pod rejected file listing");
+        return Err(pod_file_error(status));
+    }
 
     let json: serde_json::Value = resp
         .json()
@@ -128,10 +146,33 @@ where
             ApiError::AgentUnavailable
         })?;
 
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        tracing::warn!(status, "agent pod rejected file read");
+        return Err(pod_file_error(status));
+    }
+
     let json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| ApiError::Internal(format!("bad response from agent pod: {e}")))?;
 
     Ok(Json(json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pod_file_error;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn pod_file_failures_are_not_recast_as_success() {
+        assert_eq!(pod_file_error(400).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(pod_file_error(403).status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(pod_file_error(404).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            pod_file_error(500).status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
