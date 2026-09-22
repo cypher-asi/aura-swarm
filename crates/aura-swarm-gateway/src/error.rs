@@ -38,6 +38,10 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The pod refused a file larger than its bounded read limit.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// Internal server error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -84,6 +88,7 @@ impl ApiError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AgentUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::InsufficientCredits { .. } | Self::BillingAccountNotFound => {
@@ -102,6 +107,7 @@ impl ApiError {
             Self::Conflict(_) => "conflict",
             Self::RateLimited => "rate_limited",
             Self::BadRequest(_) => "bad_request",
+            Self::PayloadTooLarge(_) => "payload_too_large",
             Self::Internal(_) => "internal_error",
             Self::AgentUnavailable => "agent_unavailable",
             Self::InsufficientCredits { .. } => "insufficient_credits",
@@ -160,9 +166,9 @@ impl From<ControlError> for ApiError {
                 Self::Conflict(format!("agent quota exceeded: limit is {limit}"))
             }
             ControlError::NotOwner { .. } => Self::Forbidden,
-            ControlError::InvalidTier(tier) => {
-                Self::BadRequest(format!("unknown tier: {tier} (expected small/standard/pro)"))
-            }
+            ControlError::InvalidTier(tier) => Self::BadRequest(format!(
+                "unknown tier: {tier} (expected small/standard/pro)"
+            )),
             ControlError::InvalidTrigger(msg) => {
                 Self::BadRequest(format!("invalid trigger registration: {msg}"))
             }
@@ -225,6 +231,10 @@ mod tests {
         assert_eq!(
             ApiError::AgentUnavailable.status_code(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            ApiError::PayloadTooLarge("file".into()).status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 

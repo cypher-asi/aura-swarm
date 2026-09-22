@@ -43,7 +43,7 @@ fn pod_file_error(status: u16) -> ApiError {
         400 => ApiError::BadRequest("invalid remote workspace path".into()),
         403 => ApiError::Forbidden,
         404 => ApiError::NotFound("remote workspace path".into()),
-        413 => ApiError::BadRequest("remote workspace file exceeds the read limit".into()),
+        413 => ApiError::PayloadTooLarge("remote workspace file exceeds the read limit".into()),
         _ => ApiError::AgentUnavailable,
     }
 }
@@ -170,6 +170,10 @@ mod tests {
         assert_eq!(pod_file_error(400).status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(pod_file_error(403).status_code(), StatusCode::FORBIDDEN);
         assert_eq!(pod_file_error(404).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            pod_file_error(413).status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
         assert_eq!(
             pod_file_error(500).status_code(),
             StatusCode::SERVICE_UNAVAILABLE
