@@ -12,6 +12,7 @@ pub(crate) mod processes;
 pub(crate) mod run;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
+pub(crate) mod source_control;
 pub(crate) mod terminal;
 pub(crate) mod usage;
 pub(crate) mod ws;

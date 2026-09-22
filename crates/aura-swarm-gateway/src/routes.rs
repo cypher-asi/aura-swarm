@@ -17,7 +17,7 @@ use aura_swarm_control::ControlPlane;
 
 use crate::handlers::{
     agents, automaton, files, health, internal, process_triggers, processes, run, secrets,
-    sessions, terminal, usage, ws,
+    sessions, source_control, terminal, usage, ws,
 };
 use crate::state::GatewayState;
 
@@ -53,6 +53,8 @@ use crate::state::GatewayState;
 /// ## Files (authenticated, proxied to agent pod)
 /// - `POST /v1/agents/:agent_id/files` - List directory contents
 /// - `POST /v1/agents/:agent_id/read-file` - Read file contents
+/// - `POST /v1/agents/:agent_id/git/status` - Read-only Git status from the agent pod
+/// - `POST /v1/agents/:agent_id/git/diff` - Read-only changed-file diff from the agent pod
 ///
 /// ## Secrets (authenticated, proxied to the in-TEE vault on the pod;
 /// values are never persisted, cached, or logged by the gateway)
@@ -170,6 +172,14 @@ where
             "/v1/agents/:agent_id/read-file",
             post(files::read_file::<C, V>),
         )
+        .route(
+            "/v1/agents/:agent_id/git/status",
+            post(source_control::git_status::<C, V>),
+        )
+        .route(
+            "/v1/agents/:agent_id/git/diff",
+            post(source_control::git_diff::<C, V>),
+        )
         // Secrets vault pass-through (HTTP — forward to the pod's /secrets
         // routes; pure proxy, no control-plane persistence or body logging)
         .route(
@@ -194,10 +204,7 @@ where
         )
         // Run proxy (harness POST /v1/run + WS /stream/:run_id contract)
         .route("/v1/agents/:agent_id/run", post(run::run_start::<C, V>))
-        .route(
-            "/v1/agents/:agent_id/run/list",
-            get(run::run_list::<C, V>),
-        )
+        .route("/v1/agents/:agent_id/run/list", get(run::run_list::<C, V>))
         .route(
             "/v1/agents/:agent_id/run/:run_id/status",
             get(run::run_status::<C, V>),

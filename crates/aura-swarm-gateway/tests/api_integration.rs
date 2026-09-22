@@ -164,6 +164,39 @@ async fn malformed_auth_header_returns_401() {
     resp.assert_status(axum::http::StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn remote_git_routes_require_auth_and_agent_ownership() {
+    let (server, _tmp) = build_test_app();
+    let agent_id = "aa".repeat(16);
+    let status_path = format!("/v1/agents/{agent_id}/git/status");
+    let diff_path = format!("/v1/agents/{agent_id}/git/diff");
+
+    server
+        .post(&status_path)
+        .json(&json!({ "path": "/workspace/project" }))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    server
+        .post(&diff_path)
+        .json(&json!({ "path": "/workspace/project", "file": "src/main.rs", "area": "worktree" }))
+        .await
+        .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+    let (header, value) = auth_header(TEST_USER_UUID);
+    server
+        .post(&status_path)
+        .add_header(header.clone(), value.clone())
+        .json(&json!({ "path": "/workspace/project" }))
+        .await
+        .assert_status(axum::http::StatusCode::NOT_FOUND);
+    server
+        .post(&diff_path)
+        .add_header(header, value)
+        .json(&json!({ "path": "/workspace/project", "file": "src/main.rs", "area": "worktree" }))
+        .await
+        .assert_status(axum::http::StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // Agent CRUD
 // ---------------------------------------------------------------------------
@@ -1431,7 +1464,10 @@ async fn create_agent(server: &TestServer, agent_id: Option<&str>) -> String {
         .add_header(hdr, val)
         .json(&body)
         .await;
-    resp.json::<Value>()["agent_id"].as_str().unwrap().to_string()
+    resp.json::<Value>()["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 fn trigger_set() -> Value {
@@ -1614,7 +1650,10 @@ async fn trigger_internal_delete_single() {
         .get(&format!("/v1/agents/{agent_id}/process-triggers"))
         .add_header(hdr, val)
         .await;
-    assert_eq!(resp.json::<Value>()["triggers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        resp.json::<Value>()["triggers"].as_array().unwrap().len(),
+        1
+    );
 }
 
 #[tokio::test]
